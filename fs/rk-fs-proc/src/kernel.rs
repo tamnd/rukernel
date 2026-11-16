@@ -178,6 +178,7 @@ fn vm_counts() -> text::VmCounts {
         faults: traps.page_faults + traps.user_page_faults,
         pgpgin: sectors[0] / 2,
         pgpgout: sectors[1] / 2,
+        reclaim: rk_frame::mm::reclaim_counts(),
         min_free_kbytes: rk_mm::tunables::min_free_kbytes(f.total) as u64,
         span: (span.start as u64, span.end as u64),
         blocks: rk_frame::mm::free_blocks().map(|n| n as u64),

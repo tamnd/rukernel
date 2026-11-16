@@ -63,6 +63,12 @@ pub(crate) struct MemCounters {
     pub(crate) events: [AtomicU64; NR_EV],
     /// The counts of `memory.events.local`.
     pub(crate) events_local: [AtomicU64; NR_EV],
+    /// `pgscan_kswapd` and `pgscan_direct` of `memory.stat`: the pages of the subtree that the
+    /// reclaim looked at.
+    pub(crate) scan: [AtomicU64; 2],
+    /// `pgsteal_kswapd` and `pgsteal_direct` of `memory.stat`: the pages of the subtree that the
+    /// reclaim freed.
+    pub(crate) steal: [AtomicU64; 2],
 }
 
 /// The counts of the pids controller of one cgroup.
@@ -175,6 +181,16 @@ impl Counters {
             c.files_seq.fetch_add(1, Ordering::Relaxed);
         }
         sh.notify.store(true, Ordering::SeqCst);
+    }
+
+    /// Counts a reclaim that looked at `scanned` pages of this cgroup and freed `stolen` of them,
+    /// in this cgroup and the cgroups above it, as `count_memcg_events` of Linux with the
+    /// hierarchical counts of `memory.stat`. Index 0 is for `kswapd`, 1 for a direct reclaim.
+    pub(crate) fn count_reclaim(&self, i: usize, scanned: u64, stolen: u64) {
+        for c in self.path() {
+            c.mem.scan[i].fetch_add(scanned, Ordering::Relaxed);
+            c.mem.steal[i].fetch_add(stolen, Ordering::Relaxed);
+        }
     }
 
     /// Counts the bytes that `c` charged over its `memory.high`, after a charge that made its

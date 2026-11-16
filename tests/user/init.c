@@ -14487,6 +14487,31 @@ static int cg_cache(void)
 	return 0;
 }
 
+/* Drops the page cache of /dev/vda and reads all of the disk in chunks of 64 KiB, so that the
+ * cgroup of the caller gets the charge of 1 MiB of new page cache. */
+static int cg_read_disk(void)
+{
+	static char b[65536];
+	int fd = open("/dev/vda", O_RDONLY);
+
+	if (fd < 0 || ioctl(fd, BLKFLSBUF, 0) != 0)
+		return 2;
+	for (off_t at = 0; at < (1 << 20); at += (off_t)sizeof(b))
+		if (pread(fd, b, sizeof(b), at) != (ssize_t)sizeof(b))
+			return 3;
+	close(fd);
+	return 0;
+}
+
+/* Gives the value of the line `name` of the file `path` of lines "name value", as memory.stat and
+ * /proc/vmstat, or -1. */
+static long long stat_value(const char *path, const char *name)
+{
+	static char buf[16384];
+
+	return read_small(path, buf, sizeof(buf)) > 0 ? vmstat_value(buf, name) : -1;
+}
+
 /* Gives the value of `key` in the line of the device 254:0 in io.stat of the cgroup `cg`, or
  * -1. */
 static long cg_io_value(const char *cg, const char *key)
@@ -14649,6 +14674,25 @@ static void test_cgroup_io(void)
 	check("rmdir removes a cgroup with charges of page cache",
 	      mkdir("/cg/t/pc", 0755) == 0 && (status = wait_status(cgroup_child("/cg/t/pc", cg_cache)), WIFEXITED(status)) &&
 		      WEXITSTATUS(status) == 0 && cg_value("/cg/t/pc/memory.current", "") > 0 && rmdir("/cg/t/pc") == 0);
+	/* A cgroup over memory.high takes back its page cache at the return to user mode, and the
+	 * reclaim counts in memory.stat of the cgroup and of its parent, and in pgscan_file of
+	 * /proc/vmstat. A reclaim of a cgroup does not count in pgscan_direct of /proc/vmstat, as
+	 * shrink_inactive_list of Linux (#752). */
+	long long scan_file = stat_value("/proc/vmstat", "pgscan_file");
+	long long scan_direct = stat_value("/proc/vmstat", "pgscan_direct");
+	check("a cgroup over memory.high takes back its page cache",
+	      mkdir("/cg/t/rc", 0755) == 0 && cg_write("/cg/t/rc/memory.high", "512K") == 0 &&
+		      (status = wait_status(cgroup_child("/cg/t/rc", cg_read_disk)), WIFEXITED(status)) &&
+		      WEXITSTATUS(status) == 0 && cg_value("/cg/t/rc/memory.current", "") < (1 << 20));
+	check("memory.stat counts the reclaim of memory.high",
+	      stat_value("/cg/t/rc/memory.stat", "pgscan") > 0 && stat_value("/cg/t/rc/memory.stat", "pgsteal") > 0 &&
+		      stat_value("/cg/t/rc/memory.stat", "pgscan_direct") > 0 &&
+		      stat_value("/cg/t/memory.stat", "pgsteal") >= stat_value("/cg/t/rc/memory.stat", "pgsteal"));
+	check("/proc/vmstat counts the reclaim of a cgroup in pgscan_file only",
+	      stat_value("/proc/vmstat", "pgscan_file") > scan_file &&
+		      stat_value("/proc/vmstat", "pgsteal_file") > 0 &&
+		      stat_value("/proc/vmstat", "pgscan_direct") == scan_direct);
+	rmdir("/cg/t/rc");
 	check("io.max takes a limit", cg_write("/cg/t/io.max", "254:0 wbps=65536") == 0 &&
 					      read_file("/cg/t/io.max", buf, sizeof(buf)) > 0 &&
 					      strcmp(buf, "254:0 rbps=max wbps=65536 riops=max wiops=max\n") == 0);

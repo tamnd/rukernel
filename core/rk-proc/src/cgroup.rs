@@ -249,11 +249,13 @@ pub fn wait_throttled(thread: &Thread) -> bool {
     true
 }
 
-/// Keeps `thread` waiting when its cgroup charged pages over `memory.high`, as
-/// `mem_cgroup_handle_over_high` of Linux. The wait counts as a memory stall in the pressure.
-/// A kill or a change of the limit ends the wait.
+/// Takes memory back from the cgroups over `memory.high`, and then keeps `thread` waiting when
+/// its cgroup charged pages over `memory.high`, as `mem_cgroup_handle_over_high` of Linux. The
+/// wait counts as a memory stall in the pressure. A kill or a change of the limit ends the wait.
 fn wait_over_high(thread: &Thread, cg: CgId) {
-    let delay = rk_cgroup::high_delay(thread.process().memcg());
+    let memcg = thread.process().memcg();
+    rk_cgroup::reclaim_high(memcg);
+    let delay = rk_cgroup::high_delay(memcg);
     if delay == 0 {
         return;
     }
@@ -395,7 +397,7 @@ pub fn system_oom(thread: &Thread) -> bool {
         return false;
     }
     // The clean page cache goes first, as the reclaim of Linux before `out_of_memory`.
-    rk_vfs::blockdev::drop_clean_all();
+    rk_vfs::blockdev::reclaim_all();
     if rk_frame::mm::frame_stats().free > system_reserve() {
         return true;
     }
@@ -480,12 +482,19 @@ pub fn memcg_oom(thread: &Thread) -> bool {
     victim.is_some()
 }
 
-/// Kills processes in the subtree of `id` until its memory use is below `memory.max`, after a
-/// write of the limit.
+/// Takes memory back from the subtree of `id`, and then kills processes in it, until its memory
+/// use is below `memory.max`, after a write of the limit, as `memory_max_write` of Linux.
 pub fn reclaim_over_limit(id: CgId) {
+    let mut tries = 0;
     for _ in 0..64 {
-        if rk_cgroup::with(|h| h.memory_over(id)) == 0 {
+        let over = rk_cgroup::with(|h| h.memory_over(id));
+        if over == 0 {
             return;
+        }
+        // `MAX_RECLAIM_RETRIES` of Linux.
+        if tries < 16 && rk_cgroup::reclaim(id, over) > 0 {
+            tries += 1;
+            continue;
         }
         rk_cgroup::with(|h| h.count_oom(id));
         let Some(victim) = oom_kill(id) else { return };

@@ -54,6 +54,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use counter::{Changed, Counters, Shared};
 use rk_abi::Errno;
+use rk_frame::mm::Reclaimer;
 use rk_frame::sync::{Once, SpinLock};
 
 /// The ID of a cgroup. IDs are not used again, so an old ID never names a new cgroup.
@@ -173,6 +174,10 @@ pub struct Memory {
     /// The bytes that the subtree charged while the use was over `memory.high`. The next
     /// return of a thread to user mode waits for them, and sets the count to 0.
     pub over_high: u64,
+    /// `pgscan_kswapd` and `pgscan_direct`: the pages of the subtree that the reclaim looked at.
+    pub pgscan: [u64; 2],
+    /// `pgsteal_kswapd` and `pgsteal_direct`: the pages of the subtree that the reclaim freed.
+    pub pgsteal: [u64; 2],
 }
 
 impl Default for Memory {
@@ -191,6 +196,8 @@ impl Default for Memory {
             events: [0; NR_EV],
             events_local: [0; NR_EV],
             over_high: 0,
+            pgscan: [0; 2],
+            pgsteal: [0; 2],
         }
     }
 }
@@ -430,6 +437,8 @@ impl Node {
             events: core::array::from_fn(|i| ld(&m.events[i])),
             events_local: core::array::from_fn(|i| ld(&m.events_local[i])),
             over_high: ld(&m.over_high),
+            pgscan: core::array::from_fn(|i| ld(&m.scan[i])),
+            pgsteal: core::array::from_fn(|i| ld(&m.steal[i])),
         }
     }
 }
@@ -1536,6 +1545,15 @@ impl Hierarchy {
         }
     }
 
+    /// Counts a reclaim that looked at `scanned` pages charged to `id` and freed `stolen` of
+    /// them, in `memory.stat` of `id` and the cgroups above it. The reclaim is of `kswapd` if
+    /// `kswapd`, else it is a direct reclaim. See [`count_reclaim`].
+    pub fn count_reclaim(&self, id: CgId, kswapd: bool, scanned: u64, stolen: u64) {
+        if let Some(n) = self.nodes.get(&id) {
+            n.c.count_reclaim(usize::from(!kswapd), scanned, stolen);
+        }
+    }
+
     /// Counts an OOM in `id`: a charge failed, and the caller looks for a process to kill.
     pub fn count_oom(&mut self, id: CgId) {
         self.memory_event(id, EV_OOM);
@@ -2277,8 +2295,14 @@ fn memory_stat(m: &Memory) -> String {
         ("slab", 0),
         ("workingset_refault_anon", 0),
         ("workingset_refault_file", 0),
-        ("pgscan", 0),
-        ("pgsteal", 0),
+        ("pgscan", m.pgscan[0] + m.pgscan[1]),
+        ("pgsteal", m.pgsteal[0] + m.pgsteal[1]),
+        ("pgscan_kswapd", m.pgscan[0]),
+        ("pgscan_direct", m.pgscan[1]),
+        ("pgscan_khugepaged", 0),
+        ("pgsteal_kswapd", m.pgsteal[0]),
+        ("pgsteal_direct", m.pgsteal[1]),
+        ("pgsteal_khugepaged", 0),
         ("pgfault", 0),
         ("pgmajfault", 0),
     ] {
@@ -2451,6 +2475,44 @@ pub fn reclaim(root: CgId, want: u64) -> u64 {
     let Some(drop) = RECLAIM.get() else { return 0 };
     let plan = with(|h| h.reclaim_plan(root, want));
     plan.into_iter().map(|(id, bytes)| drop(id, bytes)).sum()
+}
+
+/// Counts a reclaim of `who` that looked at `scanned` pages charged to `id` and freed `stolen`
+/// of them, of anonymous memory if `anon`, else of the page cache. The counts go to
+/// `/proc/vmstat`, and to `memory.stat` of `id` and the cgroups above it, as
+/// `shrink_inactive_list` of Linux. An `id` of 0 is memory without a charge.
+pub fn count_reclaim(id: CgId, who: Reclaimer, anon: bool, scanned: u64, stolen: u64) {
+    rk_frame::mm::count_reclaim(who, anon, scanned, stolen);
+    if id != 0 && scanned > 0 {
+        let i = usize::from(who != Reclaimer::Kswapd);
+        with_counters(id, |c, _| (c.count_reclaim(i, scanned, stolen), Changed::default()));
+    }
+}
+
+/// Takes back memory from `id` and each cgroup above it whose use is over `memory.high`, as
+/// `reclaim_high` of Linux. Each of these cgroups gives the bytes that the subtree charged over
+/// the limit, and at least `RECLAIM_BATCH`. The return to user mode calls this before
+/// [`high_delay`], so the wait is for the use that the reclaim leaves.
+pub fn reclaim_high(id: CgId) {
+    if id == 0 || !shared().any_over_high.load(Ordering::Relaxed) {
+        return;
+    }
+    let over = with_counters(id, |c, _| {
+        let over: Vec<(CgId, u64)> = c
+            .path()
+            .filter_map(|a| {
+                let high = a.mem.high.load(Ordering::Relaxed);
+                let current = a.mem.current.load(Ordering::Relaxed);
+                let charged = a.mem.over_high.load(Ordering::Relaxed);
+                (a.on(MEMORY) && high != MAX && current > high)
+                    .then(|| (a.id, charged.max(RECLAIM_BATCH)))
+            })
+            .collect();
+        (over, Changed::default())
+    });
+    for (cg, bytes) in over.unwrap_or_default() {
+        reclaim(cg, bytes);
+    }
 }
 
 /// Charges a page of memory to `id`. A charge past a `memory.max` first takes back page cache
