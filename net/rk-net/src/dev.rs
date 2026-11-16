@@ -108,6 +108,19 @@ pub trait NetDriver: Send + Sync {
         None
     }
 
+    /// The files that the driver adds to the directory of the device in sysfs, with their
+    /// text, as the `sysfs_groups` that a driver of Linux gives to its device.
+    fn sysfs_files(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+
+    /// The attributes of `IFLA_INFO_DATA` in `IFLA_LINKINFO`, each with its type and its data,
+    /// as the `fill_info` of the `rtnl_link_ops` of Linux. Without them a message has no
+    /// `IFLA_INFO_DATA`.
+    fn link_info_data(&self) -> Vec<(u16, Vec<u8>)> {
+        Vec::new()
+    }
+
     /// The smallest MTU, as `dev->min_mtu` of Linux.
     fn min_mtu(&self) -> u32 {
         match self.kind() {

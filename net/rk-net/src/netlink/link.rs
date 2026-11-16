@@ -217,6 +217,14 @@ fn fill_event(
     if let Some(kind) = dev.link_kind() {
         let info = b.nest(IFLA_LINKINFO as u16);
         b.str(IFLA_INFO_KIND as u16, kind);
+        let data = dev.driver().link_info_data();
+        if !data.is_empty() {
+            let at = b.nest(IFLA_INFO_DATA as u16);
+            for (ty, v) in &data {
+                b.put(*ty, v);
+            }
+            b.end_nest(at);
+        }
         b.end_nest(info);
     }
     // The nsid of the namespace of the other end, if that is not this namespace, as

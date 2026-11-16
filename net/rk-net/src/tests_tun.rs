@@ -3,9 +3,10 @@ use crate::dev;
 use crate::ether::{EthHeader, MacAddr};
 use crate::ns;
 use crate::tun::{
-    IFF_ATTACH_QUEUE, IFF_DETACH_QUEUE, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_TUN, MAX_TAP_QUEUES,
-    TunFile, flow_hash,
+    IFF_ATTACH_QUEUE, IFF_DETACH_QUEUE, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_TAP, IFF_TUN, IFF_VNET_HDR,
+    MAX_TAP_QUEUES, TunFile, flow_hash,
 };
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use rk_abi::Errno;
@@ -159,4 +160,81 @@ fn a_detached_file_makes_its_device_persistent() {
     assert!(!dev.carrier());
     dev::unregister(&dev);
     assert!(dev::by_name("pq0").is_none());
+}
+
+#[test]
+fn a_device_has_tun_flags_owner_and_group_in_sysfs() {
+    let _serial = crate::TEST_DEVICES.lock();
+    dev::init();
+    let net = ns::new().unwrap();
+    let _in = ns::enter(&net);
+    // As the TAP device of `NetworkdNetDevTests.test_tuntap`: `ip tuntap show` prints
+    // "tap pi multi_queue vnet_hdr" from `tun_flags`.
+    let f = TunFile::new(net.clone());
+    f.set_iff("mqtap0", IFF_TAP | IFF_VNET_HDR | IFF_MULTI_QUEUE).unwrap();
+    let dev = dev::by_name("mqtap0").unwrap();
+    assert_eq!(
+        dev.driver().sysfs_files(),
+        [
+            ("group", String::from("-1\n")),
+            ("owner", String::from("-1\n")),
+            ("tun_flags", String::from("0x4102\n")),
+        ]
+    );
+    // A device of another driver adds no file.
+    let d = crate::dummy::create(Some(b"sdum0"), None).unwrap();
+    assert!(d.driver().sysfs_files().is_empty());
+    dev::unregister(&d);
+    drop(f);
+    assert!(dev::by_name("mqtap0").is_none());
+    drop(_in);
+    drop(net);
+}
+
+#[test]
+fn a_device_gives_its_flags_in_ifla_info_data() {
+    let _serial = crate::TEST_DEVICES.lock();
+    dev::init();
+    let net = ns::new().unwrap();
+    let _in = ns::enter(&net);
+    // As the TUN device of `NetworkdNetDevTests.test_tuntap`: `ip -d link show` prints
+    // "tun type tun pi on vnet_hdr on multi_queue" from `IFLA_INFO_DATA`.
+    let f = TunFile::new(net.clone());
+    f.set_iff("itun0", IFF_TUN | IFF_VNET_HDR | IFF_MULTI_QUEUE).unwrap();
+    let dev = dev::by_name("itun0").unwrap();
+    let data = |persist: u8, queues: u32, disabled: u32| {
+        Vec::from([
+            (3, Vec::from([1])),
+            (4, Vec::from([1])),
+            (5, Vec::from([1])),
+            (6, Vec::from([persist])),
+            (7, Vec::from([1])),
+            (8, queues.to_ne_bytes().to_vec()),
+            (9, disabled.to_ne_bytes().to_vec()),
+        ])
+    };
+    assert_eq!(dev.driver().link_info_data(), data(0, 1, 0));
+    // As systemd-networkd: the queue goes off the device, and the device stays.
+    f.set_queue(IFF_DETACH_QUEUE).unwrap();
+    f.set_persist(true).unwrap();
+    assert_eq!(dev.driver().link_info_data(), data(1, 0, 1));
+    // A device without `IFF_MULTI_QUEUE` has no count of queues, and `IFF_NO_PI` gives "pi off".
+    let g = TunFile::new(net.clone());
+    g.set_iff("itap0", IFF_TAP | IFF_NO_PI).unwrap();
+    let tap = dev::by_name("itap0").unwrap();
+    let want: Vec<(u16, Vec<u8>)> = Vec::from([
+        (3, Vec::from([2])),
+        (4, Vec::from([0])),
+        (5, Vec::from([0])),
+        (6, Vec::from([0])),
+        (7, Vec::from([0])),
+    ]);
+    assert_eq!(tap.driver().link_info_data(), want);
+    drop(g);
+    drop(f);
+    dev::unregister(&dev);
+    assert!(dev::by_name("itun0").is_none());
+    assert!(dev::by_name("itap0").is_none());
+    drop(_in);
+    drop(net);
 }
