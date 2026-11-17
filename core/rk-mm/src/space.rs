@@ -1912,6 +1912,31 @@ impl AddressSpace {
         self.page_out_range(0, usize::MAX, want)
     }
 
+    /// Reads back each page of the space that has a swap entry for which `of` gives `true`, and
+    /// maps it in place of the entry, for `swapoff`, as `unuse_mm` of Linux. The page is charged to
+    /// the memory cgroup of the space, as a fault charges it. The reads run with no lock, as the
+    /// reads of a fault. Gives the number of pages that came back. An entry that a fault, an unmap
+    /// or `mremap` took first stays where it is now, and the caller looks again.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ENOMEM` if no frame is free or the memory cgroup is full, and `EIO` if the swap area
+    /// gives an error.
+    pub fn unuse_swap(&self, of: impl Fn(u64) -> bool) -> Result<usize, Errno> {
+        let mut n = 0;
+        for (addr, slot) in self.vm.swapped_where(of) {
+            let Prepared::Swap { slot, frame } = Read::Swap(slot).run(self.memcg())? else {
+                continue;
+            };
+            let st = self.state.lock();
+            let Some(vma) = st.vmas.find(addr) else { continue };
+            let prot = page_prot(vma, true);
+            let at = VirtAddr::new(addr);
+            n += usize::from(self.vm.swap_in(at, &slot, frame, prot).map_err(map_error)?);
+        }
+        Ok(n)
+    }
+
     /// Writes up to `want` pages of `start..end` to swap. See [`AddressSpace::page_out`]. Gives
     /// the pages that it looked at and the pages that went.
     fn page_out_range(&self, start: usize, end: usize, want: usize) -> (usize, usize) {

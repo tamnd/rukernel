@@ -1326,6 +1326,19 @@ impl VmSpace {
         Ok(())
     }
 
+    /// Gives the swap entries of the space for which `of` gives `true`, with their addresses, for
+    /// `swapoff`, as `unuse_pte_range` of Linux finds the entries of an area.
+    pub fn swapped_where(&self, of: impl Fn(u64) -> bool) -> Vec<(usize, Arc<SwapSlot>)> {
+        let mut out = Vec::new();
+        let _ = self.blocks.each(0, USER_END, |_, lock| {
+            let b = lock.lock();
+            let mine = b.swapped.iter().filter(|(_, s)| of(s.entry()));
+            out.extend(mine.map(|(a, s)| (*a, s.clone())));
+            Ok::<(), ()>(())
+        });
+        out
+    }
+
     /// The number of swap entries in `start..end`, as the `Swap` line of `/proc/PID/smaps`.
     pub fn swapped_in(&self, start: VirtAddr, end: VirtAddr) -> usize {
         let (start, end) = (start.get(), end.get());

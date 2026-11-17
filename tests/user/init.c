@@ -8840,6 +8840,57 @@ static void test_memcg_swap(void)
 	rmdir("/swapcg");
 }
 
+/* swapoff of an area with used pages reads the pages back into the processes that have them, as
+ * try_to_unuse of Linux. A child of fork has the same swap entries, and it gets its own pages. */
+static void test_swapoff(long total)
+{
+	enum { N = 64 };
+	long len = N * 4096L;
+	int to[2], from[2];
+	char c;
+
+	unsigned char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (m == MAP_FAILED || pipe(to) != 0 || pipe(from) != 0) {
+		check("mmap and pipes for swapoff", 0);
+		return;
+	}
+	for (long i = 0; i < len; i++)
+		m[i] = swap_byte(i);
+	long free = meminfo("SwapFree");
+	check("MADV_PAGEOUT of the pages before swapoff",
+	      madvise(m, len, MADV_PAGEOUT) == 0 && meminfo("SwapFree") == free - N * 4);
+	pid_t pid = fork();
+	if (pid == 0) {
+		int ok = write(from[1], "r", 1) == 1 && read(to[0], &c, 1) == 1 && swap_data(m, len);
+		_exit(ok ? 0 : 1);
+	}
+	check("the child of fork for swapoff starts", pid > 0 && read(from[0], &c, 1) == 1);
+	long long in = swap_vmstat("pswpin");
+	check("swapoff of the swap disk with used pages", syscall(SYS_swapoff, "/dev/vda") == 0);
+	check("SwapTotal goes back after swapoff", meminfo("SwapTotal") == total);
+	check("swapoff reads the pages of the parent and of the child",
+	      swap_vmstat("pswpin") == in + 2 * N);
+	unsigned char vec[N];
+	int back = mincore(m, len, vec) == 0;
+	for (int i = 0; back && i < N; i++)
+		back = vec[i] & 1;
+	check("mincore gives each page in memory after swapoff", back);
+	check("the pages of the parent are the same after swapoff", swap_data(m, len));
+	int status = 0;
+	int ok = write(to[1], "g", 1) == 1 && waitpid(pid, &status, 0) == pid;
+	check("the pages of the child are the same after swapoff",
+	      ok && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("no page comes from a disk after swapoff", swap_vmstat("pswpin") == in + 2 * N);
+	char buf[512];
+	check("/proc/swaps has no area after swapoff",
+	      read_small("/proc/swaps", buf, sizeof(buf)) > 0 && strstr(buf, "/dev/vda") == NULL);
+	munmap(m, len);
+	close(to[0]);
+	close(to[1]);
+	close(from[0]);
+	close(from[1]);
+}
+
 static void test_swap(void)
 {
 	/* With the argument "only", the general checks did not make /proc. */
@@ -8866,8 +8917,7 @@ static void test_swap(void)
 		      si.freeswap == si.totalswap);
 	test_pageout();
 	test_memcg_swap();
-	check("swapoff of the swap disk", syscall(SYS_swapoff, "/dev/vda") == 0);
-	check("SwapTotal goes back after swapoff", meminfo("SwapTotal") == total);
+	test_swapoff(total);
 	umount("/proc");
 }
 
