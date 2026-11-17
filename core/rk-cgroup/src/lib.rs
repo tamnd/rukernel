@@ -158,9 +158,16 @@ pub struct Memory {
     pub high: u64,
     /// `memory.max`.
     pub max: u64,
-    /// `memory.swap.max`. rukernel has no swap, so the value has no effect: no page of a
-    /// cgroup goes to swap with any value.
+    /// `memory.swap.max`.
     pub swap_max: u64,
+    /// The bytes of the subtree in swap areas: `memory.swap.current`.
+    pub swap: u64,
+    /// The largest value of `swap`: `memory.swap.peak`.
+    pub swap_peak: u64,
+    /// The counts `max` and `fail` of `memory.swap.events`.
+    pub swap_events: [u64; 2],
+    /// `pswpout` and `pswpin`: the pages of the subtree that went to swap and that came back.
+    pub pswp: [u64; 2],
     /// The bytes of the page cache that the subtree uses, a part of `current`.
     pub file: u64,
     /// The bytes of the page cache that this cgroup uses, without the subtree.
@@ -190,6 +197,10 @@ impl Default for Memory {
             high: MAX,
             max: MAX,
             swap_max: MAX,
+            swap: 0,
+            swap_peak: 0,
+            swap_events: [0; 2],
+            pswp: [0; 2],
             file: 0,
             file_local: 0,
             oom_group: false,
@@ -208,13 +219,12 @@ impl Default for Memory {
 struct MemConf {
     min: u64,
     low: u64,
-    swap_max: u64,
     oom_group: bool,
 }
 
 impl Default for MemConf {
     fn default() -> Self {
-        Self { min: 0, low: 0, swap_max: MAX, oom_group: false }
+        Self { min: 0, low: 0, oom_group: false }
     }
 }
 
@@ -430,7 +440,11 @@ impl Node {
             low: self.mem.low,
             high: ld(&m.high),
             max: ld(&m.max),
-            swap_max: self.mem.swap_max,
+            swap_max: ld(&m.swap_max),
+            swap: ld(&m.swap),
+            swap_peak: ld(&m.swap_peak),
+            swap_events: core::array::from_fn(|i| ld(&m.swap_events[i])),
+            pswp: core::array::from_fn(|i| ld(&m.pswp[i])),
             file: ld(&m.file),
             file_local: ld(&m.file_local),
             oom_group: self.mem.oom_group,
@@ -546,6 +560,9 @@ pub enum Effect {
     /// `memory.max` is below `memory.current`: kill processes of the subtree until the use is
     /// below the limit.
     MemoryOver,
+    /// `memory.reclaim`: take back the bytes from the subtree, of the page cache only if the
+    /// second value is false (`swappiness=0`), and give `EAGAIN` if the reclaim cannot.
+    Reclaim(u64, bool),
     /// `cpuset.cpus` changed: set the CPUs of the threads of the subtree again.
     Cpuset,
     /// `memory.high`, `io.max` or `cpu.max` changed: wake the threads that wait for these
@@ -901,7 +918,7 @@ impl Hierarchy {
         // An uncharge reads `current` and then `dead` with no lock of the tree, so one of the
         // two sees the cgroup with no charge and lets it go.
         n.c.dead.store(true, Ordering::SeqCst);
-        let keep = n.c.mem.current.load(Ordering::SeqCst) > 0;
+        let keep = n.c.mem.charged();
         if n.freeze {
             self.nr_freeze -= 1;
         }
@@ -975,7 +992,7 @@ impl Hierarchy {
     fn reap(&mut self, id: CgId) {
         for a in self.path_ids(id) {
             let Some(n) = self.nodes.get(&a) else { continue };
-            if n.dead && n.c.mem.current.load(Ordering::SeqCst) == 0 && n.children.is_empty() {
+            if n.dead && !n.c.mem.charged() && n.children.is_empty() {
                 self.nodes.remove(&a);
                 self.shared.map.write().remove(&a);
             }
@@ -1415,6 +1432,25 @@ impl Hierarchy {
         self.uncharge(id, bytes, true);
     }
 
+    /// Charges `bytes` of swap to `id` and the cgroups above it.
+    ///
+    /// # Errors
+    ///
+    /// Gives `Err` if the charge passes a `memory.swap.max`.
+    pub fn charge_swap(&mut self, id: CgId, bytes: u64) -> Result<(), ()> {
+        let Some(n) = self.nodes.get(&id) else { return Ok(()) };
+        n.c.try_charge_swap(bytes, &self.shared)
+    }
+
+    /// Removes a charge of `bytes` of swap from `id` and the cgroups above it. A removed cgroup
+    /// goes away when it has no charge left.
+    pub fn uncharge_swap(&mut self, id: CgId, bytes: u64) {
+        let Some(n) = self.nodes.get(&id) else { return };
+        if n.c.uncharge_swap(bytes).reap {
+            self.reap(id);
+        }
+    }
+
     /// Removes a charge of `bytes`, of the page cache if `file`, from `id` and the cgroups
     /// above it. A removed cgroup goes away when it has no charge left.
     fn uncharge(&mut self, id: CgId, bytes: u64, file: bool) {
@@ -1501,6 +1537,19 @@ impl Hierarchy {
     /// `memory.low`, and each cgroup at or below it counts a `low` event. The plan takes from
     /// each cgroup in proportion to what it can give.
     pub fn reclaim_plan(&mut self, root: CgId, want: u64) -> Vec<(CgId, u64)> {
+        self.plan(root, want, false)
+    }
+
+    /// Plans the reclaim of `want` bytes of anonymous memory in the subtree of `root`, as
+    /// [`Hierarchy::reclaim_plan`] for the page cache. A cgroup can give the anonymous memory of
+    /// its subtree above its protection.
+    pub fn anon_plan(&mut self, root: CgId, want: u64) -> Vec<(CgId, u64)> {
+        self.plan(root, want, true)
+    }
+
+    /// The plan of [`Hierarchy::reclaim_plan`], of anonymous memory if `anon`, else of the page
+    /// cache.
+    fn plan(&mut self, root: CgId, want: u64, anon: bool) -> Vec<(CgId, u64)> {
         let prot = self.protection(root);
         let free = |h: &Self, low_pass: bool| -> Vec<(CgId, u64)> {
             prot.iter()
@@ -1508,7 +1557,12 @@ impl Hierarchy {
                     let m = &h.nodes[&id].c.mem;
                     let keep = if low_pass { emin } else { emin.max(elow) };
                     let current = m.current.load(Ordering::Relaxed);
-                    let n = m.file_local.load(Ordering::Relaxed).min(current.saturating_sub(keep));
+                    let can = if anon {
+                        current.saturating_sub(m.file.load(Ordering::Relaxed))
+                    } else {
+                        m.file_local.load(Ordering::Relaxed)
+                    };
+                    let n = can.min(current.saturating_sub(keep));
                     (n > 0).then_some((id, n))
                 })
                 .collect()
@@ -1893,12 +1947,14 @@ impl Hierarchy {
                 let anon = mem.current.saturating_sub(mem.file);
                 format!("anon N0={anon}\nfile N0={}\n", mem.file)
             }
-            "memory.swap.current" | "memory.swap.peak" | "memory.zswap.current" => {
-                String::from("0\n")
-            }
+            "memory.swap.current" => format!("{}\n", mem.swap),
+            "memory.swap.peak" => format!("{}\n", mem.swap_peak),
+            "memory.zswap.current" => String::from("0\n"),
             "memory.swap.max" => show_max(mem.swap_max),
             "memory.swap.high" | "memory.zswap.max" => String::from("max\n"),
-            "memory.swap.events" => String::from("high 0\nmax 0\nfail 0\n"),
+            "memory.swap.events" => {
+                format!("high 0\nmax {}\nfail {}\n", mem.swap_events[0], mem.swap_events[1])
+            }
             "pids.current" => format!("{}\n", pids.current.load(Ordering::Relaxed)),
             "pids.peak" => format!("{}\n", pids.peak.load(Ordering::Relaxed)),
             "pids.max" => show_max(pids.max.load(Ordering::Relaxed)),
@@ -1921,7 +1977,7 @@ impl Hierarchy {
     pub fn local_peak(&self, id: CgId, swap: bool) -> Option<(u64, u64)> {
         let m = &self.nodes.get(&id)?.c.mem;
         Some(if swap {
-            (0, 0)
+            (m.swap.load(Ordering::Relaxed), m.swap_local_peak.load(Ordering::Relaxed))
         } else {
             (m.current.load(Ordering::Relaxed), m.local_peak.load(Ordering::Relaxed))
         })
@@ -2089,7 +2145,7 @@ impl Hierarchy {
                 if current > max { Effect::MemoryOver } else { Effect::None }
             }
             "memory.swap.max" => {
-                n.mem.swap_max = parse_bytes(data)?;
+                n.c.mem.swap_max.store(parse_bytes(data)?, Ordering::Relaxed);
                 Effect::None
             }
             "memory.swap.high" | "memory.zswap.max" => {
@@ -2097,14 +2153,17 @@ impl Hierarchy {
                 Effect::None
             }
             // A write starts a new local peak, as `peak_write` of Linux. The open file keeps
-            // the value, and `memory.peak` of the other readers does not change. rukernel has no
-            // swap, so `memory.swap.peak` stays 0.
+            // the value, and `memory.peak` of the other readers does not change.
             "memory.peak" => {
                 let current = n.c.mem.current.load(Ordering::Relaxed);
                 n.c.mem.local_peak.store(current, Ordering::Relaxed);
                 Effect::None
             }
-            "memory.swap.peak" => Effect::None,
+            "memory.swap.peak" => {
+                let swap = n.c.mem.swap.load(Ordering::Relaxed);
+                n.c.mem.swap_local_peak.store(swap, Ordering::Relaxed);
+                Effect::None
+            }
             "memory.oom.group" => {
                 n.mem.oom_group = match text(data)? {
                     "0" => false,
@@ -2113,10 +2172,21 @@ impl Hierarchy {
                 };
                 Effect::None
             }
-            // rukernel has no reclaim, so no memory comes back.
+            // The size, and a `swappiness` from 0 to 200 or `max`, as `memory_reclaim` of Linux.
+            // A swappiness of 0 takes only page cache, and `max` takes only anonymous memory.
+            // rukernel takes the page cache first for each value other than 0.
             "memory.reclaim" => {
-                parse_bytes(data)?;
-                return Err(Errno::EAGAIN);
+                let mut words = text(data)?.split_ascii_whitespace();
+                let bytes = parse_bytes(words.next().ok_or(Errno::EINVAL)?.as_bytes())?;
+                let mut anon = true;
+                for w in words {
+                    match w.strip_prefix("swappiness=") {
+                        Some("max") => {}
+                        Some(v) if v.parse::<u32>().is_ok_and(|v| v <= 200) => anon = v != "0",
+                        _ => return Err(Errno::EINVAL),
+                    }
+                }
+                Effect::Reclaim(bytes, anon)
             }
             "pids.max" => {
                 n.c.pids.max.store(parse_max(data)?, Ordering::Relaxed);
@@ -2297,6 +2367,8 @@ fn memory_stat(m: &Memory) -> String {
         ("workingset_refault_file", 0),
         ("pgscan", m.pgscan[0] + m.pgscan[1]),
         ("pgsteal", m.pgsteal[0] + m.pgsteal[1]),
+        ("pswpin", m.pswp[1]),
+        ("pswpout", m.pswp[0]),
         ("pgscan_kswapd", m.pgscan[0]),
         ("pgscan_direct", m.pgscan[1]),
         ("pgscan_khugepaged", 0),
@@ -2477,6 +2549,54 @@ pub fn reclaim(root: CgId, want: u64) -> u64 {
     plan.into_iter().map(|(id, bytes)| drop(id, bytes)).sum()
 }
 
+/// The hook of [`set_reclaim_anon`].
+static RECLAIM_ANON: Once<ReclaimFn> = Once::new();
+
+/// Sets the function that writes anonymous memory of the subtree of a cgroup to swap: it gets
+/// the cgroup and the bytes, and gives the bytes that it freed. The kernel calls this once.
+pub fn set_reclaim_anon(f: ReclaimFn) {
+    RECLAIM_ANON.call_once(|| f);
+}
+
+/// Takes back `want` bytes of the subtree of `root`: the page cache first, and then anonymous
+/// memory to swap, as `shrink_lruvec` of Linux. Gives the bytes that were freed. The caller must
+/// not hold a lock of an address space, so a fault cannot call this.
+pub fn reclaim_swap(root: CgId, want: u64) -> u64 {
+    let got = reclaim(root, want);
+    match RECLAIM_ANON.get() {
+        Some(anon) if got < want => got + anon(root, want - got),
+        _ => got,
+    }
+}
+
+/// Charges a page of swap to `id`, as `mem_cgroup_try_charge_swap` of Linux.
+///
+/// # Errors
+///
+/// Gives `Err` if the page passes a `memory.swap.max`.
+pub fn charge_swap(id: CgId) -> Result<(), ()> {
+    if id == 0 {
+        return Ok(());
+    }
+    with_counters(id, |c, sh| (c.try_charge_swap(PAGE_SIZE, sh), Changed::default()))
+        .unwrap_or(Ok(()))
+}
+
+/// Removes the charge of a page of swap from `id`.
+pub fn uncharge_swap(id: CgId) {
+    if id != 0 {
+        with_counters(id, |c, _| ((), c.uncharge_swap(PAGE_SIZE)));
+    }
+}
+
+/// Counts a page of `id` that went to swap if `out`, else that came back, for `pswpout` and
+/// `pswpin` of `memory.stat`.
+pub fn count_swap(id: CgId, out: bool) {
+    if id != 0 {
+        with_counters(id, |c, _| (c.count_swap(out, 1), Changed::default()));
+    }
+}
+
 /// Counts a reclaim of `who` that looked at `scanned` pages charged to `id` and freed `stolen`
 /// of them, of anonymous memory if `anon`, else of the page cache. The counts go to
 /// `/proc/vmstat`, and to `memory.stat` of `id` and the cgroups above it, as
@@ -2511,7 +2631,7 @@ pub fn reclaim_high(id: CgId) {
         (over, Changed::default())
     });
     for (cg, bytes) in over.unwrap_or_default() {
-        reclaim(cg, bytes);
+        reclaim_swap(cg, bytes);
     }
 }
 

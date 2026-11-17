@@ -46,7 +46,9 @@ pub(crate) fn block_exists(_dev: u64) -> bool {
 }
 
 /// Does what a write asks for: nothing on the host.
-pub(crate) fn apply(_id: CgId, _effect: Effect) {}
+pub(crate) fn apply(_id: CgId, _effect: Effect) -> Result<(), Errno> {
+    Ok(())
+}
 
 /// The timer of a pressure trigger: the host has no timers, so the trigger checks only at
 /// `poll`.

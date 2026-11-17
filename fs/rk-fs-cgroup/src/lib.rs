@@ -333,8 +333,7 @@ impl Node {
                 }
                 let t = rk_cgroup::now();
                 let effect = rk_cgroup::with(|h| h.write(self.id, name, data, t))?;
-                procs::apply(self.id, effect);
-                Ok(())
+                procs::apply(self.id, effect)
             }
         }
     }

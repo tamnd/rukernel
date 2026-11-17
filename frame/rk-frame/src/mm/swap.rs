@@ -23,6 +23,8 @@ pub struct SwapOps {
     pub write: fn(u64, &[u8]) -> Result<(), ()>,
     /// Reads the page of the entry.
     pub read: fn(u64, &mut [u8]) -> Result<(), ()>,
+    /// Counts a page of the memory cgroup that went to swap (true) or that came back (false).
+    pub count: fn(u32, bool),
 }
 
 static OPS: Once<SwapOps> = Once::new();
@@ -84,6 +86,7 @@ impl SwapSlot {
         frame.read_bytes(0, &mut buf);
         (ops.write)(self.entry, &buf)?;
         PSWPOUT.fetch_add(1, Ordering::Relaxed);
+        (ops.count)(self.memcg, true);
         Ok(())
     }
 
@@ -98,6 +101,7 @@ impl SwapSlot {
         (ops.read)(self.entry, &mut buf)?;
         frame.write_bytes(0, &buf);
         PSWPIN.fetch_add(1, Ordering::Relaxed);
+        (ops.count)(self.memcg, false);
         Ok(())
     }
 }

@@ -1898,6 +1898,23 @@ impl AddressSpace {
     /// went.
     pub fn page_out(&self, addr: usize, len: usize) -> usize {
         let Ok((start, end)) = Self::lock_range(addr, len) else { return 0 };
+        self.page_out_range(start, end, usize::MAX).1
+    }
+
+    /// Writes up to `want` private anonymous pages of the space to a swap area and frees their
+    /// frames, for the reclaim of a memory cgroup or of the system, as `shrink_folio_list` of
+    /// Linux. The pages are the pages of [`AddressSpace::page_out`]. Gives the pages that the
+    /// reclaim looked at and the pages that went, for `pgscan_anon` and `pgsteal_anon`.
+    pub fn reclaim_anon(&self, want: usize) -> (usize, usize) {
+        if want == 0 {
+            return (0, 0);
+        }
+        self.page_out_range(0, usize::MAX, want)
+    }
+
+    /// Writes up to `want` pages of `start..end` to swap. See [`AddressSpace::page_out`]. Gives
+    /// the pages that it looked at and the pages that went.
+    fn page_out_range(&self, start: usize, end: usize, want: usize) -> (usize, usize) {
         let st = self.state.lock();
         let mut pages = Vec::new();
         for vma in st.vmas.iter().filter(|v| v.start < end && start < v.end) {
@@ -1909,12 +1926,16 @@ impl AddressSpace {
         // The writes wait for the disk, so they run with no lock of the areas, as the write back
         // of `munmap`.
         drop(st);
-        let mut n = 0;
+        let (mut scanned, mut n) = (0, 0);
         for page in pages {
+            if n >= want {
+                break;
+            }
             let Some(slot) = SwapSlot::alloc(self.memcg()) else { break };
+            scanned += 1;
             n += usize::from(self.swap_out(page, slot));
         }
-        n
+        (scanned, n)
     }
 
     /// Writes the page at `page` to the swap entry `slot`, and puts the entry in place of the

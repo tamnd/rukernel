@@ -401,6 +401,11 @@ pub fn system_oom(thread: &Thread) -> bool {
     if rk_frame::mm::frame_stats().free > system_reserve() {
         return true;
     }
+    // Then anonymous memory goes to swap, and the fault tries again while the reclaim frees
+    // pages.
+    if reclaim_anon(rk_cgroup::ROOT, RECLAIM_BATCH) > 0 {
+        return true;
+    }
     // A victim that is still on its way out frees its memory soon: wait for it, as Linux does
     // for a task with `TIF_MEMDIE`.
     let all: Vec<Arc<Process>> =
@@ -463,6 +468,11 @@ pub fn memcg_oom(thread: &Thread) -> bool {
         }
         Err(id) => id,
     };
+    // Anonymous memory goes to swap before a kill, as `try_charge_memcg` of Linux does a
+    // reclaim before `mem_cgroup_oom`. The fault holds no lock of the space now.
+    if reclaim_anon(blocking, RECLAIM_BATCH) > 0 {
+        return true;
+    }
     let cg = thread.cgroup();
     rk_cgroup::with(|h| h.count_oom(blocking));
     rk_cgroup::psi_change(cg, |c| c.memstall += 1);
@@ -482,6 +492,84 @@ pub fn memcg_oom(thread: &Thread) -> bool {
     victim.is_some()
 }
 
+/// The bytes of the anonymous reclaim for a fault that a memory cgroup or the system refused, as
+/// `SWAP_CLUSTER_MAX` pages of Linux.
+const RECLAIM_BATCH: u64 = 32 * crate::PAGE_SIZE as u64;
+
+/// Writes up to `want` bytes of anonymous memory of the subtree of `id` to swap, as the reclaim of
+/// the anonymous LRU lists of Linux in `shrink_lruvec`. The plan of `Hierarchy::anon_plan` keeps
+/// the protection of `memory.min` and `memory.low`. For the root, each process can give its
+/// pages. The reclaim counts in `pgscan_anon` and `pgsteal_anon`. Gives the bytes that went.
+pub fn reclaim_anon(id: CgId, want: u64) -> u64 {
+    if want == 0 || rk_vfs::swap::used_pages() >= rk_vfs::swap::total_pages() {
+        return 0;
+    }
+    let page = crate::PAGE_SIZE as u64;
+    let plan = if id == rk_cgroup::ROOT {
+        alloc::vec![(rk_cgroup::ROOT, want)]
+    } else {
+        rk_cgroup::with(|h| h.anon_plan(id, want))
+    };
+    let all: Vec<Arc<Process>> = processes().into_iter().filter(|p| !p.is_zombie()).collect();
+    let mut got = 0;
+    for (cg, bytes) in plan {
+        let mut left = bytes.min(want - got).div_ceil(page) as usize;
+        let mine = |p: &&Arc<Process>| cg == rk_cgroup::ROOT || p.memcg() == cg;
+        for p in all.iter().filter(mine) {
+            if left == 0 {
+                break;
+            }
+            let Some(vm) = p.vm() else { continue };
+            let (scanned, stolen) = vm.reclaim_anon(left);
+            let who = if id == rk_cgroup::ROOT {
+                rk_frame::mm::Reclaimer::Direct
+            } else {
+                rk_frame::mm::Reclaimer::Cgroup
+            };
+            rk_cgroup::count_reclaim(p.memcg(), who, true, scanned as u64, stolen as u64);
+            left -= stolen.min(left);
+            got += stolen as u64 * page;
+        }
+        if got >= want {
+            break;
+        }
+    }
+    got
+}
+
+/// Takes back `want` bytes of the subtree of `id`: the page cache, and then anonymous memory if
+/// `anon`. Gives the bytes that were freed.
+fn reclaim_some(id: CgId, want: u64, anon: bool) -> u64 {
+    let got = rk_cgroup::reclaim(id, want);
+    if anon && got < want { got + reclaim_anon(id, want - got) } else { got }
+}
+
+/// Takes back `want` bytes of the subtree of `id` for a write of `memory.reclaim`, as
+/// `memory_reclaim` of Linux: the page cache first, and then anonymous memory to swap if `anon`.
+///
+/// # Errors
+///
+/// `EAGAIN` if the reclaim stops with less than `want` bytes, and `EINTR` if the thread gets a
+/// kill.
+pub fn memory_reclaim(id: CgId, want: u64, anon: bool) -> Result<(), Errno> {
+    let (mut got, mut retries) = (0u64, 16);
+    while got < want {
+        if crate::current_thread().is_some_and(|t| t.is_killed()) {
+            return Err(Errno::EINTR);
+        }
+        // `MAX_RECLAIM_RETRIES` of Linux: a reclaim that frees nothing counts.
+        let n = reclaim_some(id, (want - got).min(RECLAIM_BATCH * 4), anon);
+        if n == 0 {
+            retries -= 1;
+            if retries == 0 {
+                return Err(Errno::EAGAIN);
+            }
+        }
+        got += n;
+    }
+    Ok(())
+}
+
 /// Takes memory back from the subtree of `id`, and then kills processes in it, until its memory
 /// use is below `memory.max`, after a write of the limit, as `memory_max_write` of Linux.
 pub fn reclaim_over_limit(id: CgId) {
@@ -492,7 +580,7 @@ pub fn reclaim_over_limit(id: CgId) {
             return;
         }
         // `MAX_RECLAIM_RETRIES` of Linux.
-        if tries < 16 && rk_cgroup::reclaim(id, over) > 0 {
+        if tries < 16 && reclaim_some(id, over, true) > 0 {
             tries += 1;
             continue;
         }
