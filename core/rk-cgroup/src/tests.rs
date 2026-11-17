@@ -966,7 +966,73 @@ fn memory_stat_counts_the_reclaim_of_the_subtree() {
     // The sums come before the counts of each reclaimer, as `memory_stat_format` of Linux.
     let text = h.read(a, "memory.stat", 0).unwrap();
     assert!(text.contains(
-        "\npgscan 14\npgsteal 9\npgscan_kswapd 4\npgscan_direct 10\npgscan_khugepaged 0\n\
-         pgsteal_kswapd 3\npgsteal_direct 6\npgsteal_khugepaged 0\npgfault 0\n"
+        "\npgscan 14\npgsteal 9\npswpin 0\npswpout 0\npgscan_kswapd 4\npgscan_direct 10\n\
+         pgscan_khugepaged 0\npgsteal_kswapd 3\npgsteal_direct 6\npgsteal_khugepaged 0\n\
+         pgfault 0\n"
     ));
+}
+
+#[test]
+fn swap_counts_in_the_subtree_and_stops_at_memory_swap_max() {
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    h.write(a, "memory.swap.max", b"8192", 0).unwrap();
+    assert_eq!(h.read(a, "memory.swap.max", 0).unwrap(), "8192\n");
+    assert_eq!(h.charge_swap(b, 4096), Ok(()));
+    assert_eq!(h.charge_swap(b, 4096), Ok(()));
+    // The third page passes the limit of A, so B and A keep two pages.
+    assert_eq!(h.charge_swap(b, 4096), Err(()));
+    assert_eq!(h.read(b, "memory.swap.current", 0).unwrap(), "8192\n");
+    assert_eq!(h.read(a, "memory.swap.current", 0).unwrap(), "8192\n");
+    assert_eq!(h.read(a, "memory.swap.events", 0).unwrap(), "high 0\nmax 1\nfail 1\n");
+    h.uncharge_swap(b, 4096);
+    assert_eq!(h.read(a, "memory.swap.current", 0).unwrap(), "4096\n");
+    assert_eq!(h.read(a, "memory.swap.peak", 0).unwrap(), "8192\n");
+    // A removed cgroup with swap stays until its swap is free, as the swap entries of Linux
+    // keep the ID of their memory cgroup.
+    assert_eq!(h.rmdir(a, b"b"), Ok(b));
+    assert!(h.memory(b).is_some());
+    h.uncharge_swap(b, 4096);
+    assert!(h.memory(b).is_none());
+    assert_eq!(h.read(a, "memory.swap.current", 0).unwrap(), "0\n");
+}
+
+#[test]
+fn memory_reclaim_takes_a_size_and_a_swappiness() {
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    let mut w = |data: &[u8]| h.write(a, "memory.reclaim", data, 0);
+    assert_eq!(w(b"1M\n"), Ok(Effect::Reclaim(1 << 20, true)));
+    assert_eq!(w(b"8192 swappiness=0"), Ok(Effect::Reclaim(8192, false)));
+    assert_eq!(w(b"8192 swappiness=max"), Ok(Effect::Reclaim(8192, true)));
+    assert_eq!(w(b"8192 swappiness=60"), Ok(Effect::Reclaim(8192, true)));
+    assert_eq!(w(b"8192 swappiness=201"), Err(Errno::EINVAL));
+    assert_eq!(w(b"8192 x=1"), Err(Errno::EINVAL));
+    assert_eq!(w(b""), Err(Errno::EINVAL));
+}
+
+#[test]
+fn the_anonymous_plan_keeps_the_page_cache_and_the_protection() {
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    let c = h.mkdir(a, b"c", 0).unwrap();
+    // B has 64 KiB of anonymous memory and 64 KiB of page cache. C has 64 KiB of anonymous
+    // memory, all under its `memory.min`.
+    h.charge_memory(b, 64 << 10).unwrap();
+    h.charge_file(b, 64 << 10);
+    h.charge_memory(c, 64 << 10).unwrap();
+    h.write(c, "memory.min", b"64K", 0).unwrap();
+    let plan = h.anon_plan(a, 1 << 20);
+    assert!(plan.contains(&(b, 64 << 10)), "{plan:?}");
+    assert!(!plan.iter().any(|p| p.0 == c), "{plan:?}");
+    // The plan takes from each cgroup in proportion to what it can give.
+    let plan = h.anon_plan(b, 16 << 10);
+    assert_eq!(plan, alloc::vec![(b, 16 << 10)]);
 }

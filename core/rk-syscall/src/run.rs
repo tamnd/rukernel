@@ -390,13 +390,26 @@ pub fn init() {
         },
         limit: rk_frame::mm::frame_stats().total * 4096 / 4,
     });
-    // The anonymous pages that go to swap use the swap areas of `swapon`.
+    // The anonymous pages that go to swap use the swap areas of `swapon`, and the swap of the
+    // memory cgroup of the page counts them, as `folio_alloc_swap` of Linux.
     rk_frame::mm::set_swap_ops(rk_frame::mm::SwapOps {
-        alloc: |_| rk_vfs::swap::alloc(),
-        free: |entry, _| rk_vfs::swap::free(entry),
+        alloc: |memcg| {
+            rk_cgroup::charge_swap(memcg).ok()?;
+            let entry = rk_vfs::swap::alloc();
+            if entry.is_none() {
+                rk_cgroup::uncharge_swap(memcg);
+            }
+            entry
+        },
+        free: |entry, memcg| {
+            rk_vfs::swap::free(entry);
+            rk_cgroup::uncharge_swap(memcg);
+        },
         write: |entry, data| rk_vfs::swap::write_page(entry, data).map_err(drop),
         read: |entry, buf| rk_vfs::swap::read_page(entry, buf).map_err(drop),
+        count: rk_cgroup::count_swap,
     });
+    rk_cgroup::set_reclaim_anon(rk_proc::cgroup::reclaim_anon);
     rk_drv_tty::set_signal_handler(|pgrp, sig| {
         let _ = crate::signal::signal_group(pgrp, SigInfo::new(sig, SI_KERNEL, 0));
     });

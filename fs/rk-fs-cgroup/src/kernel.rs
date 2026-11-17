@@ -90,13 +90,20 @@ pub(crate) fn block_exists(dev: u64) -> bool {
 }
 
 /// Does what `effect` of a write of the cgroup `id` asks for.
-pub(crate) fn apply(id: CgId, effect: Effect) {
+///
+/// # Errors
+///
+/// `EAGAIN` if `memory.reclaim` cannot take back the memory, and `EINTR` if the thread gets a
+/// signal during it.
+pub(crate) fn apply(id: CgId, effect: Effect) -> Result<(), Errno> {
     match effect {
         Effect::None => {}
         Effect::Kill => rk_proc::cgroup::kill_subtree(id),
         Effect::Freeze => rk_proc::cgroup::freeze_changed(id),
         Effect::MemoryOver => rk_proc::cgroup::reclaim_over_limit(id),
+        Effect::Reclaim(bytes, anon) => return rk_proc::cgroup::memory_reclaim(id, bytes, anon),
         Effect::Cpuset => rk_proc::cgroup::update_cpus(id),
         Effect::Throttle => rk_proc::cgroup::limits_changed(),
     }
+    Ok(())
 }

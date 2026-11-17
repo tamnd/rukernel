@@ -8731,6 +8731,115 @@ static void test_pageout(void)
 	check("munmap frees the pages of the swap area", meminfo("SwapFree") == free);
 }
 
+/* The number in the file `name` of the cgroup /swapcg/rk_swap, or the value of the key `key` in
+ * it if `key` is not NULL. Gives -1 if the file cannot be read. */
+static long long swapcg_value(const char *name, const char *key)
+{
+	char path[96], buf[4096];
+
+	snprintf(path, sizeof(path), "/swapcg/rk_swap/%s", name);
+	if (read_small(path, buf, sizeof(buf)) <= 0)
+		return -1;
+	return key ? vmstat_value(buf, key) : strtoll(buf, NULL, 10);
+}
+
+/* The child of test_memcg_swap: it moves to the cgroup, writes 1 MiB of anonymous pages, and
+ * waits. Then it writes 256 KiB more over memory.high, waits, and checks the first pages. */
+static int memcg_swap_child(int rd, int wr)
+{
+	long len = 256 * 4096L;
+	char c;
+
+	if (cg_write("/swapcg/rk_swap/cgroup.procs", "0") != 0)
+		return 100;
+	unsigned char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (m == MAP_FAILED)
+		return 101;
+	for (long i = 0; i < len; i++)
+		m[i] = swap_byte(i);
+	if (write(wr, "r", 1) != 1 || read(rd, &c, 1) != 1)
+		return 102;
+	unsigned char *more = mmap(NULL, len / 4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (more == MAP_FAILED)
+		return 103;
+	memset(more, 1, len / 4);
+	if (write(wr, "h", 1) != 1 || read(rd, &c, 1) != 1)
+		return 104;
+	return swap_data(m, len) ? 0 : 1;
+}
+
+/* The reclaim of a memory cgroup writes its anonymous pages to swap, as shrink_lruvec of Linux:
+ * memory.reclaim, memory.high, memory.swap.current, memory.swap.max, memory.swap.events, and
+ * pswpout and pgsteal of memory.stat. systemd-oomd reads these files (#752). */
+static void test_memcg_swap(void)
+{
+	int to[2], from[2];
+	char c;
+
+	mkdir("/swapcg", 0755);
+	if (mount("none", "/swapcg", "cgroup2", 0, NULL) != 0) {
+		check("mount cgroup2 for the swap of a cgroup", 0);
+		return;
+	}
+	check("the memory controller for the swap of a cgroup",
+	      cg_write("/swapcg/cgroup.subtree_control", "+memory") == 0 &&
+		      mkdir("/swapcg/rk_swap", 0755) == 0);
+	if (pipe(to) != 0 || pipe(from) != 0) {
+		check("pipes for the swap of a cgroup", 0);
+		return;
+	}
+	pid_t pid = fork();
+	if (pid == 0)
+		_exit(memcg_swap_child(to[0], from[1]));
+	int ok = pid > 0 && read(from[0], &c, 1) == 1;
+	check("the child of the cgroup writes its pages", ok);
+	if (!ok)
+		return;
+	long long steal = swap_vmstat("pgsteal_anon");
+	check("memory.reclaim writes anonymous pages of the cgroup to swap",
+	      cg_write("/swapcg/rk_swap/memory.reclaim", "512K") == 0);
+	long long swapped = swapcg_value("memory.swap.current", NULL);
+	check("memory.swap.current has the pages of the reclaim", swapped >= 512 * 1024);
+	check("pswpout and pgsteal of memory.stat count the pages",
+	      swapcg_value("memory.stat", "pswpout") >= 128 &&
+		      swapcg_value("memory.stat", "pgsteal") >= 128);
+	check("pgsteal_anon of /proc/vmstat counts the pages", swap_vmstat("pgsteal_anon") >= steal + 128);
+
+	/* With no swap left for the cgroup, the reclaim cannot free its anonymous pages. */
+	cg_write("/swapcg/rk_swap/memory.swap.max", "0");
+	errno = 0;
+	check("memory.reclaim gives EAGAIN at memory.swap.max",
+	      cg_write("/swapcg/rk_swap/memory.reclaim", "4M") == -1 && errno == EAGAIN);
+	check("memory.swap.events counts the max",
+	      swapcg_value("memory.swap.events", "max") >= 1 &&
+		      swapcg_value("memory.swap.events", "fail") >= 1);
+	cg_write("/swapcg/rk_swap/memory.swap.max", "max");
+
+	/* Pages over memory.high go to swap at the return of the child to user mode. */
+	char high[32];
+	snprintf(high, sizeof(high), "%lld", swapcg_value("memory.current", NULL));
+	cg_write("/swapcg/rk_swap/memory.high", high);
+	ok = write(to[1], "g", 1) == 1 && read(from[0], &c, 1) == 1;
+	check("memory.high makes the cgroup write pages to swap",
+	      ok && swapcg_value("memory.events", "high") >= 1 &&
+		      swapcg_value("memory.swap.current", NULL) > swapped);
+	cg_write("/swapcg/rk_swap/memory.high", "max");
+
+	int status = 0;
+	ok = write(to[1], "g", 1) == 1 && waitpid(pid, &status, 0) == pid;
+	check("the pages of the cgroup come back from swap",
+	      ok && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("memory.swap.current goes to 0 at the end of the child",
+	      swapcg_value("memory.swap.current", NULL) == 0);
+	check("rmdir of the cgroup after the swap", rmdir("/swapcg/rk_swap") == 0);
+	close(to[0]);
+	close(to[1]);
+	close(from[0]);
+	close(from[1]);
+	umount("/swapcg");
+	rmdir("/swapcg");
+}
+
 static void test_swap(void)
 {
 	/* With the argument "only", the general checks did not make /proc. */
@@ -8756,6 +8865,7 @@ static void test_swap(void)
 	      sysinfo(&si) == 0 && si.totalswap * si.mem_unit == 16380 * 1024ULL &&
 		      si.freeswap == si.totalswap);
 	test_pageout();
+	test_memcg_swap();
 	check("swapoff of the swap disk", syscall(SYS_swapoff, "/dev/vda") == 0);
 	check("SwapTotal goes back after swapoff", meminfo("SwapTotal") == total);
 	umount("/proc");

@@ -69,6 +69,27 @@ pub(crate) struct MemCounters {
     /// `pgsteal_kswapd` and `pgsteal_direct` of `memory.stat`: the pages of the subtree that the
     /// reclaim freed.
     pub(crate) steal: [AtomicU64; 2],
+    /// The bytes of the subtree in swap areas: `memory.swap.current`.
+    pub(crate) swap: AtomicU64,
+    /// The largest value of `swap`: `memory.swap.peak`.
+    pub(crate) swap_peak: AtomicU64,
+    /// The largest value of `swap` after the last write of `memory.swap.peak`.
+    pub(crate) swap_local_peak: AtomicU64,
+    /// `memory.swap.max`.
+    pub(crate) swap_max: AtomicU64,
+    /// The counts `max` and `fail` of `memory.swap.events`.
+    pub(crate) swap_events: [AtomicU64; 2],
+    /// `pswpout` and `pswpin` of `memory.stat`: the pages of the subtree that went to swap and
+    /// that came back.
+    pub(crate) pswp: [AtomicU64; 2],
+}
+
+impl MemCounters {
+    /// Tells if memory or swap is charged to the cgroup, so that a removed cgroup must stay, as
+    /// the swap entries of Linux keep the ID of their memory cgroup.
+    pub(crate) fn charged(&self) -> bool {
+        self.current.load(Ordering::SeqCst) > 0 || self.swap.load(Ordering::SeqCst) > 0
+    }
 }
 
 /// The counts of the pids controller of one cgroup.
@@ -153,6 +174,7 @@ impl Counters {
         };
         c.mem.high.store(MAX, Ordering::Relaxed);
         c.mem.max.store(MAX, Ordering::Relaxed);
+        c.mem.swap_max.store(MAX, Ordering::Relaxed);
         c.pids.max.store(MAX, Ordering::Relaxed);
         c
     }
@@ -190,6 +212,68 @@ impl Counters {
         for c in self.path() {
             c.mem.scan[i].fetch_add(scanned, Ordering::Relaxed);
             c.mem.steal[i].fetch_add(stolen, Ordering::Relaxed);
+        }
+    }
+
+    /// Charges `bytes` of swap to this cgroup and the cgroups above it, as
+    /// `__mem_cgroup_try_charge_swap` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// Gives `Err` if the charge passes the `memory.swap.max` of a cgroup of the path. That
+    /// cgroup and the cgroups above it count a `max` and a `fail` event of `memory.swap.events`.
+    pub(crate) fn try_charge_swap(&self, bytes: u64, sh: &Shared) -> Result<(), ()> {
+        for c in self.path() {
+            let new = c.mem.swap.fetch_add(bytes, Ordering::SeqCst) + bytes;
+            let max = c.mem.swap_max.load(Ordering::Relaxed);
+            if c.on(MEMORY) && max != MAX && new > max {
+                for b in self.path() {
+                    b.mem.swap.fetch_sub(bytes, Ordering::SeqCst);
+                    if core::ptr::eq(b, c) {
+                        break;
+                    }
+                }
+                c.swap_event(0, sh);
+                c.swap_event(1, sh);
+                return Err(());
+            }
+        }
+        for c in self.path() {
+            let swap = c.mem.swap.load(Ordering::Relaxed);
+            c.mem.swap_peak.fetch_max(swap, Ordering::Relaxed);
+            c.mem.swap_local_peak.fetch_max(swap, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Removes a charge of `bytes` of swap from this cgroup and the cgroups above it. `reap` of
+    /// the result tells that a removed cgroup has no charge now.
+    pub(crate) fn uncharge_swap(&self, bytes: u64) -> Changed {
+        let mut out = Changed::default();
+        for c in self.path() {
+            sub_sat(&c.mem.swap, bytes);
+            if c.dead.load(Ordering::SeqCst) && !c.mem.charged() {
+                out.reap = true;
+            }
+        }
+        out
+    }
+
+    /// Counts the event `ev` of `memory.swap.events`, 0 for `max` and 1 for `fail`, in this
+    /// cgroup and the cgroups above it.
+    pub(crate) fn swap_event(&self, ev: usize, sh: &Shared) {
+        for c in self.path() {
+            c.mem.swap_events[ev].fetch_add(1, Ordering::Relaxed);
+            c.files_seq.fetch_add(1, Ordering::Relaxed);
+        }
+        sh.notify.store(true, Ordering::SeqCst);
+    }
+
+    /// Counts `n` pages of this cgroup that went to swap if `out`, else that came back, in this
+    /// cgroup and the cgroups above it.
+    pub(crate) fn count_swap(&self, out: bool, n: u64) {
+        for c in self.path() {
+            c.mem.pswp[usize::from(!out)].fetch_add(n, Ordering::Relaxed);
         }
     }
 
@@ -269,7 +353,7 @@ impl Counters {
             }
             // `rmdir` sets `dead` and then reads `current`, and this reads them in the other
             // order, so one of the two sees the cgroup with no charge.
-            if left == 0 && c.dead.load(Ordering::SeqCst) {
+            if left == 0 && c.dead.load(Ordering::SeqCst) && !c.mem.charged() {
                 out.reap = true;
             }
         }
