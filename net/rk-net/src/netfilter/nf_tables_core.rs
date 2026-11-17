@@ -57,6 +57,8 @@ mod nft_exthdr;
 mod nft_fib;
 #[path = "nft_flowtable.rs"]
 mod nft_flowtable;
+#[path = "nft_inner.rs"]
+mod nft_inner;
 #[path = "nft_objects.rs"]
 mod nft_objects;
 #[path = "nft_osf.rs"]
@@ -83,6 +85,7 @@ use self::nft_flowtable::nft_flow_offload_init;
 pub(super) use self::nft_flowtable::{
     NFTA_FLOWTABLE_MAX, NftFlowtable, nf_tables_dump_flowtable, nf_tables_getflowtable,
 };
+use self::nft_inner::{NftInner, nft_inner_eval, nft_inner_init};
 pub(super) use self::nft_objects::{
     NFT_OBJECT_MAX, NFTA_OBJ_MAX, NftObj, NftObjState, nf_tables_dump_obj, nf_tables_getobj,
     nft_obj_commit, nft_set_exprs_dump, nft_set_exprs_parse, nft_setelem_parse_obj,
@@ -347,6 +350,8 @@ pub(super) enum NftExpr {
     Xfrm(NftXfrm),
     /// `osf`, as nft_osf.c.
     Osf(NftOsf),
+    /// `inner`, as nft_inner.c: a `payload` or a `meta` of the packet in a tunnel.
+    Inner(NftInner),
     /// `exthdr`, as nft_exthdr.c.
     Exthdr(NftExthdr),
     /// `dynset`, as nft_dynset.c.
@@ -636,6 +641,48 @@ fn nft_verdict_chain_dump(b: &mut Builder, nla: &[u8], path: &[u32], chain: &[u8
     }
 }
 
+/// The names of the expressions of `nf_tables_expr_parse`, for `inner`: an expression that the
+/// kernel has but that cannot go in a tunnel gives `EOPNOTSUPP`, and another name `ENOENT`.
+const NFT_EXPR_TYPES: &[&[u8]] = &[
+    b"immediate",
+    b"cmp",
+    b"payload",
+    b"meta",
+    b"bitwise",
+    b"counter",
+    b"lookup",
+    b"ct",
+    b"nat",
+    b"masq",
+    b"redir",
+    b"byteorder",
+    b"range",
+    b"numgen",
+    b"queue",
+    b"hash",
+    b"limit",
+    b"quota",
+    b"connlimit",
+    b"objref",
+    b"flow_offload",
+    b"log",
+    b"reject",
+    b"fib",
+    b"rt",
+    b"xfrm",
+    b"osf",
+    b"inner",
+    b"exthdr",
+    b"dynset",
+    b"match",
+    b"target",
+];
+
+/// Whether the kernel has the expression `name`.
+fn nft_expr_type_known(name: &[u8]) -> bool {
+    NFT_EXPR_TYPES.contains(&name)
+}
+
 /// Reads an expression of a rule of `table`, as `nf_tables_expr_parse` and the `init` of each
 /// expression of Linux.
 pub(super) fn nf_tables_expr_parse(
@@ -840,6 +887,7 @@ pub(super) fn nf_tables_expr_parse(
         b"rt" => Ok(NftExpr::Rt(nft_rt_init(table.family, data)?)),
         b"xfrm" => Ok(NftExpr::Xfrm(nft_xfrm_init(table.family, data)?)),
         b"osf" => Ok(NftExpr::Osf(nft_osf_init(table.family, data)?)),
+        b"inner" => Ok(NftExpr::Inner(nft_inner_init(data)?)),
         b"exthdr" => Ok(NftExpr::Exthdr(nft_exthdr_init(table.family, data)?)),
         b"dynset" => nft_dynset_init(table, data),
         b"match" | b"target" => {
@@ -1917,6 +1965,7 @@ fn nft_eval(
             NftExpr::Rt(r) => nft_rt_eval(r, regs, skb.data(), skb.mark, state),
             NftExpr::Xfrm(x) => nft_xfrm_eval(x, regs),
             NftExpr::Osf(o) => nft_osf_eval(o, regs, skb.data(), state, pkt),
+            NftExpr::Inner(i) => nft_inner_eval(i, regs, skb.data(), pkt),
             NftExpr::Exthdr(x) => nft_exthdr_eval(x, regs, skb, state, pkt),
             // A chain that a jump reaches from a hook with no `reject` does not reject.
             NftExpr::Reject(r) => {
