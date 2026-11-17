@@ -316,6 +316,12 @@ impl Table6 {
         }
     }
 
+    /// The interface of the local address `a`, or `None` if `a` is not local. Linux gives it as
+    /// the device of `rt6i_idev` of the route to a local address, in `ip6_rt_copy_init`.
+    pub fn local_dev(&self, a: &Ip) -> Option<u32> {
+        self.addrs.iter().find(|x| x.addr == *a).map(|x| x.ifindex)
+    }
+
     /// Tells if the interface `ifindex` takes a packet to the multicast address `a`: the groups
     /// of all of the nodes and the solicited node groups of its addresses, as the groups that
     /// `ipv6_dev_mc_inc` joins in Linux.

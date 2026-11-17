@@ -801,6 +801,13 @@ impl Table {
         self.addr_type(a) == RTN_LOCAL
     }
 
+    /// The device of the local route of `a`, or `None` if `a` is not local. Linux gives it as
+    /// the `rt_iif` of a route to a local address, in `ip_route_output_key_hash_rcu`.
+    pub fn local_dev(&self, a: Addr) -> Option<u32> {
+        let r = self.table_lookup(RT_TABLE_LOCAL, a, 0, 0)?;
+        (u32::from(r.kind) == RTN_LOCAL).then_some(r.ifindex)
+    }
+
     /// Tells if `a` is a broadcast address: `255.255.255.255` or a `broadcast` route.
     pub fn is_broadcast(&self, a: Addr) -> bool {
         a == ipv4::BROADCAST
