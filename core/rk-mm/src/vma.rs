@@ -105,6 +105,9 @@ pub struct Vma<F> {
     /// The area can get write access. It is false for a shared mapping of a file that is not open
     /// for writing. Linux names it `VM_MAYWRITE`.
     pub may_write: bool,
+    /// The area can get exec access. It is false for a mapping of a BPF map. Linux names it
+    /// `VM_MAYEXEC`.
+    pub may_exec: bool,
     /// `mlock`: the pages of the area stay in memory. Linux names it `VM_LOCKED`. R1 has no swap,
     /// so the flag only changes the counts that procfs shows.
     pub locked: bool,
@@ -150,6 +153,7 @@ impl<F: Clone> Vma<F> {
             prot,
             shared: false,
             may_write: true,
+            may_exec: true,
             locked: false,
             grows_down: false,
             mergeable: false,
@@ -207,6 +211,7 @@ impl<F: PartialEq> Vma<F> {
             && self.prot == other.prot
             && self.shared == other.shared
             && self.may_write == other.may_write
+            && self.may_exec == other.may_exec
             && self.locked == other.locked
             && self.grows_down == other.grows_down
             && self.mergeable == other.mergeable
@@ -606,6 +611,7 @@ mod tests {
             prot: Prot::RW,
             shared: true,
             may_write: true,
+            may_exec: true,
             locked: false,
             grows_down: false,
             mergeable: false,

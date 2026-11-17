@@ -1,6 +1,6 @@
 # systemd integration test results
 
-This file gives the results of three integration tests of systemd on rukernel and on the Linux reference kernel, for issue #536: TEST-07-PID1, TEST-19-CGROUP and TEST-55-OOMD.
+This file gives the results of four integration tests of systemd on rukernel and on the Linux reference kernel: TEST-07-PID1, TEST-19-CGROUP and TEST-55-OOMD for issue #536, and TEST-62-RESTRICT-IFACES for issue #762.
 
 ## How the tests run
 
@@ -12,10 +12,12 @@ RK_SYSTEMD_PACKAGES="systemd-tests systemd-oomd stress-ng systemd-container dbus
     tools/systemd/build.sh sd-tree.tar.gz
 python3 tools/systemd/integration.py --tree sd-tree.tar.gz \
     --kernel target/x86_64-unknown-none/release/rukernel --busybox busybox --memory 1G \
-    --out it-rk TEST-07-PID1 TEST-19-CGROUP TEST-55-OOMD
+    --out it-rk TEST-07-PID1 TEST-19-CGROUP TEST-55-OOMD \
+    TEST-62-RESTRICT-IFACES
 python3 tools/systemd/integration.py --linux --modules /lib/modules/6.8.0-147-generic \
     --tree sd-tree.tar.gz --kernel /boot/vmlinuz-6.8.0-147-generic --busybox busybox \
-    --memory 1G --out it-linux TEST-07-PID1 TEST-19-CGROUP TEST-55-OOMD
+    --memory 1G --out it-linux TEST-07-PID1 TEST-19-CGROUP TEST-55-OOMD \
+    TEST-62-RESTRICT-IFACES
 python3 tools/systemd/integration.py --report it-linux/*.log it-rk/*.log
 ```
 
@@ -29,6 +31,7 @@ The runs are from 2026-11-16, with rukernel 0.5.34 and the changes of #536, and 
 
 - x86_64: rukernel and Linux 6.8.0-147-generic ran on server1, one machine at a time. The load average was between 0.2 and 9 during the runs of rukernel.
 - arm64: rukernel ran on server2, with a load average between 20 and 42 from other jobs. TEST-07-PID1 is from the last build. TEST-19-CGROUP and TEST-55-OOMD are from an earlier build, rukernel 0.5.30 with the earlier changes of #536. There is no arm64 run of Linux, because the arm64 reference kernel has no PSI, which TEST-55-OOMD needs, and a run of TEST-07-PID1 takes more than 3 hours on that host.
+- #762: the x86_64 row of TEST-07-PID1 exec-context and the rows of TEST-62-RESTRICT-IFACES are from 2026-11-17, with the changes of #762. rukernel ran on server1 with a load average between 1 and 3, and Linux 6.8.0-147-generic ran TEST-62-RESTRICT-IFACES on server2 with a load average between 11 and 20. There is no arm64 run of TEST-62-RESTRICT-IFACES.
 
 ### x86_64
 
@@ -37,7 +40,7 @@ The runs are from 2026-11-16, with rukernel 0.5.34 and the changes of #536, and 
 | TEST-07-PID1 | (all) | fail (exit-code, 1) | fail (exit-code, 1) |
 | TEST-07-PID1 | DeferReactivation | pass | pass |
 | TEST-07-PID1 | aux-scope | pass | pass |
-| TEST-07-PID1 | exec-context | pass | fail |
+| TEST-07-PID1 | exec-context | pass | pass |
 | TEST-07-PID1 | exec-deserialization | fail | pass |
 | TEST-07-PID1 | exec-deserialization testcase_added_after | pass | pass |
 | TEST-07-PID1 | exec-deserialization testcase_added_before | pass | pass |
@@ -98,6 +101,7 @@ The runs are from 2026-11-16, with rukernel 0.5.34 and the changes of #536, and 
 | TEST-55-OOMD | testcase_duration_analyze | pass | pass |
 | TEST-55-OOMD | testcase_duration_override | pass | pass |
 | TEST-55-OOMD | testcase_preference_avoid | pass | fail |
+| TEST-62-RESTRICT-IFACES | (all) | pass | pass |
 
 ### arm64
 
@@ -170,7 +174,8 @@ The runs are from 2026-11-16, with rukernel 0.5.34 and the changes of #536, and 
 
 ### Differences and exceptions
 
-- TEST-07-PID1 exec-context fails on rukernel at `SocketBindAllow=` and `SocketBindDeny=`. systemd loads the BPF program `sd_bind4` (82 instructions, with two loops of 128 rounds), and the verifier of rukernel stops at the limit of 1000000 instructions with "BPF program is too large". The verifier prunes a path only when a kept state is equal in all registers, and it keeps at most 16 states for each instruction. Linux 6.8 also prunes when the registers that are different are not read again (liveness) or are scalars that are not precise. So systemd turns off `bpf-socket-bind`, the bind is not refused, and `ncat` runs until `timeout` stops it with 124. The same run shows that `restrict_ifaces_bpf` does not load, because `mmap` of an array map with `BPF_F_MMAPABLE` gives `ENODEV`. This subtest does not use `RestrictNetworkInterfaces=`. Both are open work for the eBPF verifier and maps. The earlier part of exec-context, which checks `DevicePolicy=strict` with `access(2)`, now passes.
+- TEST-07-PID1 exec-context failed on rukernel before #762 at `SocketBindAllow=` and `SocketBindDeny=`. The verifier of rukernel stopped the BPF program `sd_bind4` of systemd at the limit of 1000000 instructions, so systemd turned off `bpf-socket-bind`, and `ncat` ran until `timeout` stopped it with 124. With the state pruning of the verifier (#769), the verifier processes 39829 instructions of `sd_bind4`, and exec-context passes on x86_64. The arm64 row is from before that change. This subtest does not use `RestrictNetworkInterfaces=`.
+- TEST-62-RESTRICT-IFACES runs ping in units with `RestrictNetworkInterfaces=`. On rukernel it needs three changes of #762: `mmap` of the `BPF_F_MMAPABLE` array map that holds the `.rodata` of `restrict_ifaces_bpf`, `BPF_LINK_CREATE` with an `O_PATH` descriptor of the cgroup, and `ifindex` in the `struct __sk_buff` of the packet programs.
 - TEST-07-PID1 exec-deserialization and DeferReactivation depend on the time between two jobs. Under TCG they fail on some runs of both kernels. In these runs Linux failed testcase_removal and testcase_swapped, and rukernel passed them.
 - TEST-07-PID1 private-pids is skipped on both kernels.
 - TEST-07-PID1 type-exec-parallel failed on arm64 with "Failed to start transient service unit: Connection timed out" from `systemd-run`. The test starts 20 services at the same time, and the D-Bus call took more than its time limit at a load of 40. It passes on x86_64.

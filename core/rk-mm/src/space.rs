@@ -217,6 +217,8 @@ pub struct MmapRequest {
     pub low32: bool,
     /// The area can get write access later. See [`Vma::may_write`].
     pub may_write: bool,
+    /// The area can get exec access later. See [`Vma::may_exec`].
+    pub may_exec: bool,
     /// `MAP_LOCKED`: lock the area, as `mlock` does.
     pub locked: bool,
     /// `MAP_POPULATE`: give each page its frame now.
@@ -247,6 +249,7 @@ impl MmapRequest {
             noreplace: false,
             low32: false,
             may_write: true,
+            may_exec: true,
             locked: false,
             populate: false,
             grows_down: false,
@@ -804,6 +807,7 @@ impl AddressSpace {
             prot: req.prot,
             shared: req.shared,
             may_write: req.may_write,
+            may_exec: req.may_exec,
             locked,
             grows_down: req.grows_down,
             mergeable: false,
@@ -1388,7 +1392,7 @@ impl AddressSpace {
     /// # Errors
     ///
     /// `EINVAL` if `addr` is not page aligned, `ENOMEM` if a page of the range is not mapped, and
-    /// `EACCES` for write access to an area that cannot get it.
+    /// `EACCES` for write or exec access to an area that cannot get it.
     #[cfg_attr(feature = "corten", allow(unreachable_code))]
     pub fn mprotect(&self, addr: usize, len: usize, prot: Prot) -> Result<(), Errno> {
         if !is_page_aligned(addr) {
@@ -1407,7 +1411,8 @@ impl AddressSpace {
         if Self::splits_huge(&st, addr, end) {
             return Err(Errno::EINVAL);
         }
-        if prot.write && st.vmas.iter().any(|v| v.start < end && addr < v.end && !v.may_write) {
+        let denied = |v: &Vma<FileRef>| (prot.write && !v.may_write) || (prot.exec && !v.may_exec);
+        if st.vmas.iter().any(|v| v.start < end && addr < v.end && denied(v)) {
             return Err(Errno::EACCES);
         }
         // A private area that gets write access goes in the commit count, as in Linux.

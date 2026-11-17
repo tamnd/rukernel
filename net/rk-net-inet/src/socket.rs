@@ -757,7 +757,8 @@ impl Dgram {
         data: Vec<u8>,
         info: Option<Info6>,
     ) -> bool {
-        if !rk_net::filter::cgroup_skb_ingress(self.cgroup, packet) {
+        let ifindex = info.as_ref().map_or(0, |i| i.ifindex);
+        if !rk_net::filter::cgroup_skb_ingress(self.cgroup, ifindex, packet) {
             self.drops.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -1224,7 +1225,7 @@ impl Dgram {
         if h.src == ip::ANY {
             p[8..24].copy_from_slice(&next.src);
         }
-        rk_net::filter::cgroup_skb_egress(self.cgroup, &p)?;
+        rk_net::filter::cgroup_skb_egress(self.cgroup, next.ifindex, &p)?;
         stack6::output_raw(&next, &p)
     }
 
@@ -1244,7 +1245,7 @@ impl Dgram {
         p[10..12].fill(0);
         let sum = checksum::checksum(&p[..h.hlen]);
         p[10..12].copy_from_slice(&sum.to_be_bytes());
-        rk_net::filter::cgroup_skb_egress(self.cgroup, &p)?;
+        rk_net::filter::cgroup_skb_egress(self.cgroup, next.ifindex, &p)?;
         stack::output_raw(&next, &p)
     }
 
