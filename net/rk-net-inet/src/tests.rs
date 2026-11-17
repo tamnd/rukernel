@@ -1103,6 +1103,21 @@ fn ipv6_addresses_and_routes() {
     assert!(t.lookup(&peer, 0).is_err());
 }
 
+/// systemd-networkd-tests.py puts a router and its client on the two ends of a veth pair in one
+/// namespace. The link local address of the router is a gateway of the client, as on Linux.
+#[test]
+fn a_link_local_gateway_is_local_only_on_the_device_of_the_route() {
+    use crate::route6::{Addr6, Table6};
+    let mut t = Table6::new();
+    let router = v6([0xfe80, 0, 0, 0, 0x1034, 0x56ff, 0xfe78, 0x9a98]);
+    let global = v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]);
+    t.insert_addr(Addr6::new(3, router, 64)).unwrap();
+    t.insert_addr(Addr6::new(3, global, 64)).unwrap();
+    assert!(!t.is_local_gateway(&router, 4));
+    assert!(t.is_local_gateway(&router, 3));
+    assert!(t.is_local_gateway(&global, 4));
+}
+
 #[test]
 fn sockaddr_in6() {
     use rk_net::consts::{AF_INET, AF_INET6};

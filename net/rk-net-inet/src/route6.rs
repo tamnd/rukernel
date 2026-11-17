@@ -303,6 +303,19 @@ impl Table6 {
         self.addrs.iter().any(|x| x.addr == *a)
     }
 
+    /// Tells if the gateway `gw` of a route through the device `ifindex` is a local address, as
+    /// `ip6_validate_gw` of Linux asks `ipv6_chk_addr_and_flags`. A link local gateway is local
+    /// only on the device of the route: two devices on two links can have the same link local
+    /// address, and a veth pair in one namespace has the router on the other end. Another
+    /// gateway is local on each device.
+    pub fn is_local_gateway(&self, gw: &Ip, ifindex: u32) -> bool {
+        if ipv6::is_link_local(gw) {
+            self.addrs_of(ifindex).any(|x| x.addr == *gw)
+        } else {
+            self.is_local(gw)
+        }
+    }
+
     /// Tells if the interface `ifindex` takes a packet to the multicast address `a`: the groups
     /// of all of the nodes and the solicited node groups of its addresses, as the groups that
     /// `ipv6_dev_mc_inc` joins in Linux.
