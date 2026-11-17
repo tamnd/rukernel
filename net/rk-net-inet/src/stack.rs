@@ -567,7 +567,7 @@ pub(crate) fn output(next: &route::Next, out: &Out, payload: &[u8]) -> Result<()
         let mut packet = Vec::with_capacity(HLEN + payload.len());
         packet.extend_from_slice(&header.to_bytes());
         packet.extend_from_slice(payload);
-        rk_net::filter::cgroup_skb_egress(out.cgroup, &packet)?;
+        rk_net::filter::cgroup_skb_egress(out.cgroup, dev.ifindex(), &packet)?;
     }
     if out.protocol == PROTO_ICMP {
         count_icmp_out(payload);
@@ -1114,7 +1114,7 @@ pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf, host: bool) {
         PROTO_UDP => udp_input(&h, packet, broadcast, dif, info, csum_ok),
         PROTO_TCP => {
             let (src, dst) = (ip::mapped(h.src), ip::mapped(h.dst));
-            crate::tcp::input(src, dst, packet, payload, broadcast, dif, csum_ok);
+            crate::tcp::input(src, dst, packet, payload, broadcast, dif, dev.ifindex(), csum_ok);
         }
         _ if raw.is_empty() && !broadcast => {
             icmp_error(&h, packet, ICMP_DEST_UNREACH, ICMP_PROT_UNREACH);

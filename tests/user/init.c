@@ -6912,7 +6912,7 @@ static void test_bpf_cgroup(void)
 	unsigned int ids[4] = { 0 }, cnt = 4, flags = 0, len = sizeof(info), id = 0;
 	unsigned long long cg_id = 0;
 	struct stat st;
-	int skb, egress, sock, dev, cg, child, link, ok;
+	int skb, egress, sock, dev, cg, child, link, opath, ok;
 
 	mkdir("/bpfcg", 0755);
 	if (mount("none", "/bpfcg", "cgroup2", 0, NULL) != 0) {
@@ -6970,6 +6970,19 @@ static void test_bpf_cgroup(void)
 	errno = 0;
 	ok = ok && bpf_id(30, id, NULL) == -1 && errno == ENOENT;
 	check("the close of the last descriptor of a link detaches it", ok);
+
+	/* systemd opens the cgroup with O_PATH for RestrictNetworkInterfaces=. */
+	opath = open("/bpfcg/rk_bpf", O_PATH | O_DIRECTORY);
+	bpf_put32(attr, 0, skb);
+	bpf_put32(attr, 4, opath);
+	bpf_put32(attr, 8, 0);
+	link = bpf_call(28, attr, 64);
+	cnt = 4;
+	ok = opath >= 0 && link >= 0;
+	ok = ok && bpf_query(opath, 0, 0, ids, &cnt, &flags) == 0 && cnt == 1;
+	check("BPF_LINK_CREATE and BPF_PROG_QUERY take an O_PATH descriptor of a cgroup", ok);
+	close(link);
+	close(opath);
 
 	ok = bpf_attach(9, child, dev, 6, 0) == 0 && bpf_attach(9, child, egress, 1, 0) == 0;
 	errno = 0;
@@ -7106,13 +7119,37 @@ static int udp_self(int family)
 }
 
 /*
+ * A program of BPF_PROG_TYPE_CGROUP_SKB that gives 1 if the field at off of struct __sk_buff
+ * is idx, and 0 if not.
+ */
+static int bpf_prog_skb_field(unsigned int expected, short off, unsigned int idx)
+{
+	unsigned long long insns[] = {
+		bpf_insn(0x61, 2, 1, off, 0),	/* r2 = *(u32 *)(ctx + off) */
+		bpf_insn(0xb7, 0, 0, 0, 0),	/* r0 = 0 */
+		bpf_insn(0x55, 2, 0, 1, idx),	/* if r2 != idx goto +1 */
+		bpf_insn(0xb7, 0, 0, 0, 1),	/* r0 = 1 */
+		bpf_insn(0x95, 0, 0, 0, 0),	/* exit */
+	};
+	unsigned char attr[168] = { 0 };
+
+	bpf_put32(attr, 0, 8);
+	bpf_put32(attr, 4, 5);
+	bpf_put64(attr, 8, (unsigned long)insns);
+	bpf_put64(attr, 16, (unsigned long)"GPL");
+	bpf_put32(attr, 68, expected);
+	return bpf_call(5, attr, sizeof(attr));
+}
+
+/*
  * The packet programs of a cgroup: a program of BPF_CGROUP_INET_INGRESS that gives 0 drops the
  * packets to the sockets of the cgroup, and a program of BPF_CGROUP_INET_EGRESS that gives 0
  * makes a send of a socket of the cgroup give EPERM, for IPv4 and IPv6 (#537).
  */
 static void test_bpf_cgroup_skb(void)
 {
-	int cg, in, out, status, ok;
+	int cg, in, out, in2, out2, status, ok;
+	unsigned int lo;
 	pid_t pid;
 
 	mkdir("/bpfcg", 0755);
@@ -7163,6 +7200,47 @@ static void test_bpf_cgroup_skb(void)
 		printf("rk-bpf: the egress check gave %d\n", WEXITSTATUS(status));
 	check("the egress program makes a send of a socket of the cgroup give EPERM",
 	      ok && WEXITSTATUS(status) == 0);
+
+	/*
+	 * ifindex is the device of the packet and ingress_ifindex the device that took it, as
+	 * RestrictNetworkInterfaces= of systemd uses: here the loopback device.
+	 */
+	lo = if_nametoindex("lo");
+	ok = bpf_attach(9, cg, out, 1, 0) == 0;
+	close(in);
+	in = bpf_prog_skb_field(0, 36, lo);
+	out2 = bpf_prog_skb_field(1, 40, lo);
+	in2 = bpf_prog_skb_field(0, 40, lo + 100);
+	ok = ok && lo > 0 && in >= 0 && out2 >= 0 && in2 >= 0;
+	ok = ok && bpf_attach(8, cg, in, 0, 0) == 0 && bpf_attach(8, cg, out2, 1, 0) == 0;
+	pid = fork();
+	if (pid == 0) {
+		int r = 0;
+
+		if (cg_write("/bpfcg/rk_skb/cgroup.procs", "0") != 0)
+			_exit(1);
+		if (udp_self(AF_INET) != 1)
+			r |= 2;
+		if (udp_self(AF_INET6) != 1)
+			r |= 4;
+		_exit(r);
+	}
+	ok = ok && pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status);
+	ok = ok && WEXITSTATUS(status) == 0;
+	ok = ok && bpf_attach(9, cg, in, 0, 0) == 0 && bpf_attach(8, cg, in2, 0, 0) == 0;
+	pid = fork();
+	if (pid == 0) {
+		if (cg_write("/bpfcg/rk_skb/cgroup.procs", "0") != 0)
+			_exit(1);
+		_exit(udp_self(AF_INET) == 0 ? 0 : 2);
+	}
+	ok = ok && pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status);
+	ok = ok && WEXITSTATUS(status) == 0;
+	check("a packet program reads the ifindex and the ingress_ifindex of the packet", ok);
+	bpf_attach(9, cg, in2, 0, 0);
+	bpf_attach(9, cg, out2, 1, 0);
+	close(in2);
+	close(out2);
 	check("the packet programs of a cgroup do not stop a socket in another cgroup",
 	      udp_self(AF_INET) == 1 && udp_self(AF_INET6) == 1);
 	close(cg);

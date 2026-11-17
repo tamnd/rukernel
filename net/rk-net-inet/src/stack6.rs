@@ -454,7 +454,7 @@ pub(crate) fn output(next: &Next6, out: &Out6, payload: &[u8]) -> Result<()> {
         packet.extend_from_slice(&header(first, len));
         packet.extend_from_slice(&out.ext);
         packet.extend_from_slice(payload);
-        rk_net::filter::cgroup_skb_egress(out.cgroup, &packet)?;
+        rk_net::filter::cgroup_skb_egress(out.cgroup, dev.ifindex(), &packet)?;
     }
     if out.next == PROTO_ICMPV6 {
         count_icmp_out(payload);
@@ -937,7 +937,7 @@ pub(crate) fn input(dev: &NetDevice, frame: NetBuf, host: bool) {
     match h.protocol {
         PROTO_ICMPV6 => icmp_input(dev, &h, packet, mcast),
         PROTO_UDP => udp_input(&h, ifindex, packet, mcast, dif),
-        PROTO_TCP => crate::tcp::input(h.src, h.dst, packet, payload, mcast, dif, false),
+        PROTO_TCP => crate::tcp::input(h.src, h.dst, packet, payload, mcast, dif, ifindex, false),
         NEXT_NONE => {}
         _ if raw.is_empty() => {
             icmp_error(&h, ifindex, packet, PARAMPROB, ICMPV6_UNK_NEXTHDR as u8, h.nh as u32);

@@ -454,8 +454,9 @@ fn listener(port: u16, dst: &Ip, dif: u32) -> Option<Arc<Stream>> {
 
 /// Takes a TCP segment, as `tcp_v4_rcv` and `tcp_v6_rcv` of Linux. `tcp` has the header and
 /// the data, and `packet` is the IP packet that has it. An IPv4 packet has IPv4-mapped
-/// addresses. The segment came in on `dif`, for `stack::dev_match`. With `csum_ok`, the kernel
-/// made the checksum, and it is not checked again.
+/// addresses. The segment came in on `dif`, for `stack::dev_match`, which is the device
+/// `ifindex` or 0 for the loopback device. With `csum_ok`, the kernel made the checksum, and it
+/// is not checked again.
 pub(crate) fn input(
     src: Ip,
     dst: Ip,
@@ -463,6 +464,7 @@ pub(crate) fn input(
     tcp: &[u8],
     broadcast: bool,
     dif: u32,
+    ifindex: u32,
     csum_ok: bool,
 ) {
     if broadcast {
@@ -483,13 +485,13 @@ pub(crate) fn input(
     let found = ESTAB.lock().get(&key).cloned();
     if let Some(sock) = found.filter(|s| stack::dev_match(s.oif(), dif)) {
         // The programs of the cgroup can drop the segment, as `tcp_filter` of Linux.
-        if rk_net::filter::cgroup_skb_ingress(sock.cgroup(), packet) {
+        if rk_net::filter::cgroup_skb_ingress(sock.cgroup(), ifindex, packet) {
             sock.segment(seg);
         }
         return;
     }
     if let Some(l) = listener(dport, &dst, dif) {
-        if !rk_net::filter::cgroup_skb_ingress(l.cgroup(), packet) {
+        if !rk_net::filter::cgroup_skb_ingress(l.cgroup(), ifindex, packet) {
             return;
         }
         if l.syn(&key, &seg) {

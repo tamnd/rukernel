@@ -6,12 +6,15 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
+- `mmap` of a BPF array map with `BPF_F_MMAPABLE`, as `bpf_map_mmap` of Linux: the process and the BPF programs share the pages of the values. A map with `BPF_F_RDONLY_PROG` or a frozen map maps only to read, `BPF_MAP_FREEZE` gives `EBUSY` while a mapping can write, a mapping of a map cannot get exec access with `mprotect`, and the mapping holds the map. libbpf maps the `.rodata` and `.bss` maps of a program, so the `restrict-ifaces` program of systemd now loads (#762).
 - The labels of the IPv6 addresses, as addrlabel.c of Linux: `RTM_NEWADDRLABEL`, `RTM_DELADDRLABEL` and `RTM_GETADDRLABEL` with the default policy of RFC 6724 in each network namespace. `ip addrlabel` and `networkctl label` use them (#538).
 - nf_tables: the expression `inner`, as nft_inner.c of Linux, for the headers of the packet in a tunnel: `vxlan ip saddr`, `geneve tcp dport`, `gre ip daddr` and the like. In the tunnel go `payload` (the tunnel, link layer, network and transport headers) and `meta protocol` and `meta l4proto` (#542).
 - `madvise(MADV_PAGEOUT)` writes the private anonymous pages of a range to swap, as `madvise_pageout` of Linux. The page table keeps a swap entry in place of the page, and the next access reads the page back, as `do_swap_page`. `fork`, `mremap` and `munmap` keep or free the entries. `/proc/vmstat` gives `pswpin` and `pswpout`, `/proc/PID/status` gives `VmSwap`, and `/proc/PID/smaps` gives `Swap`. Both backends do it. (#752)
 
 ### Fixed
 
+- `BPF_LINK_CREATE`, `BPF_PROG_ATTACH`, `BPF_PROG_DETACH` and `BPF_PROG_QUERY` take an `O_PATH` descriptor of a cgroup, as `cgroup_v1v2_get_from_fd` of Linux. systemd opens the cgroup with `O_PATH` for `RestrictNetworkInterfaces=`, and the attach gave `EBADF` (#762).
+- A program of `BPF_PROG_TYPE_CGROUP_SKB` reads the device of the packet in `ifindex` of `struct __sk_buff`, and a packet that comes in also has it in `ingress_ifindex`, as Linux. Before, both were 0, so `RestrictNetworkInterfaces=` of systemd dropped each packet (#762).
 - A route of IPv6 of the type `blackhole`, `unreachable` or `prohibit` goes on the loopback device, as Linux does. Thus `ip -6 route` shows `dev lo` for it, as the tests of systemd-networkd expect for the routes of DHCPv6 prefix delegation and for the static routes (#538).
 - With `net.ipv4.conf.*.promote_secondaries`, the removal of a primary IPv4 address makes the first secondary address of its subnet primary, as `__inet_del_ifa` of Linux, and sends `RTM_NEWADDR` for it. The routes of the subnet then use it as the source. Before this, the secondary addresses went away with the primary address, and systemd-networkd, which sets the value, could not remove them (#538).
 - A new MTU of a network device is its IPv6 MTU too, and a write of `net.ipv6.conf.DEV.mtu` larger than the MTU of the device gives `EINVAL`, as `addrconf_notify` and `addrconf_sysctl_mtu` of Linux. The MTU tests of systemd-networkd-tests.py expect this (#538).

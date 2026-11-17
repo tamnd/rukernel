@@ -464,8 +464,9 @@ pub struct CgroupSkbHooks {
     /// The cgroup of the current task, for `sock_cgroup_data` of a new socket.
     pub current: fn() -> u32,
     /// Runs the programs of the cgroup on a packet from its IP header. `egress` tells the
-    /// direction. Gives `false` if a program drops the packet.
-    pub run: fn(cgroup: u32, egress: bool, packet: &[u8]) -> bool,
+    /// direction, and `ifindex` is the device that sends or took the packet. Gives `false` if a
+    /// program drops the packet.
+    pub run: fn(cgroup: u32, egress: bool, ifindex: u32, packet: &[u8]) -> bool,
     /// Tells if a cgroup has a program of the direction, as `cgroup_bpf_enabled` of Linux.
     pub enabled: fn(egress: bool) -> bool,
     /// Runs the programs of `BPF_CGROUP_INET4_POST_BIND` or `BPF_CGROUP_INET6_POST_BIND` of the
@@ -512,10 +513,11 @@ pub fn cgroup_skb_enabled(cgroup: u32, egress: bool) -> bool {
 }
 
 /// Runs the programs of `BPF_CGROUP_INET_INGRESS` of the cgroup of a socket on a packet that
-/// the socket gets, as `sk_filter_trim_cap` of Linux. Gives `false` if the socket drops it.
-pub fn cgroup_skb_ingress(cgroup: u32, packet: &[u8]) -> bool {
+/// the socket gets, as `sk_filter_trim_cap` of Linux. The packet came in on the device
+/// `ifindex`. Gives `false` if the socket drops it.
+pub fn cgroup_skb_ingress(cgroup: u32, ifindex: u32, packet: &[u8]) -> bool {
     match CGROUP_SKB.get() {
-        Some(h) if cgroup != 0 => (h.run)(cgroup, false, packet),
+        Some(h) if cgroup != 0 => (h.run)(cgroup, false, ifindex, packet),
         _ => true,
     }
 }
@@ -543,15 +545,15 @@ pub fn cgroup_sock_release(sock: &dyn crate::Socket) {
 }
 
 /// Runs the programs of `BPF_CGROUP_INET_EGRESS` of the cgroup of a socket on a packet that the
-/// socket sends, as `ip_finish_output` of Linux. A program that drops the packet gives `EPERM`
-/// to the sender.
+/// socket sends, as `ip_finish_output` of Linux. The packet goes out on the device `ifindex`.
+/// A program that drops the packet gives `EPERM` to the sender.
 ///
 /// # Errors
 ///
 /// Gives `EPERM` if a program drops the packet.
-pub fn cgroup_skb_egress(cgroup: u32, packet: &[u8]) -> Result<()> {
+pub fn cgroup_skb_egress(cgroup: u32, ifindex: u32, packet: &[u8]) -> Result<()> {
     match CGROUP_SKB.get() {
-        Some(h) if cgroup != 0 && !(h.run)(cgroup, true, packet) => Err(Errno::EPERM),
+        Some(h) if cgroup != 0 && !(h.run)(cgroup, true, ifindex, packet) => Err(Errno::EPERM),
         _ => Ok(()),
     }
 }

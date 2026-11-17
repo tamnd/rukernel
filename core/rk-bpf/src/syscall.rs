@@ -101,8 +101,8 @@ pub trait Env {
     fn uid(&self) -> u32;
     /// What the helpers of a program see when the call runs it: the task of the caller.
     fn helpers(&self) -> &dyn crate::helpers::HelperEnv;
-    /// The cgroup of the cgroup2 directory `fd`, `cgroup_get_from_fd` of Linux. Another file
-    /// gives `EBADF`.
+    /// The cgroup of the cgroup2 directory `fd`, `cgroup_get_from_fd` of Linux. An `O_PATH`
+    /// descriptor is good, as `fdget_raw`. Another file gives `EBADF`.
     fn cgroup_get_from_fd(&self, fd: u32) -> Result<CgId>;
     /// The parent of a cgroup, or `None` for the root.
     fn cgroup_parent(&self, id: CgId) -> Option<CgId>;

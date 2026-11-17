@@ -89,8 +89,13 @@ impl Env for BpfEnv<'_, '_> {
         &TaskHelperEnv
     }
 
+    /// `cgroup_v1v2_get_from_fd` of Linux, with `fdget_raw`: an `O_PATH` descriptor of a cgroup
+    /// is also good. systemd opens the cgroup with `O_PATH` for `RestrictNetworkInterfaces=`.
     fn cgroup_get_from_fd(&self, fd: u32) -> Result<rk_cgroup::CgId, Errno> {
-        let file = self.fdget(fd as i32)?;
+        if (fd as i32) < 0 {
+            return Err(Errno::EBADF);
+        }
+        let file = self.0.file(u64::from(fd))?;
         let inode = file.inode().ok_or(Errno::EBADF)?;
         rk_fs_cgroup::cgroup_of(inode).ok_or(Errno::EBADF)
     }
@@ -494,17 +499,28 @@ pub(crate) fn init() {
 
 /// Runs the programs of `BPF_CGROUP_INET_INGRESS` or `BPF_CGROUP_INET_EGRESS` of `cgroup` on
 /// `packet`, which starts at its IP header, as `__cgroup_bpf_run_filter_skb` of Linux. The
-/// addresses and the ports of the socket come from the packet. Gives `false` if a program drops
-/// the packet: a return value with the bit 0 clear. The congestion bit of the values 2 and 3
-/// has no effect.
-fn cgroup_bpf_run_filter_skb(cgroup: rk_cgroup::CgId, egress: bool, packet: &[u8]) -> bool {
+/// addresses and the ports of the socket come from the packet. `ifindex` is the device that
+/// sends the packet or that took it, `skb->dev` of Linux, and a packet that comes in also has
+/// it as `skb_iif`. Gives `false` if a program drops the packet: a return value with the bit 0
+/// clear. The congestion bit of the values 2 and 3 has no effect.
+fn cgroup_bpf_run_filter_skb(
+    cgroup: rk_cgroup::CgId,
+    egress: bool,
+    ifindex: u32,
+    packet: &[u8],
+) -> bool {
     use rk_abi::native::if_ether::{ETH_P_IP, ETH_P_IPV6};
     use rk_net::consts::{AF_INET, AF_INET6};
     let atype = if egress { atype::CGROUP_INET_EGRESS } else { atype::CGROUP_INET_INGRESS };
     if !cgroup_bpf_enabled(atype) {
         return true;
     }
-    let mut skb = rk_bpf::prog::SkBuff { data: packet, ..Default::default() };
+    let mut skb = rk_bpf::prog::SkBuff {
+        data: packet,
+        ifindex,
+        ingress_ifindex: if egress { 0 } else { ifindex },
+        ..Default::default()
+    };
     // The source and destination addresses, and the offset and protocol of the transport
     // header.
     let (src, dst, l4, proto) = match packet.first().map(|b| b >> 4) {
