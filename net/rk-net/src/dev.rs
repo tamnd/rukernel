@@ -17,6 +17,7 @@ use crate::consts::{
 use crate::ether::{HLEN, MacAddr};
 pub use crate::ethtool::{Channels, DrvInfo, LinkSettings, Rings};
 use crate::features;
+use crate::netfilter::NF_NETDEV_EGRESS;
 use crate::ns::{self, NetNs};
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -827,7 +828,7 @@ impl NetDevice {
 
     /// Sends a frame as `transmit`, for the packet socket with the inode number `skip`. That
     /// socket does not get a copy of its own frame, as `skb->sk` of Linux.
-    pub fn transmit_from(&self, frame: NetBuf, skip: u64) -> Result<()> {
+    pub fn transmit_from(&self, mut frame: NetBuf, skip: u64) -> Result<()> {
         if !self.is_up() {
             add(&self.counters.tx_dropped, 1);
             return Err(Errno::ENETDOWN);
@@ -835,6 +836,30 @@ impl NetDevice {
         if frame.len() < HLEN || frame.len() - HLEN > self.mtu() as usize {
             add(&self.counters.tx_dropped, 1);
             return Err(Errno::EMSGSIZE);
+        }
+        // The hooks of the egress of the device, as `nf_hook_egress` in `__dev_queue_xmit` of
+        // Linux. They see the frame with its link header before it. A frame that a hook drops
+        // gives `ENOBUFS`, as `NET_XMIT_DROP` and `net_xmit_errno`; a frame that a hook takes
+        // gives no error.
+        if crate::netfilter::nf_hook_netdev_active(NF_NETDEV_EGRESS)
+            && let Some(ty) = frame.pull(HLEN).map(|e| u16::from_be_bytes([e[12], e[13]]))
+        {
+            if frame.protocol == 0 {
+                frame.protocol = ty;
+            }
+            if self.kind().has_header() {
+                frame.set_mac_header(HLEN);
+            }
+            let r = crate::netfilter::nf_hook_netdev(NF_NETDEV_EGRESS, self, &mut frame);
+            frame.push(HLEN);
+            match r {
+                crate::netfilter::NfResult::Accept => {}
+                crate::netfilter::NfResult::Stolen => return Ok(()),
+                crate::netfilter::NfResult::Drop(_) => {
+                    add(&self.counters.tx_dropped, 1);
+                    return Err(Errno::ENOBUFS);
+                }
+            }
         }
         let len = frame.len();
         crate::packet::tap(self, &frame, crate::packet::Direction::Out(skip));

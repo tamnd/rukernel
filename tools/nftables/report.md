@@ -47,6 +47,13 @@ These tests pass on Linux and do not pass on rukernel x86_64.
 - sets: 6: [sets/0028autoselect_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/0028autoselect_0?h=v1.0.9), [sets/0055tcpflags_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/0055tcpflags_0?h=v1.0.9), [sets/dynset_missing](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/dynset_missing?h=v1.0.9), [sets/inner_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/inner_0?h=v1.0.9), [sets/sets_with_ifnames](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/sets_with_ifnames?h=v1.0.9), [sets/typeof_sets_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/typeof_sets_0?h=v1.0.9).
 - transactions: 2: [transactions/0049huge_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/transactions/0049huge_0?h=v1.0.9), [transactions/table_onoff](https://git.netfilter.org/nftables/tree/tests/shell/testcases/transactions/table_onoff?h=v1.0.9).
 
+## Where rukernel follows Linux 7.4
+
+The reference kernel is Linux 6.8. These tests expect what Linux 6.8 does, and rukernel does what Linux 7.4 does.
+
+- [chains/netdev_chain_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/chains/netdev_chain_0?h=v1.0.9): The dump of the test has no chain, because Linux 6.8 deletes a netdev chain when its last device goes. Linux 7.4 keeps the chain and its devices by name (nft_netdev_event), and rukernel too.
+- [json/netdev](https://git.netfilter.org/nftables/tree/tests/shell/testcases/json/netdev?h=v1.0.9): The dump of the test has no chain, because Linux 6.8 deletes a netdev chain when its last device goes. Linux 7.4 keeps the chain and its devices by name (nft_netdev_event), and rukernel too.
+
 ## Each test
 
 | Test | Linux | rukernel x86_64 | rukernel arm64 | Note |
@@ -115,7 +122,7 @@ These tests pass on Linux and do not pass on rukernel x86_64.
 | [chains/0042chain_variable_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/chains/0042chain_variable_0?h=v1.0.9) | pass | fail | fail | /dev/stdin:5:3-56: Error: Chain of type "filter" is not supported, perhaps kernel support is miss... |
 | [chains/0043chain_ingress_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/chains/0043chain_ingress_0?h=v1.0.9) | pass | skip | skip |  |
 | [chains/0044chain_destroy_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/chains/0044chain_destroy_0?h=v1.0.9) | pass | pass | pass |  |
-| [chains/netdev_chain_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/chains/netdev_chain_0?h=v1.0.9) | pass | skip | skip |  |
+| [chains/netdev_chain_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/chains/netdev_chain_0?h=v1.0.9) | pass | skip | skip | The dump of the test has no chain, because Linux 6.8 deletes a netdev chain when its last device goes. Linux 7.4 keeps the chain and its devices by name (nft_netdev_event), and rukernel too. |
 | [chains/netdev_chain_autoremove](https://git.netfilter.org/nftables/tree/tests/shell/testcases/chains/netdev_chain_autoremove?h=v1.0.9) | pass | fail | fail | RTNETLINK answers: Not supported |
 | [comments/comments_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/comments/comments_0?h=v1.0.9) | pass | pass | pass |  |
 | [flowtable/0001flowtable_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/flowtable/0001flowtable_0?h=v1.0.9) | pass | pass | pass |  |
@@ -160,7 +167,7 @@ These tests pass on Linux and do not pass on rukernel x86_64.
 | [json/0004json_schema_version_1](https://git.netfilter.org/nftables/tree/tests/shell/testcases/json/0004json_schema_version_1?h=v1.0.9) | pass | pass | pass |  |
 | [json/0005secmark_objref_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/json/0005secmark_objref_0?h=v1.0.9) | fail | fail | fail | internal:0:0-0: Error: Could not process rule: No such file or directory |
 | [json/0006obj_comment_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/json/0006obj_comment_0?h=v1.0.9) | pass | pass | pass |  |
-| [json/netdev](https://git.netfilter.org/nftables/tree/tests/shell/testcases/json/netdev?h=v1.0.9) | pass | fail | fail | internal:0:0-0: Error: Chain of type "filter" is not supported, perhaps kernel support is missing? |
+| [json/netdev](https://git.netfilter.org/nftables/tree/tests/shell/testcases/json/netdev?h=v1.0.9) | pass | fail | fail | The dump of the test has no chain, because Linux 6.8 deletes a netdev chain when its last device goes. Linux 7.4 keeps the chain and its devices by name (nft_netdev_event), and rukernel too. |
 | [listing/0001ruleset_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/listing/0001ruleset_0?h=v1.0.9) | pass | pass | pass |  |
 | [listing/0002ruleset_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/listing/0002ruleset_0?h=v1.0.9) | pass | pass | pass |  |
 | [listing/0003table_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/listing/0003table_0?h=v1.0.9) | pass | pass | pass |  |

@@ -12,8 +12,9 @@ DIR of --logs has one directory for each batch of run.py, and each batch directo
 
 The script keeps the newest result of each test for each kernel. It writes the report to FILE,
 by default report.md next to the script: the number of the tests that pass for each directory of
-testcases, the tests that pass on Linux and not on rukernel, and the result of each test. Do not
-change the report by hand, because the next run of the script writes it again.
+testcases, the tests that pass on Linux and not on rukernel, the tests where rukernel does what
+Linux 7.4 does and the reference kernel does not, and the result of each test. Do not change the
+report by hand, because the next run of the script writes it again.
 """
 
 import argparse
@@ -32,6 +33,18 @@ WORDS = {
     "ok": "pass", "skipped": "skip", "failed": "fail", "dump-fail": "dump differs",
     "chk-dump": "no dump", "tainted": "tainted", "timeout": "timeout", "error": "error",
     "panic": "panic", "hang": "hang", "crash": "crash", "noboot": "no boot",
+}
+# The tests that expect what the reference kernel (Linux 6.8) does, where rukernel does what Linux
+# 7.4 does. The report gives the note of each one.
+LINUX_7_4 = {
+    "testcases/chains/netdev_chain_0":
+        "The dump of the test has no chain, because Linux 6.8 deletes a netdev chain when its "
+        "last device goes. Linux 7.4 keeps the chain and its devices by name (nft_netdev_event), "
+        "and rukernel too.",
+    "testcases/json/netdev":
+        "The dump of the test has no chain, because Linux 6.8 deletes a netdev chain when its "
+        "last device goes. Linux 7.4 keeps the chain and its devices by name (nft_netdev_event), "
+        "and rukernel too.",
 }
 
 
@@ -140,11 +153,16 @@ def main():
         ts = [t for t in todo if t.split("/")[1] == d]
         if ts:
             o.append(f"- {d}: {len(ts)}: " + ", ".join(link(t) for t in ts) + ".")
+    o += ["", "## Where rukernel follows Linux 7.4", "",
+          "The reference kernel is Linux 6.8. These tests expect what Linux 6.8 does, and rukernel "
+          "does what Linux 7.4 does.", ""]
+    o += [f"- {link(t)}: {n}" for t, n in sorted(LINUX_7_4.items())]
     o += ["", "## Each test", "",
           "| Test | Linux | rukernel x86_64 | rukernel arm64 | Note |",
           "| --- | --- | --- | --- | --- |"]
     for t in tests:
         note = rk[t][2] if t in rk and rk[t][2] else (ref[t][2] if t in ref else "")
+        note = LINUX_7_4.get(t, note)
         o.append(f"| {link(t)} | {cell(ref, t)} | {cell(rk, t)} | {cell(a64, t)} | {note} |")
     with open(a.out, "w") as f:
         f.write("\n".join(o) + "\n")

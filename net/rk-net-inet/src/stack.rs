@@ -38,8 +38,8 @@ use rk_net::ether::{EthHeader, MacAddr};
 use rk_net::netfilter::nf_reject::{NfReject, nf_reject_tcp_rst};
 use rk_net::netfilter::nf_tables_api::NftFibFlow;
 use rk_net::netfilter::{
-    NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING, NFPROTO_IPV4,
-    nf_hook, nf_hook_active,
+    NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING,
+    NF_NETDEV_INGRESS, NFPROTO_IPV4, NfResult, nf_hook, nf_hook_active, nf_hook_netdev,
 };
 use rk_net::ns::PerNet;
 use rk_vfs::inode::Result;
@@ -954,8 +954,8 @@ fn solicit(dev: &NetDevice, target: Addr) {
 /// header gives the protocol.
 pub fn receive(dev: &NetDevice, mut frame: NetBuf) {
     let Some(eth) = EthHeader::pull(&mut frame) else { return };
-    if eth.dst != dev.mac() && !eth.dst.is_multicast() {
-        return;
+    if dev.kind().has_header() {
+        frame.set_mac_header(rk_net::ether::HLEN);
     }
     frame.protocol = eth.ethertype;
     // The type of the frame, as `eth_type_trans` of Linux.
@@ -963,9 +963,19 @@ pub fn receive(dev: &NetDevice, mut frame: NetBuf) {
         rk_net::packet::PACKET_BROADCAST
     } else if eth.dst.is_multicast() {
         rk_net::packet::PACKET_MULTICAST
-    } else {
+    } else if eth.dst == dev.mac() {
         rk_net::packet::PACKET_HOST
+    } else {
+        rk_net::packet::PACKET_OTHERHOST
     };
+    // The hooks of the ingress of the device see each frame, as `nf_ingress` in
+    // `__netif_receive_skb_core` of Linux.
+    if nf_hook_netdev(NF_NETDEV_INGRESS, dev, &mut frame) != NfResult::Accept {
+        return;
+    }
+    if frame.pkt_type == rk_net::packet::PACKET_OTHERHOST {
+        return;
+    }
     match u32::from(eth.ethertype) {
         ETH_P_ARP => arp_input(dev, frame.data()),
         // A frame to a link multicast or broadcast address is not `PACKET_HOST`, and the stack

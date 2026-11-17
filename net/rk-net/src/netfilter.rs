@@ -15,6 +15,7 @@
 //! run without the lock, as the RCU read side of Linux.
 
 use crate::buf::NetBuf;
+use crate::dev::NetDevice;
 use crate::ns::{self, PerNet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -78,6 +79,13 @@ pub const NF_INET_NUMHOOKS: u8 = 5;
 /// The hook point of the ingress of a device, for the family `NFPROTO_INET`.
 pub const NF_INET_INGRESS: u8 = NF_INET_NUMHOOKS;
 
+/// The hook point of a frame that a device takes, for the family `NFPROTO_NETDEV`.
+pub const NF_NETDEV_INGRESS: u8 = 0;
+/// The hook point of a frame that goes to a device, for the family `NFPROTO_NETDEV`.
+pub const NF_NETDEV_EGRESS: u8 = 1;
+/// The count of the hook points of the devices.
+pub const NF_NETDEV_NUMHOOKS: u8 = 2;
+
 /// No family.
 pub const NFPROTO_UNSPEC: u8 = 0;
 /// IPv4 and IPv6. A hook of this family goes in the lists of both.
@@ -122,7 +130,8 @@ const MAX_HOOK_COUNT: usize = 1024;
 pub struct NfHookState {
     /// The hook point.
     pub hook: u8,
-    /// The family of the packet: `NFPROTO_IPV4` or `NFPROTO_IPV6`.
+    /// The family of the packet: `NFPROTO_IPV4` or `NFPROTO_IPV6`, or `NFPROTO_NETDEV` at the
+    /// hooks of a device.
     pub pf: u8,
     /// The index of the device that the packet came in on, or 0.
     pub in_dev: u32,
@@ -157,13 +166,49 @@ struct NfHookEntry {
     priority: i32,
 }
 
-/// The lists of the hooks of IPv4 and IPv6 of a namespace, as `struct netns_nf` of Linux. A
-/// list does not change: a new hook makes a new list, so that `nf_hook` can run a list
-/// without the lock.
+/// The name of a device of a hook, as `ifname` and `ifnamelen` of `struct nft_hook` of Linux.
+/// A prefix takes each device with a name that starts with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NfDevName {
+    /// The name, with no NUL.
+    pub name: Vec<u8>,
+    /// The name is a prefix, `NFTA_DEVICE_PREFIX`.
+    pub prefix: bool,
+}
+
+impl NfDevName {
+    /// Tells if a device with the name `dev` has the hook, as the `strncmp` of
+    /// `nft_netdev_hook_alloc` of Linux.
+    pub fn matches(&self, dev: &[u8]) -> bool {
+        if self.prefix { dev.starts_with(&self.name) } else { dev == self.name.as_slice() }
+    }
+}
+
+/// A hook on the devices with the names `devs`, as the `nf_hook_ops` of the devices of a base
+/// chain of the family `netdev` in Linux. Linux puts the hook on each device with one of the
+/// names when the chain comes, when the device comes and when the device gets a new name. Here
+/// the hook keeps the names, and a frame finds the hooks of the name of its device, which
+/// does the same.
+#[derive(Clone)]
+pub struct NfDevHookOps {
+    /// The function.
+    pub hook: Arc<dyn NfHookFn>,
+    /// The hook point: `NF_NETDEV_INGRESS` or `NF_NETDEV_EGRESS`.
+    pub hooknum: u8,
+    /// The priority. A hook with a lower value runs first.
+    pub priority: i32,
+    /// The names of the devices.
+    pub devs: Arc<[NfDevName]>,
+}
+
+/// The lists of the hooks of IPv4, IPv6 and the devices of a namespace, as `struct netns_nf`
+/// and the hooks of `struct net_device` of Linux. A list does not change: a new hook makes a
+/// new list, so that `nf_hook` can run a list without the lock.
 #[derive(Default)]
 struct NetnsNf {
     hooks_ipv4: [Option<Arc<[NfHookEntry]>>; NF_INET_NUMHOOKS as usize],
     hooks_ipv6: [Option<Arc<[NfHookEntry]>>; NF_INET_NUMHOOKS as usize],
+    hooks_netdev: [Option<Arc<[NfDevHookOps]>>; NF_NETDEV_NUMHOOKS as usize],
 }
 
 impl NetnsNf {
@@ -183,6 +228,11 @@ static NF: PerNet<SpinLock<NetnsNf>> = PerNet::new(|| SpinLock::new(NetnsNf::def
 /// `nf_hooks_needed` of Linux.
 static NF_HOOKS_NEEDED: [[AtomicU32; NF_INET_NUMHOOKS as usize]; 2] =
     [const { [const { AtomicU32::new(0) }; NF_INET_NUMHOOKS as usize] }; 2];
+
+/// The count of the hooks of the devices of all namespaces for each hook point, as
+/// `nf_hooks_ingress` and `nf_egress_needed` of Linux.
+static NF_NETDEV_NEEDED: [AtomicU32; NF_NETDEV_NUMHOOKS as usize] =
+    [const { AtomicU32::new(0) }; NF_NETDEV_NUMHOOKS as usize];
 
 fn needed(pf: u8, hooknum: u8) -> Option<&'static AtomicU32> {
     let row = match pf {
@@ -300,6 +350,78 @@ pub fn hook_count(pf: u8, hooknum: u8) -> usize {
     NF.lock().list(pf, hooknum).and_then(|l| l.as_ref().map(|l| l.len())).unwrap_or(0)
 }
 
+/// Puts `reg` in the list of the devices of the current namespace, as `nf_register_net_hook`
+/// of Linux for the hooks of a device. If the list has the function of `reg` already, it gets
+/// the devices of `reg` and keeps its place, as a base chain that gets new devices.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for a hook point that is not known, and `E2BIG` if the list is full.
+pub fn nf_register_dev_hook(reg: &NfDevHookOps) -> Result<()> {
+    let Some(n) = NF_NETDEV_NEEDED.get(usize::from(reg.hooknum)) else {
+        return Err(Errno::EINVAL);
+    };
+    let mut nf = NF.lock();
+    let list = &mut nf.hooks_netdev[usize::from(reg.hooknum)];
+    let mut new: Vec<NfDevHookOps> = list.as_deref().unwrap_or_default().to_vec();
+    if let Some(e) = new.iter_mut().find(|e| Arc::ptr_eq(&e.hook, &reg.hook)) {
+        e.devs = reg.devs.clone();
+    } else {
+        if new.len() >= MAX_HOOK_COUNT {
+            return Err(Errno::E2BIG);
+        }
+        let at = new.iter().position(|e| reg.priority < e.priority).unwrap_or(new.len());
+        new.insert(at, reg.clone());
+        n.fetch_add(1, Ordering::Relaxed);
+    }
+    *list = Some(new.into());
+    Ok(())
+}
+
+/// Removes the hook with the function of `reg` from the list of the devices of the current
+/// namespace, as `nf_unregister_net_hook` of Linux. A hook that is not in the list does
+/// nothing.
+pub fn nf_unregister_dev_hook(reg: &NfDevHookOps) {
+    let Some(n) = NF_NETDEV_NEEDED.get(usize::from(reg.hooknum)) else { return };
+    let mut nf = NF.lock();
+    let list = &mut nf.hooks_netdev[usize::from(reg.hooknum)];
+    let Some(old) = list.as_deref() else { return };
+    if !old.iter().any(|e| Arc::ptr_eq(&e.hook, &reg.hook)) {
+        return;
+    }
+    let new: Vec<NfDevHookOps> =
+        old.iter().filter(|e| !Arc::ptr_eq(&e.hook, &reg.hook)).cloned().collect();
+    *list = if new.is_empty() { None } else { Some(new.into()) };
+    n.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Tells if a namespace has a hook of the devices at `hooknum`, as `nf_hook_ingress_active`
+/// and `nf_hook_egress_active` of Linux.
+#[inline]
+pub fn nf_hook_netdev_active(hooknum: u8) -> bool {
+    NF_NETDEV_NEEDED.get(usize::from(hooknum)).is_some_and(|n| n.load(Ordering::Relaxed) != 0)
+}
+
+/// Runs the hooks of the device `dev` at `hooknum` on the frame `skb`, as `nf_hook_ingress`
+/// and `nf_hook_egress` of Linux. The data of `skb` starts at the network header, and the link
+/// header is before it.
+pub fn nf_hook_netdev(hooknum: u8, dev: &NetDevice, skb: &mut NetBuf) -> NfResult {
+    if !nf_hook_netdev_active(hooknum) {
+        return NfResult::Accept;
+    }
+    let Some(list) = NF.lock().hooks_netdev.get(usize::from(hooknum)).and_then(|l| l.clone())
+    else {
+        return NfResult::Accept;
+    };
+    let name = dev.name();
+    let mut hooks =
+        list.iter().filter(|e| e.devs.iter().any(|d| d.matches(name.as_bytes()))).map(|e| &e.hook);
+    let ifindex = dev.ifindex();
+    let (in_dev, out_dev) = if hooknum == NF_NETDEV_INGRESS { (ifindex, 0) } else { (0, ifindex) };
+    let state = NfHookState { hook: hooknum, pf: NFPROTO_NETDEV, in_dev, out_dev };
+    nf_hook_run(skb, &state, &mut hooks)
+}
+
 /// The result of the hooks for a packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NfResult {
@@ -346,8 +468,17 @@ pub fn nf_hook(pf: u8, hook: u8, skb: &mut NetBuf, in_dev: u32, out_dev: u32) ->
 /// user space yet, so `NF_QUEUE` drops the packet, as `nf_queue` with no handler, or gives it
 /// to the next hook if the verdict has `NF_VERDICT_FLAG_QUEUE_BYPASS`.
 fn nf_hook_slow(skb: &mut NetBuf, state: &NfHookState, entries: &[NfHookEntry]) -> NfResult {
-    for e in entries {
-        let verdict = e.hook.hook(skb, state);
+    nf_hook_run(skb, state, &mut entries.iter().map(|e| &e.hook))
+}
+
+/// Runs the hooks `hooks` on `skb` in order, as the loop of `nf_hook_slow` of Linux.
+fn nf_hook_run<'a>(
+    skb: &mut NetBuf,
+    state: &NfHookState,
+    hooks: &mut dyn Iterator<Item = &'a Arc<dyn NfHookFn>>,
+) -> NfResult {
+    for hook in hooks {
+        let verdict = hook.hook(skb, state);
         match verdict & NF_VERDICT_MASK {
             NF_ACCEPT => {}
             NF_DROP => {
@@ -423,11 +554,36 @@ pub(crate) fn nf_pktinfo(pf: u8, d: &[u8]) -> NfPktinfo {
     }
 }
 
+/// Tells if the packet `d` of the family `pf` has a valid header, as
+/// `nft_set_pktinfo_ipv4_ingress` and `nft_set_pktinfo_ipv6_ingress` of Linux: the version, the
+/// length of the header, and a total length that is not longer than the packet.
+pub(crate) fn nf_ingress_valid(pf: u8, d: &[u8]) -> bool {
+    match pf {
+        NFPROTO_IPV4 => {
+            let Some(h) = d.get(..20) else { return false };
+            let ihl = usize::from(h[0] & 0xf) * 4;
+            let len = usize::from(u16::from_be_bytes([h[2], h[3]]));
+            h[0] >> 4 == 4 && ihl >= 20 && len >= ihl && len <= d.len()
+        }
+        NFPROTO_IPV6 => {
+            let Some(h) = d.get(..40) else { return false };
+            let len = usize::from(u16::from_be_bytes([h[4], h[5]])) + 40;
+            h[0] >> 4 == 6 && len <= d.len()
+        }
+        _ => false,
+    }
+}
+
 /// Removes the hooks of the current namespace that stops, so that the counters of
 /// `nf_hook_active` are correct, as `netfilter_net_exit` of Linux.
 fn ns_exit() {
     let mut guard = NF.lock();
     let nf = &mut *guard;
+    for (list, n) in nf.hooks_netdev.iter_mut().zip(&NF_NETDEV_NEEDED) {
+        if let Some(l) = list.take() {
+            n.fetch_sub(l.len() as u32, Ordering::Relaxed);
+        }
+    }
     for (pf, lists) in [(NFPROTO_IPV4, &mut nf.hooks_ipv4), (NFPROTO_IPV6, &mut nf.hooks_ipv6)] {
         for (hooknum, list) in lists.iter_mut().enumerate() {
             if let Some(l) = list.take()
