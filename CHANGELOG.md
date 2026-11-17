@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.36] - 2026-11-17
+
 ### Added
 
 - The reclaim counters of a memory cgroup, as mm/vmscan.c and mm/memcontrol.c of Linux: `memory.stat` gives `pgscan`, `pgsteal`, `pgscan_kswapd`, `pgscan_direct`, `pgsteal_kswapd` and `pgsteal_direct` of the subtree, and `/proc/vmstat` gives `pgscan_kswapd`, `pgscan_direct`, `pgsteal_kswapd`, `pgsteal_direct`, `pgscan_file` and `pgsteal_file`. The page cache counts each page that a reclaim scans and drops. A cgroup over `memory.high` now reclaims its page cache at the return to user space, as `reclaim_high` of Linux, and a write of `memory.max` reclaims before the OOM kill. systemd-oomd needs `pgscan` above 0 to kill. (#752)
@@ -1750,6 +1752,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.36]: https://github.com/tamnd/rukernel/compare/v0.5.35...v0.5.36
 [0.5.35]: https://github.com/tamnd/rukernel/compare/v0.5.34...v0.5.35
 [0.5.34]: https://github.com/tamnd/rukernel/compare/v0.5.33...v0.5.34
 [0.5.33]: https://github.com/tamnd/rukernel/compare/v0.5.32...v0.5.33
