@@ -294,6 +294,31 @@ pub fn change_sid(ssid: u32, tsid: u32, tclass: u32) -> Result<u32, Errno> {
     compute_sid(ssid, tsid, tclass, crate::avtab::spec::CHANGE, None, false)
 }
 
+/// Checks that the type of the SID `new` is the type of the SID `old` or has it in its chain of
+/// bounds, as `security_bounded_transition` of Linux. A bounded type has only a part of the
+/// permissions of its bound, so a change to it gives no new permission. A denial makes a
+/// `SELINUX_ERR` audit record. Before the first policy load, all changes are bounded.
+///
+/// # Errors
+///
+/// `EINVAL` for an unknown SID, `EPERM` if the type of `new` is not bounded by the type of
+/// `old`.
+pub fn bounded_transition(old: u32, new: u32) -> Result<(), Errno> {
+    let Some(p) = policy() else { return Ok(()) };
+    let func = "security_bounded_transition";
+    let o = search(&p, old, false, func).ok_or(Errno::EINVAL)?.context;
+    let n = search(&p, new, false, func).ok_or(Errno::EINVAL)?.context;
+    if o.ty == n.ty || p.db.type_bounded_by(n.ty, o.ty) {
+        return Ok(());
+    }
+    services::log_err(&format!(
+        "op=security_bounded_transition seresult=denied oldcontext={} newcontext={}",
+        p.db.context_to_string(&o),
+        p.db.context_to_string(&n)
+    ));
+    Err(Errno::EPERM)
+}
+
 /// Reads a binary policy into a box. The function is not inline, so that the large values of
 /// the read are not in the frame of [`load_policy`] on the kernel stack.
 #[inline(never)]

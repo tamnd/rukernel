@@ -6,7 +6,8 @@
 //! ([`selinuxfs`]), the read of the binary policy ([`policydb`]) with its bitmaps
 //! ([`ebitmap`]) and its rules ([`avtab`]), the security server ([`server`] and [`services`])
 //! with its table of SIDs ([`sidtab`]), the text of the contexts ([`context`]), the classes of
-//! the kernel ([`classmap`]) and the access vector cache ([`avc`]).
+//! the kernel ([`classmap`]), the access vector cache ([`avc`]), and the SIDs of the tasks with
+//! their change at an exec and their attributes in `/proc/PID/attr` ([`task`]).
 //!
 //! The module is active when the command line has `selinux=1`, when `lsm=` names it, or with
 //! `security=selinux`. With `selinux=0` it is not active. The module starts in permissive
@@ -30,6 +31,7 @@ pub mod selinuxfs;
 pub mod server;
 pub mod services;
 pub mod sidtab;
+pub mod task;
 
 pub use crate::server::Policy;
 use alloc::format;
@@ -37,14 +39,36 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use rk_frame::sync::SpinLock;
+use rk_vfs::inode::Result;
 use rk_vfs::security::{
-    BlobSizes, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks, id,
+    BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks, Task,
+    id,
 };
 
 /// The hooks of SELinux.
 struct SeLinux;
 
-impl SecurityHooks for SeLinux {}
+impl SecurityHooks for SeLinux {
+    fn bprm_creds_for_exec(&self, bprm: &mut Bprm<'_>) -> Result<()> {
+        task::bprm_creds_for_exec(bprm)
+    }
+
+    fn getselfattr(&self, attr: u64, t: &Task<'_>) -> Result<Vec<u8>> {
+        task::getattr(attr, t)
+    }
+
+    fn setselfattr(&self, attr: u64, ctx: &[u8], _flags: u64) -> Result<()> {
+        task::setattr(attr, ctx).map(|_| ())
+    }
+
+    fn getprocattr(&self, t: &Task<'_>, name: &str) -> Option<Result<Vec<u8>>> {
+        Some(task::getprocattr(t, name))
+    }
+
+    fn setprocattr(&self, name: &str, value: &[u8]) -> Option<Result<usize>> {
+        Some(task::setprocattr(name, value))
+    }
+}
 
 /// The description of the module, as `DEFINE_LSM(selinux)` of Linux. SELinux is a major module
 /// that `security=selinux` selects, and it cannot be active with another exclusive module, as
@@ -53,7 +77,7 @@ pub static LSM: LsmInfo = LsmInfo {
     id: LsmId { name: "selinux", id: id::SELINUX },
     order: Order::Mutable,
     flags: FLAG_LEGACY_MAJOR | FLAG_EXCLUSIVE,
-    blobs: BlobSizes::NONE,
+    blobs: BlobSizes { cred: task::CRED_BLOB, ..BlobSizes::NONE },
     hooks: &SeLinux,
 };
 
@@ -133,10 +157,9 @@ fn current() -> (u32, Vec<u8>) {
     (0, Vec::new())
 }
 
-/// The SID of the current task, as `current_sid` of Linux. The tasks have no label of their
-/// own yet, so each task has the SID of the kernel.
+/// The SID of the current task, as `current_sid` of Linux.
 pub fn current_sid() -> u32 {
-    sidtab::sid::KERNEL
+    task::cred_sid(&rk_vfs::cred::current())
 }
 
 /// Tells if the module can be active, from the values of the parameters `selinux=`, `lsm=`

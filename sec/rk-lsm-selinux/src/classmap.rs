@@ -187,6 +187,8 @@ pub mod class {
     pub const SECURITY: u16 = 1;
     /// `process`.
     pub const PROCESS: u16 = 2;
+    /// `process2`.
+    pub const PROCESS2: u16 = 3;
     /// `system`.
     pub const SYSTEM: u16 = 4;
     /// `capability`.
@@ -209,6 +211,54 @@ pub mod class {
     pub const SOCK_FILE: u16 = 13;
     /// `fifo_file`.
     pub const FIFO_FILE: u16 = 14;
+    /// `key`.
+    pub const KEY: u16 = 50;
+}
+
+/// The permissions of the class `process`, `PROCESS__*` of Linux.
+pub mod process {
+    /// `transition`.
+    pub const TRANSITION: u32 = 1 << 1;
+    /// `ptrace`.
+    pub const PTRACE: u32 = 1 << 7;
+    /// `getattr`.
+    pub const GETATTR: u32 = 1 << 16;
+    /// `setexec`.
+    pub const SETEXEC: u32 = 1 << 17;
+    /// `setfscreate`.
+    pub const SETFSCREATE: u32 = 1 << 18;
+    /// `noatsecure`.
+    pub const NOATSECURE: u32 = 1 << 19;
+    /// `dyntransition`.
+    pub const DYNTRANSITION: u32 = 1 << 23;
+    /// `setcurrent`.
+    pub const SETCURRENT: u32 = 1 << 24;
+    /// `setkeycreate`.
+    pub const SETKEYCREATE: u32 = 1 << 28;
+    /// `setsockcreate`.
+    pub const SETSOCKCREATE: u32 = 1 << 29;
+}
+
+/// The permissions of the class `process2`, `PROCESS2__*` of Linux.
+pub mod process2 {
+    /// `nnp_transition`.
+    pub const NNP_TRANSITION: u32 = 1 << 0;
+    /// `nosuid_transition`.
+    pub const NOSUID_TRANSITION: u32 = 1 << 1;
+}
+
+/// The permissions of the class `file`, `FILE__*` of Linux.
+pub mod file {
+    /// `execute_no_trans`.
+    pub const EXECUTE_NO_TRANS: u32 = 1 << 26;
+    /// `entrypoint`.
+    pub const ENTRYPOINT: u32 = 1 << 27;
+}
+
+/// The permissions of the class `key`, `KEY__*` of Linux.
+pub mod key {
+    /// `create`.
+    pub const CREATE: u32 = 1 << 6;
 }
 
 /// The permissions of the class `security`, `SECURITY__*` of Linux.
@@ -282,5 +332,29 @@ mod tests {
         assert!(is_socket(16) && is_socket(15) && !is_socket(class::FILE));
         assert!(!is_socket(value("association").unwrap()));
         assert!(CLASSES.iter().all(|c| c.1.len() <= 32));
+        let bit = |tclass: u16, perm: &str| {
+            let perms = CLASSES[usize::from(tclass) - 1].1;
+            1u32 << perms.iter().position(|&p| p == perm).unwrap()
+        };
+        assert_eq!(name(class::PROCESS2), Some("process2"));
+        assert_eq!(value("key"), Some(class::KEY));
+        for (perm, v) in [
+            ("transition", process::TRANSITION),
+            ("ptrace", process::PTRACE),
+            ("getattr", process::GETATTR),
+            ("setexec", process::SETEXEC),
+            ("setfscreate", process::SETFSCREATE),
+            ("noatsecure", process::NOATSECURE),
+            ("dyntransition", process::DYNTRANSITION),
+            ("setcurrent", process::SETCURRENT),
+            ("setkeycreate", process::SETKEYCREATE),
+            ("setsockcreate", process::SETSOCKCREATE),
+        ] {
+            assert_eq!(bit(class::PROCESS, perm), v, "{perm}");
+        }
+        assert_eq!(bit(class::PROCESS2, "nosuid_transition"), process2::NOSUID_TRANSITION);
+        assert_eq!(bit(class::FILE, "execute_no_trans"), file::EXECUTE_NO_TRANS);
+        assert_eq!(bit(class::FILE, "entrypoint"), file::ENTRYPOINT);
+        assert_eq!(bit(class::KEY, "create"), key::CREATE);
     }
 }

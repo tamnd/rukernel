@@ -128,6 +128,8 @@ pub mod cap {
     pub const SETFCAP: u32 = 31;
     /// Skip the mandatory access control.
     pub const MAC_OVERRIDE: u32 = 32;
+    /// Change the mandatory access control, as a label that the policy does not know.
+    pub const MAC_ADMIN: u32 = 33;
     /// Read and clear the kernel log.
     pub const SYSLOG: u32 = 34;
     /// Read the audit log through the multicast group of the netlink socket.
