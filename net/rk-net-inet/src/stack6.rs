@@ -830,6 +830,13 @@ fn send_rs(dev: &NetDevice) {
     send_ndisc(dev, &src, &ALL_ROUTERS, ipv6::multicast_mac(&ALL_ROUTERS), msg);
 }
 
+/// Tells if the device `ifindex` takes router advertisements, as `ipv6_accept_ra` of Linux.
+fn accepts_ra(ifindex: u32) -> bool {
+    use rk_net::sysctl::{Family, Scope, conf};
+    let c = |name| conf(Family::Ipv6, Scope::Dev(ifindex), name);
+    addrconf::accept_ra(c("forwarding"), c("accept_ra"))
+}
+
 /// Starts the router solicitations of a device that went up, as `addrconf_dad_completed` of
 /// Linux. The first one goes out at the next poll.
 pub(crate) fn start_solicit(ifindex: u32) {
@@ -1297,7 +1304,8 @@ fn expiry(now: u64, secs: u32) -> Option<u64> {
 
 /// Takes a router advertisement, as `ndisc_router_discovery` and `addrconf_prefix_rcv` of
 /// Linux: the default route through the router, the routes of the prefixes on the link, and
-/// an address of each prefix for SLAAC.
+/// an address of each prefix for SLAAC. A device that does not take advertisements, as
+/// `ipv6_accept_ra`, only learns the link address of the router.
 fn ndisc_ra(dev: &NetDevice, h: &Header, msg: &[u8]) {
     if h.hops != ND_HOPS
         || msg.len() < 16
@@ -1313,6 +1321,10 @@ fn ndisc_ra(dev: &NetDevice, h: &Header, msg: &[u8]) {
     let opts = &msg[16..];
     if let Some(mac) = link_option(opts, ND_OPT_SOURCE_LL_ADDR) {
         learn(dev, &h.src, mac, true);
+    }
+    // A device that does not take advertisements only learns the link address of the router.
+    if !accepts_ra(ifindex) {
+        return;
     }
     let lifetime = u16::from_be_bytes([msg[6], msg[7]]);
     let mut r = Route6::new(ip::ANY, 0, Some(h.src), ifindex);
@@ -1413,6 +1425,11 @@ pub(crate) fn tick() {
         due
     };
     for ifindex in due {
+        // `addrconf_rs_timer` stops when the device does not take advertisements.
+        if !accepts_ra(ifindex) {
+            stop_solicit(ifindex);
+            continue;
+        }
         if let Some(d) = dev::by_index(ifindex).filter(|d| d.is_up()) {
             send_rs(&d);
         }

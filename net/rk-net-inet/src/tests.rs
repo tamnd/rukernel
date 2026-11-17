@@ -1702,6 +1702,20 @@ fn an_arp_sender_with_a_local_address_is_a_martian() {
     assert!(arp_sender_remote(&t, ipv4::ANY, false));
 }
 
+/// The values of `ipv6_accept_ra`: a device that forwards takes router advertisements only with
+/// `accept_ra` 2. systemd-networkd sets `accept_ra` to 0, and the kernel made addresses from
+/// the advertisements that networkd did not want.
+#[test]
+fn router_advertisements_follow_accept_ra_and_forwarding() {
+    use crate::addrconf::accept_ra;
+    assert!(accept_ra(0, 1));
+    assert!(accept_ra(0, 2));
+    assert!(!accept_ra(0, 0));
+    assert!(!accept_ra(1, 0));
+    assert!(!accept_ra(1, 1));
+    assert!(accept_ra(1, 2));
+}
+
 /// The proxy entries of `pneigh_lookup`: an entry of the device or of each device.
 #[test]
 fn proxy_entries() {

@@ -527,6 +527,13 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
     }
 }
 
+/// Tells if a device takes router advertisements, as `ipv6_accept_ra` of Linux: a device that
+/// forwards takes them only with `accept_ra` 2, and another device with `accept_ra` not 0.
+/// systemd-networkd sets `accept_ra` to 0 and takes the advertisements itself.
+pub(crate) fn accept_ra(forwarding: i32, accept_ra: i32) -> bool {
+    if forwarding != 0 { accept_ra == 2 } else { accept_ra != 0 }
+}
+
 /// Checks the attributes of an address against `ifa_ipv6_policy` of Linux.
 /// Takes a write of `net.ipv6.conf.DEV.disable_ipv6`, as `dev_disable_change` of Linux. The
 /// device loses its addresses and routes when IPv6 goes off, and it gets them again when IPv6
