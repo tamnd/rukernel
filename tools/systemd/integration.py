@@ -44,7 +44,9 @@ has a test-control.sh that runs all of them, and fails at the end if one failed,
 gives the result of each one. TEST_MATCH_SUBTEST and TEST_MATCH_TESTCASE of test-control.sh come
 from --match-subtest and --match-testcase.
 
-The test passes if the service result is `success` and the test made /testok. It is skipped if
+The test passes if the test made /testok and the service result is `success`, or the service
+stopped with SIGTERM. After it makes /testok, the test runs `systemctl --no-block exit 123`, and
+the stop of the system can stop the service with SIGTERM before it exits. The test is skipped if
 the exit status is 77. The results of the subtests and the test cases of test-control.sh come
 from the trace of bash on the console. A subtest or a test case that starts and does not end is a
 failure.
@@ -231,7 +233,10 @@ def stage(a, test, d):
     for var, value in (("TEST_MATCH_SUBTEST", a.match_subtest),
                        ("TEST_MATCH_TESTCASE", a.match_testcase)):
         if value:
-            dropin += f"\n[Service]\nEnvironment={var}={value}\n"
+            # systemd reads C escapes and specifiers in Environment=, so a backslash, a quote
+            # and a percent sign of the pattern need an escape.
+            value = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+            dropin += f'\n[Service]\nEnvironment="{var}={value}"\n'
     files = {
         f"etc/systemd/system/{test}.service.d/50-rk-it.conf": dropin,
         "etc/systemd/system/emergency-exit.service": EMERGENCY_EXIT,
@@ -389,7 +394,7 @@ def read_log(path):
                 service, status, ok = words[2], words[4], words[5]
                 if status == "77":
                     result = "skip"
-                elif service == "success" and ok == "testok":
+                elif ok == "testok" and (service == "success" or status == "TERM"):
                     result = "pass"
                 else:
                     result = f"fail ({service}, {status})"
