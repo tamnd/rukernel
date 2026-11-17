@@ -16784,8 +16784,10 @@ static int sel_xact(const char *path, const char *req, char *buf, int size)
 static void test_selinux(void)
 {
 	static char buf[65536], pol[65536], back[65536];
-	unsigned long long ids[4] = { 0 };
-	unsigned int size = sizeof(ids), st4[5];
+	static const char kernel[] = "system_u:system_r:kernel_t:s0-s1:c0.c2", init[] = "system_u:system_r:init_t:s0";
+	unsigned long long ids[4] = { 0 }, ctx[16] = { 0 };
+	unsigned int size = sizeof(ids), csize = sizeof(ctx), st4[5];
+	char *sub[] = { "rk-sub", NULL };
 	struct statfs sfs;
 	struct stat st;
 	int n, fd, len;
@@ -16821,7 +16823,7 @@ static void test_selinux(void)
 	n = aa_read("/sys/fs/selinux/status", buf, 64);
 	memcpy(st4, buf, sizeof(st4));
 	check("selinux: status counts the load", n == 20 && st4[1] == 2 && st4[2] == 0 && st4[3] == 1);
-	/* The security server. The test task has the SID kernel, and the policy gives kernel_t no permission of the class security, so each check makes a denial record. */
+	/* The security server. The test task has the context of the SID kernel, and the policy gives kernel_t no permission of the class security, so each check makes a denial record. */
 	check("selinux: access gives the decision of the policy", sel_xact("/sys/fs/selinux/access", "system_u:system_r:init_t:s0 system_u:object_r:etc_t:s0 6", buf, 256) > 0 && strcmp(buf, "44012 ffffffff 4 ffffffff 1 0") == 0);
 	check("selinux: access gives EINVAL for a bad context", sel_xact("/sys/fs/selinux/access", "system_u:object_r:nothing_t:s0 system_u:object_r:etc_t:s0 6", buf, 256) == -EINVAL);
 	n = sel_xact("/sys/fs/selinux/context", "system_u:object_r:sbin_t:s0", buf, 256);
@@ -16841,11 +16843,34 @@ static void test_selinux(void)
 	check("selinux: initial_contexts/kernel gives the context of the policy", n > 0 && strcmp(buf, "system_u:system_r:kernel_t:s0-s1:c0.c2") == 0);
 	n = aa_read("/sys/fs/selinux/avc/cache_stats", buf, 256);
 	check("selinux: avc/cache_stats has the counters", n > 0 && strncmp(buf, "lookups hits misses allocations reclaims frees\n", 47) == 0);
+	/*
+	 * The SID of the task, as selinux_lsm_getattr, selinux_lsm_setattr and selinux_bprm_creds_for_exec of Linux. init ran before
+	 * the load, so it has the SID init, and without the policy capability userspace_initial_context, init has the context of
+	 * kernel. The files have no label yet, so an exec in permissive mode makes denials for the file unlabeled_t.
+	 */
+	mkdir("/proc", 0555);
+	check("selinux: proc mounts", mount("proc", "/proc", "proc", 0, NULL) == 0);
+	n = aa_read("/proc/self/attr/current", buf, 256);
+	check("selinux: attr/current gives the context of init with a NUL", n == (int)sizeof(kernel) && strcmp(buf, kernel) == 0);
+	n = aa_read("/proc/self/attr/prev", buf, 256);
+	check("selinux: attr/prev gives the context before the exec, and attr/exec is empty", n == (int)sizeof(kernel) && strcmp(buf, kernel) == 0 && aa_read("/proc/self/attr/exec", buf, 256) == 0);
+	check("selinux: lsm_get_self_attr gives the context with a NUL", syscall(459, 100, ctx, &csize, 0) == 1 && ctx[0] == 101 && ctx[3] == sizeof(kernel) && strcmp((char *)&ctx[4], kernel) == 0);
+	check("selinux: a write of a context that the policy does not know to attr/exec gives EINVAL", aa_write("/proc/self/attr/exec", "system_u:system_r:nothing_t:s0", 30, 0) == EINVAL);
+	check("selinux: attr/fscreate takes a context with a NUL and gives it back", aa_write("/proc/self/attr/fscreate", "system_u:object_r:etc_t:s0", 27, 0) == 0 && aa_read("/proc/self/attr/fscreate", buf, 256) == 27 && strcmp(buf, "system_u:object_r:etc_t:s0") == 0);
+	check("selinux: a new line clears attr/fscreate", aa_write("/proc/self/attr/fscreate", "\n", 1, 0) == 0 && aa_read("/proc/self/attr/fscreate", buf, 256) == 0);
+	mkdir("/tmp", 01777);
+	check("selinux: the test program is there", aa_copy("/init", "/tmp/rk-sub") == 0);
+	n = aa_run_at("/tmp/rk-sub", init, sub, buf, 256);
+	check("selinux: an exec after a write to attr/exec runs with the new context", n == (int)sizeof(init) && strcmp(buf, init) == 0);
+	n = aa_run_at("/tmp/rk-sub", NULL, sub, buf, 256);
+	check("selinux: an exec without a rule keeps the context", n == (int)sizeof(kernel) && strcmp(buf, kernel) == 0);
+	check("selinux: attr/exec of init stays empty", aa_read("/proc/self/attr/exec", buf, 256) == 0);
 	check("selinux: a write of 1 to enforce works in permissive mode", aa_write("/sys/fs/selinux/enforce", "1", 1, O_TRUNC) == 0 && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "1") == 0);
 	n = aa_read("/sys/fs/selinux/status", buf, 64);
 	memcpy(st4, buf, sizeof(st4));
 	check("selinux: status has the enforcing mode and the second load", n == 20 && st4[1] == 6 && st4[2] == 1 && st4[3] == 2);
 	check("selinux: a write of 0 to enforce gives EACCES in enforcing mode", aa_write("/sys/fs/selinux/enforce", "0\n", 2, 0) == EACCES && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "1") == 0);
+	check("selinux: a write to attr/exec gives EACCES in enforcing mode", aa_write("/proc/self/attr/exec", init, strlen(init), 0) == EACCES && aa_read("/proc/self/attr/exec", buf, 256) == 0);
 	check("selinux: a write of text to enforce gives EINVAL", aa_write("/sys/fs/selinux/enforce", "x", 1, 0) == EINVAL);
 	check("selinux: a write to checkreqprot does nothing", aa_write("/sys/fs/selinux/checkreqprot", "1", 1, 0) == 0 && aa_read("/sys/fs/selinux/checkreqprot", buf, 64) == 1 && strcmp(buf, "0") == 0);
 	n = klogctl(3, buf, sizeof(buf) - 1);
@@ -16859,6 +16884,10 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the denial of setenforce in enforcing mode", strstr(buf, "{ setenforce } for  pid=1 comm=\"init\" scontext=system_u:system_r:kernel_t:s0-s1:c0.c2 tcontext=system_u:object_r:security_t:s0 tclass=security permissive=0") != NULL);
 	check("selinux: the kernel log has the denials of the other files", strstr(buf, "{ compute_av } for") != NULL && strstr(buf, "{ check_context } for") != NULL && strstr(buf, "{ compute_create } for") != NULL && strstr(buf, "{ load_policy } for") != NULL);
 	check("selinux: the kernel log has the unknown classes", strstr(buf, "SELinux:  Class tcp_socket not defined in policy.") != NULL && strstr(buf, "SELinux: the above unknown classes and permissions will be denied") != NULL);
+	check("selinux: the kernel log has the denial of the entrypoint", strstr(buf, "avc:  denied  { entrypoint } for  pid=") != NULL && strstr(buf, " comm=\"init\" path=\"/tmp/rk-sub\" dev=\"") != NULL && strstr(buf, "scontext=system_u:system_r:init_t:s0 tcontext=system_u:object_r:unlabeled_t:s0 tclass=file permissive=1") != NULL);
+	check("selinux: the kernel log has the denials of noatsecure and execute_no_trans", strstr(buf, "{ noatsecure } for") != NULL && strstr(buf, "{ execute_no_trans } for") != NULL);
+	check("selinux: the kernel log has the denial of setexec in enforcing mode", strstr(buf, "{ setexec } for  pid=1 comm=\"init\" scontext=system_u:system_r:kernel_t:s0-s1:c0.c2 tcontext=system_u:system_r:kernel_t:s0-s1:c0.c2 tclass=process permissive=0") != NULL);
+	umount("/proc");
 	umount("/sys/fs/selinux");
 	umount("/sys");
 }

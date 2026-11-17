@@ -1117,6 +1117,20 @@ impl Policydb {
         self.types.get(t.checked_sub(1)? as usize)?.as_ref()
     }
 
+    /// Tells if the type `bound` is in the chain of bounds of the type `t`, as the loop of
+    /// `security_bounded_transition` of Linux. The load checks that a chain is short and has no
+    /// loop.
+    pub fn type_bounded_by(&self, t: u32, bound: u32) -> bool {
+        let mut t = t;
+        while let Some(b) = self.ty(t).map(|ty| ty.bounds).filter(|&b| b != 0) {
+            if b == bound {
+                return true;
+            }
+            t = b;
+        }
+        false
+    }
+
     /// The class with the value `c`.
     pub fn class(&self, c: u32) -> Option<&Class> {
         self.classes.get(c.checked_sub(1)? as usize)?.as_ref()
@@ -1611,6 +1625,9 @@ mod tests {
         assert_eq!(p.permissive.iter().collect::<Vec<_>>(), [unconfined]);
         let child = value(&p, sym::TYPES, "child_t");
         assert_eq!(p.ty(child).unwrap().bounds, unconfined);
+        assert!(p.type_bounded_by(child, unconfined));
+        assert!(!p.type_bounded_by(unconfined, child));
+        assert!(!p.type_bounded_by(child, value(&p, sym::TYPES, "kernel_t")));
         let file = p.class_value("file").unwrap();
         let class = p.class(file).unwrap();
         assert_eq!(p.commons[class.common.unwrap()].name, "file");
