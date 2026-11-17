@@ -256,26 +256,32 @@ pub fn update_addr(ifindex: u32, mut f: impl FnMut(&mut IfAddr) -> bool, origin:
 }
 
 /// Removes the first address of an interface that `pred` takes, and its routes, as
-/// `__inet_del_ifa` and `fib_del_ifaddr` of Linux.
+/// `__inet_del_ifa` and `fib_del_ifaddr` of Linux. With `promote_secondaries` of `all` or of
+/// the interface, a secondary address of the subnet of a removed primary address becomes
+/// primary, and a `RTM_NEWADDR` tells of it.
 ///
 /// # Errors
 ///
 /// Gives `EADDRNOTAVAIL` if no address matches.
 pub fn del_addr(ifindex: u32, pred: impl Fn(&IfAddr) -> bool, origin: Origin) -> Result<IfAddr> {
-    let (removed, changes) = {
+    let promote = crate::forward::orconf(ifindex, "promote_secondaries");
+    let ((removed, promoted), changes) = {
         let mut t = ROUTES.lock();
         let i = t
             .addrs()
             .iter()
             .position(|a| a.ifindex == ifindex && pred(a))
             .ok_or(Errno::EADDRNOTAVAIL)?;
-        let removed = t.remove_addr(i);
+        let removed = t.remove_addr(i, promote);
         (removed, t.sync_link(link(ifindex)))
     };
     let n = removed.len();
     for (i, a) in removed.iter().enumerate() {
         // The secondary addresses go out without the origin of the request, as Linux does.
         notify_addr(a, RTM_DELADDR, if i + 1 == n { origin } else { Origin::KERNEL });
+    }
+    if let Some(p) = &promoted {
+        notify_addr(p, RTM_NEWADDR, origin);
     }
     notify_changes(&changes);
     // An interface without addresses loses its neighbours, as `fib_disable_ip` of Linux.

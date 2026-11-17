@@ -436,30 +436,48 @@ impl Table {
         Ok(())
     }
 
-    /// Removes the address at `index` of `addrs`, as `__inet_del_ifa` of Linux without the
-    /// promotion of a secondary address. A primary address takes its secondary addresses with
-    /// it. Gives the removed addresses: the secondary addresses first. The caller removes the
-    /// routes with `sync_link`.
-    pub fn remove_addr(&mut self, index: usize) -> Vec<IfAddr> {
+    /// Removes the address at `index` of `addrs`, as `__inet_del_ifa` of Linux. A primary
+    /// address takes the secondary addresses of its subnet with it. With `promote`, as
+    /// `promote_secondaries` of Linux, the first of them becomes primary instead and goes after
+    /// the last primary address that comes after the removed address and has a scope that is
+    /// not smaller. If there is no such address, it takes the place of the removed address.
+    /// The other secondary addresses stay. Gives the removed addresses, the secondary addresses
+    /// first, and the promoted address. The caller changes the routes with `sync_link`.
+    pub fn remove_addr(&mut self, index: usize, promote: bool) -> (Vec<IfAddr>, Option<IfAddr>) {
         let a = self.addrs.remove(index);
         let mut out = Vec::new();
+        let mut promoted = None;
         if !a.is_secondary() {
-            let mut i = 0;
-            while i < self.addrs.len() {
-                let o = &self.addrs[i];
-                if o.ifindex == a.ifindex
+            let of_subnet = |o: &IfAddr| {
+                o.ifindex == a.ifindex
                     && o.is_secondary()
                     && o.prefix == a.prefix
                     && a.contains(o.address)
-                {
-                    out.push(self.addrs.remove(i));
-                } else {
-                    i += 1;
+            };
+            if promote {
+                if let Some(i) = self.addrs.iter().position(of_subnet) {
+                    let mut p = self.addrs.remove(i);
+                    p.flags &= !IFA_F_SECONDARY;
+                    let last_primary = self.addrs[index..].iter().rposition(|o| {
+                        o.ifindex == a.ifindex && !o.is_secondary() && o.scope >= a.scope
+                    });
+                    let at = last_primary.map_or(index, |j| index + j + 1);
+                    self.addrs.insert(at, p.clone());
+                    promoted = Some(p);
+                }
+            } else {
+                let mut i = 0;
+                while i < self.addrs.len() {
+                    if of_subnet(&self.addrs[i]) {
+                        out.push(self.addrs.remove(i));
+                    } else {
+                        i += 1;
+                    }
                 }
             }
         }
         out.push(a);
-        out
+        (out, promoted)
     }
 
     /// Removes the addresses and the routes of an interface. The routes through nexthop

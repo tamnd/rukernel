@@ -345,11 +345,40 @@ fn addresses_and_link_state() {
     assert!(t.routes().iter().filter(|r| r.ifindex == 2).all(|r| r.scope == RT_SCOPE_HOST as u8));
     assert_eq!(t.lookup([8, 8, 8, 8]), Err(Errno::ENETUNREACH));
     // The removal of the primary address takes the secondary address and all routes with it.
-    let removed = t.remove_addr(t.addrs().iter().position(|a| a.local == [10, 0, 2, 15]).unwrap());
+    let at = t.addrs().iter().position(|a| a.local == [10, 0, 2, 15]).unwrap();
+    let (removed, promoted) = t.remove_addr(at, false);
+    assert_eq!(promoted, None);
     assert_eq!(removed.len(), 2);
     assert_eq!(removed[1].local, [10, 0, 2, 15]);
     t.sync_link(Link { up: false, ..ETH });
     assert!(t.routes().iter().all(|r| r.ifindex != 2));
+}
+
+#[test]
+fn a_secondary_address_takes_the_place_of_a_removed_primary_address() {
+    let mut t = qemu_table();
+    for a in [[10, 0, 2, 16], [10, 0, 2, 17]] {
+        t.insert_addr(IfAddr::new(2, a, 24, "eth0")).unwrap();
+    }
+    t.insert_addr(IfAddr::new(2, [10, 1, 0, 1], 16, "eth0")).unwrap();
+    t.sync_link(ETH);
+    // With `promote_secondaries`, the first secondary address becomes primary and goes after
+    // the last primary address, as `__inet_del_ifa` of Linux. The other one stays secondary.
+    let at = t.addrs().iter().position(|a| a.local == [10, 0, 2, 15]).unwrap();
+    let (removed, promoted) = t.remove_addr(at, true);
+    assert_eq!(removed.iter().map(|a| a.local).collect::<Vec<_>>(), [[10, 0, 2, 15]]);
+    let promoted = promoted.unwrap();
+    assert_eq!(promoted.local, [10, 0, 2, 16]);
+    assert!(!promoted.is_secondary());
+    let addrs: Vec<_> = t.addrs_of(2).map(|a| (a.local, a.is_secondary())).collect();
+    assert_eq!(addrs, [([10, 1, 0, 1], false), ([10, 0, 2, 16], false), ([10, 0, 2, 17], true)]);
+    // The route of the subnet now has the promoted address as its source.
+    t.sync_link(ETH);
+    let subnet = t.routes().iter().find(|r| r.dst == [10, 0, 2, 0] && r.prefix == 24).unwrap();
+    assert_eq!(subnet.prefsrc, Some([10, 0, 2, 16]));
+    // A removal of a secondary address promotes nothing.
+    let at = t.addrs().iter().position(|a| a.local == [10, 0, 2, 17]).unwrap();
+    assert_eq!(t.remove_addr(at, true).1, None);
 }
 
 #[test]

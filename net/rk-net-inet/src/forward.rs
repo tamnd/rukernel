@@ -84,7 +84,7 @@ pub fn fwd_proxy(proxy_arp: bool, in_medium: i32, out_medium: i32) -> bool {
 
 /// The value of a configuration of IPv4 of `all` or of the device, as the `IN_DEV_ORCONF`
 /// macro of include/linux/inetdevice.h.
-fn orconf(ifindex: u32, name: &str) -> bool {
+pub(crate) fn orconf(ifindex: u32, name: &str) -> bool {
     conf(Family::Ipv4, Scope::All, name) != 0 || conf(Family::Ipv4, Scope::Dev(ifindex), name) != 0
 }
 
