@@ -527,8 +527,10 @@ impl Table {
             if a.broadcast != ipv4::ANY && a.broadcast != ipv4::BROADCAST {
                 out.push(magic(RTN_BROADCAST, a.broadcast, 32, 0));
             }
+            // The route of the subnet, or of the peer of a point to point address, as Linux:
+            // the prefix of `ifa_address` that is not the local address itself.
             let prefix = ipv4::prefix(a.address, a.prefix);
-            if prefix[0] != 0 && !a.is_secondary() && (prefix != a.address || a.prefix < 32) {
+            if prefix[0] != 0 && !a.is_secondary() && (prefix != a.local || a.prefix < 32) {
                 if a.flags & IFA_F_NOPREFIXROUTE == 0 {
                     let kind = if link.loopback { RTN_LOCAL } else { RTN_UNICAST };
                     out.push(magic(kind, prefix, a.prefix, a.rt_priority));
