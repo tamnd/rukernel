@@ -8,6 +8,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The labels of the IPv6 addresses, as addrlabel.c of Linux: `RTM_NEWADDRLABEL`, `RTM_DELADDRLABEL` and `RTM_GETADDRLABEL` with the default policy of RFC 6724 in each network namespace. `ip addrlabel` and `networkctl label` use them (#538).
 - nf_tables: the expression `inner`, as nft_inner.c of Linux, for the headers of the packet in a tunnel: `vxlan ip saddr`, `geneve tcp dport`, `gre ip daddr` and the like. In the tunnel go `payload` (the tunnel, link layer, network and transport headers) and `meta protocol` and `meta l4proto` (#542).
+- `madvise(MADV_PAGEOUT)` writes the private anonymous pages of a range to swap, as `madvise_pageout` of Linux. The page table keeps a swap entry in place of the page, and the next access reads the page back, as `do_swap_page`. `fork`, `mremap` and `munmap` keep or free the entries. `/proc/vmstat` gives `pswpin` and `pswpout`, `/proc/PID/status` gives `VmSwap`, and `/proc/PID/smaps` gives `Swap`. Both backends do it. (#752)
 
 ### Fixed
 
@@ -26,7 +27,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - nf_tables: `NFT_MSG_GETRULE_RESET`, as Linux, for `nft reset rule`, `nft reset rules` of a chain, a table, a family or all: the dump gives what the counters and the quotas of the rules counted, then sets them back to 0. The dump of a rule also gives what its quotas used so far, as `nft_quota_dump` (#542).
 - State pruning of the BPF verifier as `is_state_visited` and `states_equal` of Linux: a path stops when its state is within a safe state that the verifier kept at the same prune point, with `regsafe`, `stacksafe`, register liveness, and the limits of Linux for the kept states. The `socket-bind` and `restrict-ifaces` programs of systemd 257 now load, with 39,829 and 24 processed instructions, where Linux 6.8 processes 25,505 and 16 (#762).
 - The swap areas of `swapon` have a map of their pages, as the `swap_map` of Linux, and the kernel can write a page to a swap area and read it back with direct I/O to the disk. A swap file uses the runs of the disk of its extents. `/proc/swaps` gives the used pages, and `/proc/meminfo` and `sysinfo` give the free swap. `swapoff` of an area with used pages gives `EBUSY`. The new `swap` boot test makes a disk a swap area. (#752)
-- `madvise(MADV_PAGEOUT)` writes the private anonymous pages of a range to swap, as `madvise_pageout` of Linux. The page table keeps a swap entry in place of the page, and the next access reads the page back, as `do_swap_page`. `fork`, `mremap` and `munmap` keep or free the entries. `/proc/vmstat` gives `pswpin` and `pswpout`, `/proc/PID/status` gives `VmSwap`, and `/proc/PID/smaps` gives `Swap`. Both backends do it. (#752)
 
 ### Fixed
 
