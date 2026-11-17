@@ -717,9 +717,8 @@ fn to_route(req: &Request<'_>) -> Result<Route6> {
 fn check_route(r: &mut Route6) -> Result<()> {
     match u32::from(r.kind) {
         RTN_UNICAST | RTN_LOCAL => {}
-        // A route that rejects has no next hop.
         RTN_UNREACHABLE | RTN_PROHIBIT | RTN_BLACKHOLE => {
-            r.gateway = None;
+            ROUTES6.lock().set_reject_dev(r);
             return Ok(());
         }
         _ => return Err(Errno::EINVAL),
