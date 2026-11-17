@@ -162,6 +162,9 @@ pub struct Swap {
     pub pages: u64,
     /// The priority.
     pub priority: i32,
+    /// A `swapoff` reads the pages of the area back, so no new entry goes to it, as the clear
+    /// `SWP_WRITEOK` of Linux.
+    closing: bool,
 }
 
 impl Swap {
@@ -429,11 +432,57 @@ pub fn activate(file: Arc<File>, path: Vec<u8>, swap_flags: u32) -> Result<()> {
         return Err(Errno::EBUSY);
     }
     let kind = (0..MAX_SWAPFILES as u64).find(|k| swaps.iter().all(|s| s.kind != *k)).unwrap_or(0);
-    swaps.push(Swap { file, kind, slots, disk, path, partition, pages: pages - 1, priority });
+    swaps.push(Swap {
+        file,
+        kind,
+        slots,
+        disk,
+        path,
+        partition,
+        pages: pages - 1,
+        priority,
+        closing: false,
+    });
     ACTIVE.store(swaps.len(), Ordering::Release);
     drop(swaps);
     touch();
     Ok(())
+}
+
+/// Starts the `swapoff` of the active swap area of `inode`: no new entry goes to the area. Gives
+/// the type of the entries of the area and the pages that entries use. The caller reads these
+/// pages back, as `try_to_unuse` of Linux, and then calls [`deactivate`], or [`cancel`] after an
+/// error.
+///
+/// # Errors
+///
+/// Gives `EINVAL` if `inode` is not an active area or another `swapoff` of it runs.
+pub fn begin_off(inode: &InodeRef) -> Result<(u64, u64)> {
+    let mut swaps = SWAPS.lock();
+    let s = swaps
+        .iter_mut()
+        .find(|s| !s.closing && s.inode().is_some_and(|x| Arc::ptr_eq(x, inode)))
+        .ok_or(Errno::EINVAL)?;
+    s.closing = true;
+    Ok((s.kind, s.slots.inuse))
+}
+
+/// Ends a `swapoff` of the area of `inode` that did not end, so new entries go to the area again.
+pub fn cancel(inode: &InodeRef) {
+    let mut swaps = SWAPS.lock();
+    if let Some(s) = swaps.iter_mut().find(|s| s.inode().is_some_and(|x| Arc::ptr_eq(x, inode))) {
+        s.closing = false;
+    }
+}
+
+/// The type of the area of the swap entry `e`.
+pub const fn kind_of(e: u64) -> u64 {
+    split(e).0
+}
+
+/// The pages that entries use in the area of type `kind`.
+pub fn used_of(kind: u64) -> u64 {
+    SWAPS.lock().iter().find(|s| s.kind == kind).map_or(0, |s| s.slots.inuse)
 }
 
 /// Ends the active swap area of `inode`, for `swapoff`.
@@ -441,7 +490,7 @@ pub fn activate(file: Arc<File>, path: Vec<u8>, swap_flags: u32) -> Result<()> {
 /// # Errors
 ///
 /// Gives `EINVAL` if `inode` is not an active area, and `EBUSY` if entries use pages of the area.
-/// rukernel does not read the pages back into memory yet, as `try_to_unuse` of Linux does.
+/// The caller reads the pages back first, after [`begin_off`].
 pub fn deactivate(inode: &InodeRef) -> Result<()> {
     let mut swaps = SWAPS.lock();
     let i = swaps
@@ -497,7 +546,8 @@ pub fn alloc() -> Option<u64> {
         return None;
     }
     let mut swaps = SWAPS.lock();
-    let mut order: Vec<usize> = (0..swaps.len()).filter(|&i| swaps[i].disk.is_some()).collect();
+    let mut order: Vec<usize> =
+        (0..swaps.len()).filter(|&i| swaps[i].disk.is_some() && !swaps[i].closing).collect();
     order.sort_by_key(|&i| core::cmp::Reverse(swaps[i].priority));
     order.into_iter().find_map(|i| {
         let s = &mut swaps[i];
@@ -583,6 +633,7 @@ mod tests {
     #[test]
     fn an_entry_has_the_type_and_the_page() {
         assert_eq!(split(entry(3, 12345)), (3, 12345));
+        assert_eq!(kind_of(entry(31, 7)), 31);
         assert_eq!(bad_pages(&page(9, &[3, 7])), [3, 7]);
     }
 

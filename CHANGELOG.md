@@ -6,6 +6,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
+- `swapoff` of an area with used pages reads the pages back into the processes that have them, as `try_to_unuse` of Linux. Before, it gave `EBUSY`. No new page goes to the area while it reads. `swapoff` gives `ENOMEM` if the pages do not fit in the free memory, and the area then stays active. (#752)
 - `mmap` of a BPF array map with `BPF_F_MMAPABLE`, as `bpf_map_mmap` of Linux: the process and the BPF programs share the pages of the values. A map with `BPF_F_RDONLY_PROG` or a frozen map maps only to read, `BPF_MAP_FREEZE` gives `EBUSY` while a mapping can write, a mapping of a map cannot get exec access with `mprotect`, and the mapping holds the map. libbpf maps the `.rodata` and `.bss` maps of a program, so the `restrict-ifaces` program of systemd now loads (#762).
 - The labels of the IPv6 addresses, as addrlabel.c of Linux: `RTM_NEWADDRLABEL`, `RTM_DELADDRLABEL` and `RTM_GETADDRLABEL` with the default policy of RFC 6724 in each network namespace. `ip addrlabel` and `networkctl label` use them (#538).
 - nf_tables: the expression `inner`, as nft_inner.c of Linux, for the headers of the packet in a tunnel: `vxlan ip saddr`, `geneve tcp dport`, `gre ip daddr` and the like. In the tunnel go `payload` (the tunnel, link layer, network and transport headers) and `meta protocol` and `meta l4proto` (#542).
