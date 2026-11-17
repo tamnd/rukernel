@@ -8,6 +8,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The labels of the IPv6 addresses, as addrlabel.c of Linux: `RTM_NEWADDRLABEL`, `RTM_DELADDRLABEL` and `RTM_GETADDRLABEL` with the default policy of RFC 6724 in each network namespace. `ip addrlabel` and `networkctl label` use them (#538).
 - nf_tables: the expression `inner`, as nft_inner.c of Linux, for the headers of the packet in a tunnel: `vxlan ip saddr`, `geneve tcp dport`, `gre ip daddr` and the like. In the tunnel go `payload` (the tunnel, link layer, network and transport headers) and `meta protocol` and `meta l4proto` (#542).
+- `madvise(MADV_PAGEOUT)` writes the private anonymous pages of a range to swap, as `madvise_pageout` of Linux. The page table keeps a swap entry in place of the page, and the next access reads the page back, as `do_swap_page`. `fork`, `mremap` and `munmap` keep or free the entries. `/proc/vmstat` gives `pswpin` and `pswpout`, `/proc/PID/status` gives `VmSwap`, and `/proc/PID/smaps` gives `Swap`. Both backends do it. (#752)
 
 ### Fixed
 

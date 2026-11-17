@@ -143,6 +143,8 @@ pub struct VmCounts {
     pub pgpgout: u64,
     /// The counts of the reclaim.
     pub reclaim: rk_frame::mm::ReclaimCounts,
+    /// The pages that went to swap and that came back, `pswpout` and `pswpin`.
+    pub swap: (u64, u64),
     /// `vm.min_free_kbytes`.
     pub min_free_kbytes: u64,
     /// The first frame and the end of the frames of the zone.
@@ -161,6 +163,8 @@ fn vm_value(c: &VmCounts, name: &str) -> u64 {
         "pgfault" => c.faults,
         "pgpgin" => c.pgpgin,
         "pgpgout" => c.pgpgout,
+        "pswpin" => c.swap.1,
+        "pswpout" => c.swap.0,
         "pgscan_kswapd" => c.reclaim.scan[0],
         "pgscan_direct" => c.reclaim.scan[1],
         "pgsteal_kswapd" => c.reclaim.steal[0],
@@ -593,6 +597,8 @@ pub struct MemSizes {
     pub rss_file: u64,
     /// The pages with a frame in shared areas without a file.
     pub rss_shmem: u64,
+    /// The pages in a swap area, `MM_SWAPENTS` of Linux.
+    pub swap: u64,
     /// The private areas that can be written, without the stack, `data_vm` of Linux.
     pub data: u64,
     /// The stack, `stack_vm`.
@@ -631,7 +637,7 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
          VmLck:\t{:>8} kB\nVmPin:\t       0 kB\nVmHWM:\t{rss:>8} kB\nVmRSS:\t{rss:>8} kB\n\
          RssAnon:\t{:>8} kB\nRssFile:\t{:>8} kB\nRssShmem:\t{:>8} kB\nVmData:\t{:>8} kB\n\
          VmStk:\t{:>8} kB\nVmExe:\t{:>8} kB\nVmLib:\t{:>8} kB\nVmPTE:\t       0 kB\n\
-         VmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t0\n\
+         VmSwap:\t{:>8} kB\nHugetlbPages:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t0\n\
          Threads:\t{}\nSigQ:\t0/31\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\n\
          SigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\nCapInh:\t{:016x}\n\
          CapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\n\
@@ -665,6 +671,7 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
         m.stack / 1024,
         m.exe / 1024,
         m.lib / 1024,
+        m.swap / 1024,
         s.threads,
         s.pending,
         x.shared_pending,
@@ -693,6 +700,8 @@ pub struct SmapsArea {
     pub anon: bool,
     /// The area is locked.
     pub locked: bool,
+    /// The bytes in pages that are in a swap area.
+    pub swap: u64,
     /// The two letter names of the flags of the area for the line `VmFlags`, in the order of
     /// `show_smap_vma_flags` of Linux.
     pub flags: Vec<&'static str>,
@@ -724,7 +733,7 @@ pub fn smaps_area(out: &mut Vec<u8>, a: &SmapsArea) {
         ("FilePmdMapped", 0),
         ("Shared_Hugetlb", 0),
         ("Private_Hugetlb", 0),
-        ("Swap", 0),
+        ("Swap", a.swap),
         ("SwapPss", 0),
         ("Locked", locked),
     ];
@@ -955,6 +964,7 @@ mod tests {
                 scan_kind: [0, 9],
                 steal_kind: [0, 5],
             },
+            swap: (7, 6),
             min_free_kbytes: 5792,
             span: (1, 131_040),
             blocks,
@@ -965,6 +975,7 @@ mod tests {
         assert_eq!(v.lines().count(), 178);
         assert!(v.starts_with("nr_free_pages 120000\nnr_zone_inactive_anon 0\n"));
         assert!(v.contains("\npgfault 42\n"));
+        assert!(v.contains("\npgpgout 0\npswpin 6\npswpout 7\n"));
         assert!(v.contains("\npgsteal_kswapd 2\npgsteal_direct 1\npgsteal_khugepaged 0\n"));
         assert!(v.contains("\npgscan_kswapd 3\npgscan_direct 4\npgscan_khugepaged 0\n"));
         assert!(v.contains("\npgscan_anon 0\npgscan_file 9\npgsteal_anon 0\npgsteal_file 5\n"));
@@ -1069,7 +1080,7 @@ mod tests {
     fn smaps_shows_the_resident_and_locked_bytes() {
         let mut out = Vec::new();
         let flags = alloc::vec!["rd", "wr", "mr", "mw", "me", "lo", "ac"];
-        let area = SmapsArea { size: 8192, rss: 4096, anon: true, locked: true, flags };
+        let area = SmapsArea { size: 8192, rss: 4096, anon: true, locked: true, swap: 0, flags };
         smaps_area(&mut out, &area);
         let text = core::str::from_utf8(&out).unwrap_or("");
         assert!(text.starts_with("Size:                  8 kB\n"));

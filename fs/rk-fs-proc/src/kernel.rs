@@ -179,6 +179,7 @@ fn vm_counts() -> text::VmCounts {
         pgpgin: sectors[0] / 2,
         pgpgout: sectors[1] / 2,
         reclaim: rk_frame::mm::reclaim_counts(),
+        swap: rk_frame::mm::swap_counts(),
         min_free_kbytes: rk_mm::tunables::min_free_kbytes(f.total) as u64,
         span: (span.start as u64, span.end as u64),
         blocks: rk_frame::mm::free_blocks().map(|n| n as u64),
@@ -1444,6 +1445,7 @@ fn mem_sizes(p: &Process) -> text::MemSizes {
             }
             _ => None,
         };
+        m.swap += vm.swapped_pages(a.start, a.end) as u64 * page;
         match (&file, a.shared) {
             (Some(_), _) => m.rss_file += resident,
             (None, true) => m.rss_shmem += resident,
@@ -1624,6 +1626,7 @@ fn areas_of(p: &Process, smaps: bool) -> Result<Vec<u8>> {
                 rss: vm.resident_pages(a.start, a.end) as u64 * 4096,
                 anon: matches!(a.backing, Backing::Anon),
                 locked: a.locked,
+                swap: vm.swapped_pages(a.start, a.end) as u64 * 4096,
                 flags: vm_flags(&a, vm.area_soft_dirty(a.start, a.end)),
             };
             text::smaps_area(&mut out, &area);

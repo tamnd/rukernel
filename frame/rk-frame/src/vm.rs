@@ -25,7 +25,7 @@ use crate::addr::{PAGE_SIZE, VirtAddr};
 use crate::arch::imp::paging;
 use crate::blocks::{BlockTree, TOP_LEVEL};
 use crate::mm::frame::free_frame_phys;
-use crate::mm::{Frame, HUGE_FRAMES};
+use crate::mm::{Frame, HUGE_FRAMES, SwapSlot};
 use crate::status::{PageStatus, SLOTS, StatusTable};
 use crate::sync::SpinLock;
 use alloc::collections::BTreeMap;
@@ -131,6 +131,9 @@ pub struct PageChange {
     freed: Vec<BTreeMap<usize, (Mapped, PageProt)>>,
     /// The huge pages that the change removed. They had their own flush.
     huge: Vec<Huge>,
+    /// The swap entries that the change removed. Their pages of the swap areas go after the
+    /// locks of the blocks.
+    slots: Vec<BTreeMap<usize, Arc<SwapSlot>>>,
 }
 
 /// What a [`PageChange`] does to each page.
@@ -143,7 +146,7 @@ enum PageOp {
 impl PageChange {
     fn new(op: PageOp, start: VirtAddr, end: VirtAddr) -> Self {
         let each = end.get() - start.get() <= PAGE_SIZE;
-        Self { op, each, flush: false, freed: Vec::new(), huge: Vec::new() }
+        Self { op, each, flush: false, freed: Vec::new(), huge: Vec::new(), slots: Vec::new() }
     }
 
     /// Removes the pages of `start..end`, as `unmap_range`. The change can cover a part of the
@@ -213,6 +216,10 @@ struct Block {
     pages: BTreeMap<usize, (Mapped, PageProt)>,
     /// The huge page of the block. Then `pages` is empty.
     huge: Option<Huge>,
+    /// The swap entry at each page address that has its data in a swap area, as a swap PTE of
+    /// Linux. An address has a page or an entry, not both. A block with an entry has no huge
+    /// page.
+    swapped: BTreeMap<usize, Arc<SwapSlot>>,
 }
 
 /// The metadata of one page table page for the memory manager, as the metadata array of a page
@@ -463,7 +470,7 @@ impl VmSpace {
             return Err(MapError::BadAddress);
         }
         let mut b = self.block_or_new(a).lock();
-        if b.get(a).is_some() {
+        if b.get(a).is_some() || b.swapped.contains_key(&a) {
             return Err(MapError::Mapped);
         }
         paging::user_map(self.root, a, frame.addr().get(), prot.bits())
@@ -529,7 +536,7 @@ impl VmSpace {
             assert_eq!(f.addr().get(), first + (i * PAGE_SIZE) as u64, "the frames are not a run");
         }
         let mut b = self.block_or_new(a).lock();
-        if b.huge.is_some() || !b.pages.is_empty() {
+        if b.huge.is_some() || !b.pages.is_empty() || !b.swapped.is_empty() {
             return Err(MapError::Mapped);
         }
         let table = paging::user_map_huge(self.root, a, first, prot.bits())
@@ -901,6 +908,14 @@ impl VmSpace {
                     c.huge.push(huge);
                 }
                 self.split(b, block);
+                if !b.swapped.is_empty() {
+                    let mut gone = b.swapped.split_off(&from);
+                    let mut after = gone.split_off(&to);
+                    b.swapped.append(&mut after);
+                    if !gone.is_empty() {
+                        c.slots.push(gone);
+                    }
+                }
                 let mut gone = b.pages.split_off(&from);
                 let mut after = gone.split_off(&to);
                 b.pages.append(&mut after);
@@ -1140,6 +1155,21 @@ impl VmSpace {
                 }),
             );
         }
+        // The child gets the swap entries in the areas. Both spaces then have the entry, and each
+        // one reads the page back for itself.
+        let mut j = i;
+        let mut swapped = BTreeMap::new();
+        for (&a, slot) in &b.swapped {
+            while areas.get(j).is_some_and(|r| r.end <= a) {
+                j += 1;
+            }
+            if areas.get(j).is_some_and(|r| r.start <= a) {
+                swapped.insert(a, slot.clone());
+            }
+        }
+        if !swapped.is_empty() {
+            child.block_or_new(block).lock().swapped = swapped;
+        }
         if pages.is_empty() {
             return Ok(());
         }
@@ -1173,6 +1203,139 @@ impl VmSpace {
         paging::user_unmap(self.root, a);
         self.small.fetch_sub(1, Ordering::Relaxed);
         Some(frame.0.clone())
+    }
+
+    /// Gives the swap entry at `addr`, if the page of `addr` is in a swap area.
+    pub fn swapped(&self, addr: VirtAddr) -> Option<Arc<SwapSlot>> {
+        let a = addr.get();
+        self.block(a)?.lock().swapped.get(&a).cloned()
+    }
+
+    /// Maps `frame`, which has the data of the swap entry `slot`, at `addr` in place of the
+    /// entry, as `do_swap_page` of Linux. Gives `Ok(false)` and does nothing if `addr` does not
+    /// have this entry now, for example after another fault read it.
+    ///
+    /// # Errors
+    ///
+    /// Gives `MapError::NoMemory` if no frame is free for a page table.
+    pub fn swap_in(
+        &self,
+        addr: VirtAddr,
+        slot: &Arc<SwapSlot>,
+        frame: Arc<Frame>,
+        prot: PageProt,
+    ) -> Result<bool, MapError> {
+        let a = addr.get();
+        let Some(lock) = self.block(a) else { return Ok(false) };
+        let mut b = lock.lock();
+        if !b.swapped.get(&a).is_some_and(|s| Arc::ptr_eq(s, slot)) {
+            return Ok(false);
+        }
+        paging::user_map(self.root, a, frame.addr().get(), prot.bits())
+            .map_err(|()| MapError::NoMemory)?;
+        b.pages.insert(a, (Mapped::new(frame), prot));
+        self.small.fetch_add(1, Ordering::Relaxed);
+        let old = b.swapped.remove(&a);
+        drop(b);
+        drop(old);
+        Ok(true)
+    }
+
+    /// Starts the move of the page at `addr` to a swap area, as `shrink_folio_list` of Linux
+    /// starts with an anonymous page. Only a 4 KiB anonymous page that only this entry maps and
+    /// that no other part of the kernel holds can go, and not a page that KSM merged. The page
+    /// becomes read only, so its data does not change while the write to the swap area runs: a
+    /// write to it is a fault. Gives the frame of the page, or `None` if the page cannot go.
+    pub fn swap_out_start(&self, addr: VirtAddr) -> Option<Arc<Frame>> {
+        let a = addr.get();
+        let mut b = self.block(a)?.lock();
+        if b.huge.is_some() {
+            return None;
+        }
+        let (frame, prot) = b.pages.get_mut(&a)?;
+        if Arc::strong_count(&frame.0) != 1
+            || frame.map_count() != 1
+            || !frame.is_anon()
+            || crate::mm::phys_is_ksm(frame.addr())
+        {
+            return None;
+        }
+        if prot.writable {
+            prot.writable = false;
+            paging::user_protect(self.root, a, frame.addr().get(), prot.bits());
+        }
+        Some(frame.0.clone())
+    }
+
+    /// Ends the move of the page at `addr` that `swap_out_start` started, after the write of the
+    /// page to `slot`. If the page at `addr` is still `frame` and nothing else holds it, the swap
+    /// entry takes the place of the page, as `try_to_unmap_one` of Linux puts a swap entry in the
+    /// page table, and the function gives `true`. Else the page stays read only, and a write to it
+    /// is a fault that makes it writable again. The frame goes when the caller drops `frame`.
+    pub fn swap_out_end(&self, addr: VirtAddr, frame: &Arc<Frame>, slot: Arc<SwapSlot>) -> bool {
+        let a = addr.get();
+        let Some(lock) = self.block(a) else { return false };
+        let mut b = lock.lock();
+        let same = b.pages.get(&a).is_some_and(|(f, _)| Arc::ptr_eq(&f.0, frame));
+        if b.huge.is_some() || !same || Arc::strong_count(frame) != 2 {
+            return false;
+        }
+        let gone = b.pages.remove(&a);
+        paging::user_unmap(self.root, a);
+        self.small.fetch_sub(1, Ordering::Relaxed);
+        b.swapped.insert(a, slot);
+        drop(b);
+        drop(gone);
+        true
+    }
+
+    /// Removes the swap entries in `start..end` and gives them with their addresses, for the
+    /// move of `mremap`.
+    pub fn take_swapped(&self, start: VirtAddr, end: VirtAddr) -> Vec<(usize, Arc<SwapSlot>)> {
+        let (start, end) = (start.get(), end.get());
+        let mut out = Vec::new();
+        let _ = self.blocks.each(start, end, |block, lock| {
+            let (from, to) = clip(block, start, end);
+            let mut b = lock.lock();
+            if !b.swapped.is_empty() {
+                let mut gone = b.swapped.split_off(&from);
+                let mut after = gone.split_off(&to);
+                b.swapped.append(&mut after);
+                out.extend(gone);
+            }
+            Ok::<(), ()>(())
+        });
+        out
+    }
+
+    /// Puts the swap entry `slot` at `addr`, for the move of `mremap`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `MapError::Mapped` if `addr` has a page or an entry.
+    pub fn put_swapped(&self, addr: VirtAddr, slot: Arc<SwapSlot>) -> Result<(), MapError> {
+        let a = addr.get();
+        if !a.is_multiple_of(PAGE_SIZE) || a >= USER_END {
+            return Err(MapError::BadAddress);
+        }
+        let mut b = self.block_or_new(a).lock();
+        if b.get(a).is_some() || b.swapped.contains_key(&a) {
+            return Err(MapError::Mapped);
+        }
+        b.swapped.insert(a, slot);
+        Ok(())
+    }
+
+    /// The number of swap entries in `start..end`, as the `Swap` line of `/proc/PID/smaps`.
+    pub fn swapped_in(&self, start: VirtAddr, end: VirtAddr) -> usize {
+        let (start, end) = (start.get(), end.get());
+        let mut n = 0;
+        let _ = self.blocks.each(start, end, |block, lock| {
+            let (from, to) = clip(block, start, end);
+            n += lock.lock().swapped.range(from..to).count();
+            Ok::<(), ()>(())
+        });
+        n
     }
 
     /// Changes the permissions of the page at `addr`. Gives `false` if no page is mapped there.
