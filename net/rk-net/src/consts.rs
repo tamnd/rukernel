@@ -59,6 +59,8 @@ pub const MSG_NOSIGNAL: u32 = 0x4000;
 pub const MSG_MORE: u32 = 0x8000;
 /// For `recvmmsg`: wait only for the first message.
 pub const MSG_WAITFORONE: u32 = 0x1_0000;
+/// Connect with the address of the message, as TCP Fast Open.
+pub const MSG_FASTOPEN: u32 = 0x2000_0000;
 /// Set `FD_CLOEXEC` on the files of `SCM_RIGHTS`.
 pub const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
 

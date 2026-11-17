@@ -51,8 +51,8 @@ use rk_abi::native::tcp::{
 };
 use rk_frame::sync::SpinLock;
 use rk_net::consts::{
-    AF_INET, AF_INET6, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, MSG_WAITALL,
-    SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_STREAM,
+    AF_INET, AF_INET6, AF_UNSPEC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_FASTOPEN, MSG_MORE, MSG_OOB,
+    MSG_PEEK, MSG_WAITALL, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_STREAM,
 };
 use rk_net::ns::PerNet;
 use rk_net::{Message, Options, PathOps, Received, Socket, wait_for};
@@ -930,6 +930,25 @@ impl Stream {
         }
     }
 
+    /// The connect of `MSG_FASTOPEN`, as `tcp_sendmsg_fastopen` of Linux. The client side of
+    /// TCP Fast Open is on with bit 1 of `net.ipv4.tcp_fastopen`. Without a cookie the SYN does
+    /// not take the data, so a send without a wait gives `EINPROGRESS`, and a send with a
+    /// wait sends the data after the handshake. A socket that is connected gives `EISCONN`.
+    fn fastopen_connect(
+        &self,
+        paths: &dyn PathOps,
+        addr: Option<&[u8]>,
+        nonblock: bool,
+    ) -> Result<()> {
+        let addr = addr.unwrap_or_default();
+        let unspec =
+            addr.first_chunk::<2>().is_some_and(|f| u32::from(u16::from_ne_bytes(*f)) == AF_UNSPEC);
+        if rk_net::sysctl::ipv4("tcp_fastopen") & 1 == 0 || unspec {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        Socket::connect(self, paths, addr, nonblock)
+    }
+
     /// One step of `send`: gives the bytes that the send queue took.
     fn send_step(s: &mut Inner, data: &[u8], now: u64) -> Result<usize> {
         let shut = s.shut_wr;
@@ -1220,17 +1239,14 @@ impl Socket for Stream {
         Ok(child)
     }
 
-    fn send(
-        &self,
-        _paths: &dyn PathOps,
-        msg: Message,
-        flags: u32,
-        nonblock: bool,
-    ) -> Result<usize> {
+    fn send(&self, paths: &dyn PathOps, msg: Message, flags: u32, nonblock: bool) -> Result<usize> {
         if flags & MSG_OOB != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
         let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+        if flags & MSG_FASTOPEN != 0 {
+            self.fastopen_connect(paths, msg.addr.as_deref(), nonblock)?;
+        }
         let data = msg.data;
         let timeout = self.state.lock().options.sndtimeo;
         let mut done = 0;

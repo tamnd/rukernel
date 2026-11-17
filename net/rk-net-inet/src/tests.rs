@@ -909,7 +909,7 @@ fn tcp_loopback() {
     use crate::Stream;
     use rk_abi::native::poll::{POLLHUP, POLLIN, POLLOUT, POLLRDHUP};
     use rk_abi::native::socket::{SO_ERROR, SO_LINGER, SO_REUSEADDR, SOL_SOCKET};
-    use rk_net::consts::{MSG_WAITALL, SHUT_WR};
+    use rk_net::consts::{MSG_FASTOPEN, MSG_WAITALL, SHUT_WR};
     let lo = ipv4::LOOPBACK;
     let int = |v: i32| v.to_ne_bytes().to_vec();
 
@@ -969,6 +969,29 @@ fn tcp_loopback() {
     assert_eq!(d.connect(&NoPaths, &sockaddr::make(lo, 9), true), Err(Errno::EINPROGRESS));
     assert_eq!(d.connect(&NoPaths, &sockaddr::make(lo, 9), true), Err(Errno::ECONNREFUSED));
     d.release();
+
+    // `MSG_FASTOPEN` connects with the address of the message, as `tcp_sendmsg_fastopen` of
+    // Linux. Without a cookie the SYN takes no data, so the send gives `EINPROGRESS`. The DNS
+    // over TLS of systemd-resolved connects so, and it needs the `ECONNREFUSED` to fall back.
+    let fastopen = |s: &Stream, addr: Vec<u8>| {
+        let m = Message { data: b"q".to_vec(), addr: Some(addr), ..Message::default() };
+        s.send(&NoPaths, m, MSG_FASTOPEN, true)
+    };
+    let t = Stream::new();
+    assert_eq!(fastopen(&t, sockaddr::make(lo, port)), Err(Errno::EINPROGRESS));
+    let u = l.accept(true).unwrap();
+    assert_eq!(fastopen(&t, sockaddr::make(lo, port)), Ok(1));
+    assert_eq!(fastopen(&t, sockaddr::make(lo, port)), Err(Errno::EISCONN));
+    assert_eq!(u.recv(10, 0, true).unwrap().data, b"q");
+    u.release();
+    t.release();
+    let v = Stream::new();
+    assert_eq!(fastopen(&v, sockaddr::make(lo, 9)), Err(Errno::EINPROGRESS));
+    assert_eq!(tcp_send(&v, b"q"), Err(Errno::ECONNREFUSED));
+    v.release();
+    let w = Stream::new();
+    assert_eq!(fastopen(&w, vec![0; 16]), Err(Errno::EOPNOTSUPP));
+    w.release();
 
     // A close with data that the program did not read sends an RST.
     let e = Stream::new();
