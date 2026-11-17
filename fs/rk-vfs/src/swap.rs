@@ -3,8 +3,13 @@
 //! A swap area is a regular file or a block device with the header of `mkswap`. `swapon` examines
 //! the header and the blocks of the file, as Linux does, and then the area is active: a write, a
 //! truncate, a `fallocate` and a shared writable mapping of the file give `ETXTBSY`, and
-//! `/proc/swaps` shows the area. rukernel does not move pages to a swap area yet, so the used
-//! count of each area stays 0.
+//! `/proc/swaps` shows the area.
+//!
+//! Each area has a map of its pages, as the `swap_map` of Linux. [`alloc`] gives a free page of the
+//! area with the highest priority as a swap entry, and [`write_page`] and [`read_page`] move the
+//! data of the entry with direct I/O to the queue of the disk, as `swap_writepage` and
+//! `swap_read_folio` of Linux. A swap file uses the runs of the disk that `swapon` found in its
+//! extents, as the `swap_extent` list of Linux.
 
 use crate::FileType;
 use crate::file::File;
@@ -14,6 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
+use rk_block::Queue;
 use rk_block::cache::PAGE_SIZE;
 use rk_frame::sync::SpinLock;
 
@@ -52,9 +58,102 @@ mod header {
     pub(super) const BADPAGES: usize = 1536;
 }
 
+/// The use of the pages of an area, as the `swap_map` of Linux with one bit for each page. The
+/// first page has the header, and it and the bad pages are never free.
+#[derive(Debug, Default)]
+struct Slots {
+    /// One bit for each page of the area, set for a page that is used.
+    used: Vec<u64>,
+    /// The number of pages, with the header.
+    pages: u64,
+    /// The pages that entries use, as `inuse_pages` of Linux.
+    inuse: u64,
+    /// The page where the next search starts, as `cluster_next` of Linux.
+    next: u64,
+}
+
+impl Slots {
+    /// The map of an area of `pages` pages with the header, and the bad pages `bad`.
+    fn new(pages: u64, bad: &[u64]) -> Self {
+        let words = usize::try_from(pages.div_ceil(64)).unwrap_or(0);
+        let mut s = Self { used: alloc::vec![0; words], pages, inuse: 0, next: 1 };
+        for &page in core::iter::once(&0).chain(bad) {
+            s.mark(page);
+        }
+        // The bits after the last page are used.
+        for page in pages..words as u64 * 64 {
+            s.mark(page);
+        }
+        s
+    }
+
+    fn mark(&mut self, page: u64) {
+        if let Some(w) = self.used.get_mut((page / 64) as usize) {
+            *w |= 1 << (page % 64);
+        }
+    }
+
+    /// Gives a free page and marks it used, or `None` if the area is full.
+    fn alloc(&mut self) -> Option<u64> {
+        let words = self.used.len();
+        let start = (self.next / 64) as usize;
+        for i in (start..words).chain(0..start) {
+            let w = self.used[i];
+            if w != u64::MAX {
+                let page = i as u64 * 64 + u64::from(w.trailing_ones());
+                self.mark(page);
+                self.inuse += 1;
+                self.next = page + 1;
+                return Some(page);
+            }
+        }
+        None
+    }
+
+    /// Marks the used page `page` free. Gives `false` for a page that is not used or that is not
+    /// an entry.
+    fn free(&mut self, page: u64) -> bool {
+        if page == 0 || page >= self.pages {
+            return false;
+        }
+        let Some(w) = self.used.get_mut((page / 64) as usize) else { return false };
+        let bit = 1 << (page % 64);
+        if *w & bit == 0 {
+            return false;
+        }
+        *w &= !bit;
+        self.inuse -= 1;
+        true
+    }
+}
+
+/// The place of the pages of an area on the disk.
+struct Disk {
+    queue: Arc<Queue>,
+    /// The runs of the disk that hold the pages of the area, in order: the first page of the run
+    /// on the disk and the number of pages. A block device has one run.
+    runs: Vec<(u64, u64)>,
+}
+
+/// The sector of the disk of the page `page` of an area on the runs `runs` of the disk.
+fn sector(runs: &[(u64, u64)], mut page: u64) -> Option<u64> {
+    for &(first, n) in runs {
+        if page < n {
+            return Some((first + page) * (PAGE_SIZE as u64 / 512));
+        }
+        page -= n;
+    }
+    None
+}
+
 /// An active swap area.
 pub struct Swap {
     file: Arc<File>,
+    /// The type of the entries of the area, as the index of `swap_info` of Linux. It does not
+    /// change while the area is active.
+    kind: u64,
+    slots: Slots,
+    disk: Option<Disk>,
     /// The path of the file at `swapon`, as `/proc/swaps` shows it.
     pub path: Vec<u8>,
     /// The file is a block device.
@@ -69,6 +168,25 @@ impl Swap {
     fn inode(&self) -> Option<&InodeRef> {
         self.file.inode()
     }
+
+    /// The pages that entries use, as the `Used` column of `/proc/swaps`.
+    pub fn used(&self) -> u64 {
+        self.slots.inuse
+    }
+}
+
+/// The bits of the type in a swap entry. The low bits are the page in the area, as `swp_entry_t`
+/// of Linux.
+const KIND_SHIFT: u32 = 58;
+
+/// The swap entry of the page `page` of the area of type `kind`.
+const fn entry(kind: u64, page: u64) -> u64 {
+    kind << KIND_SHIFT | page
+}
+
+/// The type and the page of the swap entry `e`.
+const fn split(e: u64) -> (u64, u64) {
+    (e >> KIND_SHIFT, e & ((1 << KIND_SHIFT) - 1))
 }
 
 /// The active areas, in the order of `swapon`.
@@ -155,17 +273,29 @@ pub fn read_header(page: &[u8]) -> Result<u64> {
     Ok(u64::from(last) + 1)
 }
 
+/// The bad pages that the header in `page` lists. `read_header` checked the header.
+fn bad_pages(page: &[u8]) -> Vec<u64> {
+    let field =
+        |at: usize| u32::from_le_bytes([page[at], page[at + 1], page[at + 2], page[at + 3]]);
+    let swapped = field(header::VERSION) != 1;
+    let get = |at: usize| if swapped { field(at).swap_bytes() } else { field(at) };
+    let n = get(header::NR_BADPAGES).min(MAX_BADPAGES) as usize;
+    (0..n).map(|i| u64::from(get(header::BADPAGES + 4 * i))).collect()
+}
+
 /// The pages of the regular file `file` that can be in an area of at most `max` pages, as
 /// `iomap_swapfile_activate` of Linux finds them. Each block up to the end must be on the disk,
 /// and an extent that is allocated but not written is good. Only the pages of the disk that the
 /// file fully holds count, so a file without one such page gives `EINVAL`.
-fn file_pages(file: &File, inode: &InodeRef, max: u64) -> Result<u64> {
+/// Gives the pages and the runs of the disk that hold them.
+fn file_pages(file: &File, inode: &InodeRef, max: u64) -> Result<(u64, Vec<(u64, u64)>)> {
     // Linux makes the map of the file durable first.
     file.sync()?;
     let size = inode.metadata().size / PAGE_SIZE as u64 * PAGE_SIZE as u64;
     // A file system without extents cannot hold a swap area.
     let extents = inode.fiemap(0, size).map_err(|_| Errno::EINVAL)?;
-    usable_pages(&extents, size, max)
+    let runs = disk_runs(&extents, size)?;
+    Ok((runs.iter().map(|r| r.1).sum::<u64>().min(max), runs))
 }
 
 /// The pages of the disk that the extents of the first `len` bytes of a file fully hold, at most
@@ -176,17 +306,30 @@ fn file_pages(file: &File, inode: &InodeRef, max: u64) -> Result<u64> {
 /// # Errors
 ///
 /// Gives `EINVAL` for a hole, inline data, or no full page.
+#[cfg(test)]
 fn usable_pages(extents: &[FiemapExtent], len: u64, max: u64) -> Result<u64> {
+    Ok(disk_runs(extents, len)?.iter().map(|r| r.1).sum::<u64>().min(max))
+}
+
+/// The runs of whole pages of the disk that the extents of the first `len` bytes of a file hold,
+/// as the first page of the disk and the number of pages, as `usable_pages` counts them.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for a hole, inline data, or no full page.
+fn disk_runs(extents: &[FiemapExtent], len: u64) -> Result<Vec<(u64, u64)>> {
     let page = PAGE_SIZE as u64;
+    let mut runs = Vec::new();
     // The pages of a run of the disk at `start` with `length` bytes.
-    let aligned = |(start, length): (u64, u64)| {
+    let mut aligned = |(start, length): (u64, u64)| {
         let first = start.div_ceil(page);
         let next = start.saturating_add(length) / page;
-        next.saturating_sub(first)
+        if next > first {
+            runs.push((first, next - first));
+        }
     };
     let mut at = 0;
     let mut run: Option<(u64, u64)> = None;
-    let mut pages: u64 = 0;
     for e in extents {
         if at >= len {
             break;
@@ -203,7 +346,7 @@ fn usable_pages(extents: &[FiemapExtent], len: u64, max: u64) -> Result<u64> {
         run = match run {
             Some((start, n)) if start + n == physical => Some((start, n + length)),
             Some(r) => {
-                pages = pages.saturating_add(aligned(r));
+                aligned(r);
                 Some((physical, length))
             }
             None => Some((physical, length)),
@@ -214,12 +357,12 @@ fn usable_pages(extents: &[FiemapExtent], len: u64, max: u64) -> Result<u64> {
         return Err(Errno::EINVAL);
     }
     if let Some(r) = run {
-        pages = pages.saturating_add(aligned(r));
+        aligned(r);
     }
-    if pages == 0 {
+    if runs.is_empty() {
         return Err(Errno::EINVAL);
     }
-    Ok(pages.min(max))
+    Ok(runs)
 }
 
 /// Makes `file`, which `swapon` opened at `path`, an active swap area with the `swapon` flags
@@ -251,15 +394,26 @@ pub fn activate(file: Arc<File>, path: Vec<u8>, swap_flags: u32) -> Result<()> {
         done += n;
     }
     let max = read_header(&page)?;
-    let pages = if partition {
-        let size = file.metadata()?.size;
-        max.min(size / PAGE_SIZE as u64)
+    // An area on a file system without a disk, as a file of a FUSE file system, has no queue.
+    // `swapon` accepts it, and no entry goes to it.
+    let queue = crate::blockdev::block_queue(if partition { meta.rdev } else { meta.dev });
+    let (pages, runs) = if partition {
+        // The pages that `mkswap` wrote through the cache of the device go to the disk first,
+        // as the writes of the area go to the disk directly.
+        file.sync()?;
+        // The inode of the device node has no size. The size is the size of the disk, as
+        // `bdev_nr_bytes` of Linux.
+        let size = queue.as_ref().map_or(0, |q| q.sectors() * crate::blockdev::SECTOR_SIZE as u64);
+        let pages = max.min(size / PAGE_SIZE as u64);
+        (pages, alloc::vec![(0, pages)])
     } else {
         file_pages(&file, &inode, max)?
     };
     if pages <= 1 {
         return Err(Errno::EINVAL);
     }
+    let disk = queue.map(|queue| Disk { queue, runs });
+    let slots = Slots::new(pages, &bad_pages(&page));
     let priority = if swap_flags & flags::SWAP_FLAG_PREFER != 0 {
         (swap_flags & flags::SWAP_FLAG_PRIO_MASK) as i32
     } else {
@@ -274,7 +428,8 @@ pub fn activate(file: Arc<File>, path: Vec<u8>, swap_flags: u32) -> Result<()> {
     if swaps.iter().any(|s| s.inode().is_some_and(|i| Arc::ptr_eq(i, &inode))) {
         return Err(Errno::EBUSY);
     }
-    swaps.push(Swap { file, path, partition, pages: pages - 1, priority });
+    let kind = (0..MAX_SWAPFILES as u64).find(|k| swaps.iter().all(|s| s.kind != *k)).unwrap_or(0);
+    swaps.push(Swap { file, kind, slots, disk, path, partition, pages: pages - 1, priority });
     ACTIVE.store(swaps.len(), Ordering::Release);
     drop(swaps);
     touch();
@@ -285,13 +440,17 @@ pub fn activate(file: Arc<File>, path: Vec<u8>, swap_flags: u32) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Gives `EINVAL` if `inode` is not an active area.
+/// Gives `EINVAL` if `inode` is not an active area, and `EBUSY` if entries use pages of the area.
+/// rukernel does not read the pages back into memory yet, as `try_to_unuse` of Linux does.
 pub fn deactivate(inode: &InodeRef) -> Result<()> {
     let mut swaps = SWAPS.lock();
     let i = swaps
         .iter()
         .position(|s| s.inode().is_some_and(|x| Arc::ptr_eq(x, inode)))
         .ok_or(Errno::EINVAL)?;
+    if swaps[i].slots.inuse > 0 {
+        return Err(Errno::EBUSY);
+    }
     let swap = swaps.remove(i);
     ACTIVE.store(swaps.len(), Ordering::Release);
     // The areas after it with a priority that `swapon` gave move up, as `swapoff` of Linux.
@@ -322,6 +481,69 @@ pub fn total_pages() -> u64 {
     SWAPS.lock().iter().map(|s| s.pages).sum()
 }
 
+/// The number of pages that entries use in all the active areas.
+pub fn used_pages() -> u64 {
+    if ACTIVE.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    SWAPS.lock().iter().map(|s| s.slots.inuse).sum()
+}
+
+/// Gives a free page of an area as a swap entry, as `folio_alloc_swap` of Linux. The area with
+/// the highest priority that has a free page and a disk gives it. Gives `None` if no area has a
+/// free page.
+pub fn alloc() -> Option<u64> {
+    if ACTIVE.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut swaps = SWAPS.lock();
+    let mut order: Vec<usize> = (0..swaps.len()).filter(|&i| swaps[i].disk.is_some()).collect();
+    order.sort_by_key(|&i| core::cmp::Reverse(swaps[i].priority));
+    order.into_iter().find_map(|i| {
+        let s = &mut swaps[i];
+        s.slots.alloc().map(|page| entry(s.kind, page))
+    })
+}
+
+/// Makes the page of the swap entry `e` free, as `swap_entries_free` of Linux. An entry of an
+/// area that is not active does nothing.
+pub fn free(e: u64) {
+    let (kind, page) = split(e);
+    if let Some(s) = SWAPS.lock().iter_mut().find(|s| s.kind == kind) {
+        s.slots.free(page);
+    }
+}
+
+/// The queue and the sector of the disk of the swap entry `e`.
+fn locate(e: u64) -> Result<(Arc<Queue>, u64)> {
+    let (kind, page) = split(e);
+    let swaps = SWAPS.lock();
+    let s = swaps.iter().find(|s| s.kind == kind && page > 0 && page < s.slots.pages);
+    let disk = s.and_then(|s| s.disk.as_ref()).ok_or(Errno::EINVAL)?;
+    let sector = sector(&disk.runs, page).ok_or(Errno::EINVAL)?;
+    Ok((disk.queue.clone(), sector))
+}
+
+/// Writes the page `data` to the swap entry `e`, with direct I/O to the disk.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for an entry of no active area, and the error of the disk.
+pub fn write_page(e: u64, data: &[u8]) -> Result<()> {
+    let (queue, sector) = locate(e)?;
+    queue.write(sector, &data[..PAGE_SIZE])
+}
+
+/// Reads the page of the swap entry `e` into `buf`, with direct I/O from the disk.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for an entry of no active area, and the error of the disk.
+pub fn read_page(e: u64, buf: &mut [u8]) -> Result<()> {
+    let (queue, sector) = locate(e)?;
+    queue.read(sector, &mut buf[..PAGE_SIZE])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +560,41 @@ mod tests {
             p[at..at + 4].copy_from_slice(&b.to_le_bytes());
         }
         p
+    }
+
+    #[test]
+    fn the_slots_skip_the_header_and_the_bad_pages() {
+        let mut s = Slots::new(70, &[2, 65]);
+        let mut got = Vec::new();
+        while let Some(p) = s.alloc() {
+            got.push(p);
+        }
+        let want: Vec<u64> = (1..70).filter(|p| *p != 2 && *p != 65).collect();
+        assert_eq!(got, want);
+        assert_eq!(s.inuse, 67);
+        assert!(s.free(30));
+        assert!(!s.free(30));
+        assert!(!s.free(0));
+        assert!(!s.free(70));
+        assert_eq!(s.alloc(), Some(30));
+        assert_eq!(s.alloc(), None);
+    }
+
+    #[test]
+    fn an_entry_has_the_type_and_the_page() {
+        assert_eq!(split(entry(3, 12345)), (3, 12345));
+        assert_eq!(bad_pages(&page(9, &[3, 7])), [3, 7]);
+    }
+
+    #[test]
+    fn the_runs_of_a_file_give_the_sectors() {
+        let p = PAGE_SIZE as u64;
+        let runs = disk_runs(&[extent(0, 4 * p, 2 * p), extent(2 * p, 10 * p, 3 * p)], 5 * p);
+        assert_eq!(runs, Ok(alloc::vec![(4, 2), (10, 3)]));
+        let runs = [(4, 2), (10, 3)];
+        assert_eq!(sector(&runs, 1), Some(5 * 8));
+        assert_eq!(sector(&runs, 2), Some(10 * 8));
+        assert_eq!(sector(&runs, 5), None);
     }
 
     #[test]

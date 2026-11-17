@@ -19,8 +19,10 @@ pub struct MemInfo {
     pub total: u64,
     /// The memory that is free.
     pub free: u64,
-    /// The size of the active swap areas. rukernel does not use them yet, so all of it is free.
+    /// The size of the active swap areas.
     pub swap: u64,
+    /// The part of the active swap areas that no entry uses.
+    pub swap_free: u64,
     /// The commit limit of `vm.overcommit_memory` 2.
     pub commit_limit: u64,
     /// The memory that the address spaces can write without a new mapping.
@@ -261,7 +263,7 @@ pub fn meminfo(m: MemInfo) -> String {
         ("Active", 0),
         ("Inactive", 0),
         ("SwapTotal", m.swap),
-        ("SwapFree", m.swap),
+        ("SwapFree", m.swap_free),
         ("Dirty", 0),
         ("Writeback", 0),
         ("AnonPages", 0),
@@ -994,7 +996,8 @@ mod tests {
         let m = MemInfo {
             total: 1024,
             free: 512,
-            swap: 0,
+            swap: 400,
+            swap_free: 300,
             commit_limit: 512,
             committed: 100,
             anon_huge: 2048,
@@ -1004,6 +1007,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 26);
         assert!(text.contains("\nCommitted_AS:        100 kB\n"));
+        assert!(text.contains("\nSwapTotal:           400 kB\nSwapFree:            300 kB\n"));
         assert!(text.contains("\nAnonHugePages:      2048 kB\n"));
         assert_eq!(lines[0], "MemTotal:           1024 kB");
         assert_eq!(lines[2], "MemAvailable:        512 kB");

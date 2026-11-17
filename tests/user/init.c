@@ -54,6 +54,7 @@
 #include <sys/time.h>
 #include <sys/times.h>
 #include <sys/statfs.h>
+#include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
@@ -8375,6 +8376,51 @@ static void test_ext2(void)
 	check("umount of the ext2 disk", umount("/ext2") == 0);
 }
 
+/* The size of the disk of the swap boot test. xtask/src/main.rs has the same value. */
+#define SWAP_DISK_SIZE (16 * 1024 * 1024)
+
+/* Writes the header of mkswap to the first page of fd, for an area of `pages` pages. */
+static int write_swap_header(int fd, unsigned int pages)
+{
+	static unsigned char page[4096];
+	memset(page, 0, sizeof(page));
+	unsigned int version = 1, last = pages - 1;
+	memcpy(page + 1024, &version, 4);
+	memcpy(page + 1028, &last, 4);
+	memcpy(page + 4096 - 10, "SWAPSPACE2", 10);
+	return pwrite(fd, page, sizeof(page), 0) == (ssize_t)sizeof(page) && fsync(fd) == 0 ? 0 : -1;
+}
+
+/* The swap areas of swapon and swapoff, with the disk /dev/vda of the swap boot test. */
+static void test_swap(void)
+{
+	/* With the argument "only", the general checks did not make /proc. */
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
+	int fd = open("/dev/vda", O_RDWR);
+	check("the swap disk opens", fd >= 0);
+	if (fd < 0)
+		return;
+	unsigned int pages = SWAP_DISK_SIZE / 4096;
+	check("the header of mkswap goes to the swap disk", write_swap_header(fd, pages) == 0);
+	close(fd);
+	long total = meminfo("SwapTotal");
+	check("swapon of the swap disk", syscall(SYS_swapon, "/dev/vda", 0) == 0);
+	char buf[512];
+	check("/proc/swaps has the disk with no used page",
+	      read_small("/proc/swaps", buf, sizeof(buf)) > 0 &&
+		      strstr(buf, "/dev/vda                                partition\t16380\t\t0\t\t-2\n"));
+	check("SwapTotal and SwapFree of /proc/meminfo have the area",
+	      meminfo("SwapTotal") == total + 16380 && meminfo("SwapFree") == meminfo("SwapTotal"));
+	struct sysinfo si;
+	check("sysinfo gives the free swap",
+	      sysinfo(&si) == 0 && si.totalswap * si.mem_unit == 16380 * 1024ULL &&
+		      si.freeswap == si.totalswap);
+	check("swapoff of the swap disk", syscall(SYS_swapoff, "/dev/vda") == 0);
+	check("SwapTotal goes back after swapoff", meminfo("SwapTotal") == total);
+	umount("/proc");
+}
+
 static void test_blk(void)
 {
 	test_ext2();
@@ -16623,6 +16669,8 @@ int main(int argc, char **argv)
 		test_smp();
 	if (argc > 1 && strcmp(argv[1], "blk") == 0)
 		test_blk();
+	if (argc > 1 && strcmp(argv[1], "swap") == 0)
+		test_swap();
 	if (argc > 1 && strcmp(argv[1], "inet") == 0)
 		test_inet(argc > 2 ? atoi(argv[2]) : 0);
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");

@@ -219,11 +219,13 @@ fn root_files(ns: &PidNs) -> Vec<(Vec<u8>, InodeRef)> {
             let f = rk_frame::mm::frame_stats();
             let kb = (rk_mm::PAGE_SIZE / 1024) as u64;
             let swap = rk_vfs::swap::total_pages() * kb;
+            let swap_free = swap.saturating_sub(rk_vfs::swap::used_pages() * kb);
             let pages = |n: usize| n as u64 * kb;
             text::meminfo(MemInfo {
                 total: pages(f.total),
                 free: pages(f.free),
                 swap,
+                swap_free,
                 commit_limit: pages(rk_mm::tunables::commit_limit(f.total)),
                 committed: pages(rk_mm::tunables::committed_pages()),
                 anon_huge: rk_frame::vm::huge_pages_mapped() as u64 * 2048,
@@ -1945,7 +1947,8 @@ fn swaps_text() -> Vec<u8> {
     let kb = (rk_mm::PAGE_SIZE / 1024) as u64;
     let mut out = String::from(text::SWAPS_HEADER);
     rk_vfs::swap::for_each(|s| {
-        out.push_str(&text::swap_line(&s.path, s.partition, s.pages * kb, 0, s.priority));
+        let used = s.used() * kb;
+        out.push_str(&text::swap_line(&s.path, s.partition, s.pages * kb, used, s.priority));
     });
     out.into_bytes()
 }
