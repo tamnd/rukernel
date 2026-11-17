@@ -216,6 +216,12 @@ pub trait NetDriver: Send + Sync {
         false
     }
 
+    /// Sets the carrier, as `ndo_change_carrier` of Linux. Gives `true` if the carrier changed.
+    /// A driver without it gives `EOPNOTSUPP`. Only the dummy devices have it.
+    fn change_carrier(&self, _on: bool) -> Result<bool> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// Sends one frame. Gives `ENOBUFS` if the queue of the device is full.
     fn transmit(&self, frame: NetBuf) -> Result<()>;
 
@@ -688,6 +694,15 @@ impl NetDevice {
             && peer.is_up()
         {
             notify(&peer, Event::Change);
+        }
+        Ok(())
+    }
+
+    /// Sets the carrier, as `dev_change_carrier` of Linux for `IFLA_CARRIER`. Gives
+    /// `EOPNOTSUPP` if the driver cannot set it.
+    pub fn change_carrier(&self, on: bool) -> Result<()> {
+        if self.driver.change_carrier(on)? {
+            self.carrier_changed();
         }
         Ok(())
     }
