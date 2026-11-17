@@ -36,8 +36,8 @@ use crate::netfilter::nf_nat::{
 use crate::netfilter::nft_compat::{NftXt, nft_xt_init};
 use crate::netfilter::{
     NF_INET_FORWARD, NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING,
-    NF_INET_PRE_ROUTING, NFPROTO_INET, NFPROTO_IPV4, NfHookState, NfPktinfo as NftPktinfo,
-    nf_pktinfo as nft_pktinfo,
+    NF_INET_PRE_ROUTING, NFPROTO_INET, NFPROTO_IPV4, NFPROTO_NETDEV, NfHookState,
+    NfPktinfo as NftPktinfo, nf_ingress_valid, nf_pktinfo as nft_pktinfo,
 };
 use crate::netlink::msg::{ATTR_HDRLEN, Attrs, Builder, HDRLEN};
 use crate::packet::PACKET_OTHERHOST;
@@ -259,8 +259,8 @@ const NFT_DYNSET_F_EXPR: u32 = 2;
 pub(super) const NFT_JUMP_STACK_SIZE: usize = 16;
 
 /// `ETH_P_IP` and `ETH_P_IPV6`, for `meta protocol`.
-const ETH_P_IP: u16 = 0x0800;
-const ETH_P_IPV6: u16 = 0x86dd;
+pub(super) const ETH_P_IP: u16 = 0x0800;
+pub(super) const ETH_P_IPV6: u16 = 0x86dd;
 
 /// The data of `immediate`.
 #[derive(Clone, Debug)]
@@ -523,7 +523,7 @@ fn len_attr(a: &Attrs<'_>, ty: u32) -> Result<usize> {
 
 /// The attributes in `b` with their types as they are, with the flags: each item is the type
 /// and the payload.
-fn nla_raw(b: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
+pub(super) fn nla_raw(b: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     let mut rest = b;
     core::iter::from_fn(move || {
         let len = u16::from_ne_bytes([*rest.first()?, *rest.get(1)?]) as usize;
@@ -1762,12 +1762,16 @@ fn nft_eval(
                 }
             }
             NftExpr::Payload { base, offset, len, dreg } => {
-                let d = skb.data();
-                let start = match *base {
-                    NFT_PAYLOAD_NETWORK_HEADER => Some(0),
-                    NFT_PAYLOAD_TRANSPORT_HEADER => pkt.thoff,
-                    // The packet has no link layer header at the hooks of IPv4 and IPv6.
-                    _ => None,
+                let (d, start) = match *base {
+                    // The link header is there for a frame that a device took or sends, and
+                    // not for a packet that the host makes, as `skb_mac_header_was_set`.
+                    NFT_PAYLOAD_LL_HEADER => match skb.mac_data() {
+                        Some(m) => (m, Some(0)),
+                        None => (skb.data(), None),
+                    },
+                    NFT_PAYLOAD_NETWORK_HEADER => (skb.data(), Some(0)),
+                    NFT_PAYLOAD_TRANSPORT_HEADER => (skb.data(), pkt.thoff),
+                    _ => (skb.data(), None),
                 };
                 match start.and_then(|s| d.get(s + offset..s + offset + len)) {
                     Some(v) => regs.store(*dreg, v),
@@ -1776,8 +1780,14 @@ fn nft_eval(
             }
             NftExpr::Meta { key, dreg } => match *key {
                 NFT_META_LEN => regs.store(*dreg, &(skb.len() as u32).to_ne_bytes()),
+                // The protocol of the link header, or the one of the family for a packet that
+                // the host makes.
                 NFT_META_PROTOCOL => {
-                    let p = if state.pf == NFPROTO_IPV6 { ETH_P_IPV6 } else { ETH_P_IP };
+                    let p = match skb.protocol {
+                        0 if state.pf == NFPROTO_IPV6 => ETH_P_IPV6,
+                        0 => ETH_P_IP,
+                        p => p,
+                    };
                     regs.store(*dreg, &p.to_be_bytes());
                 }
                 // As `nft_meta_store_ifindex`: a packet with no device gives 0.
@@ -1986,6 +1996,20 @@ fn nft_eval(
     }
 }
 
+/// The family of the headers of a packet at a hook of `pf`: at the hooks of a device the
+/// protocol of the frame gives it, and a header that is not valid gives none, as
+/// `nft_do_chain_netdev` of Linux.
+fn nft_netdev_pf(pf: u8, skb: &NetBuf) -> u8 {
+    if pf != NFPROTO_NETDEV {
+        return pf;
+    }
+    match skb.protocol {
+        ETH_P_IP if nf_ingress_valid(NFPROTO_IPV4, skb.data()) => NFPROTO_IPV4,
+        ETH_P_IPV6 if nf_ingress_valid(NFPROTO_IPV6, skb.data()) => NFPROTO_IPV6,
+        _ => NFPROTO_NETDEV,
+    }
+}
+
 /// Runs the program of a base chain on a packet, as `nft_do_chain` of Linux. Gives the
 /// verdict, or `policy` at the end of the base chain.
 pub(super) fn nft_do_chain(
@@ -1994,7 +2018,7 @@ pub(super) fn nft_do_chain(
     skb: &mut NetBuf,
     state: &NfHookState,
 ) -> u32 {
-    let pkt = nft_pktinfo(state.pf, skb.data());
+    let pkt = nft_pktinfo(nft_netdev_pf(state.pf, skb), skb.data());
     let mut regs = NftRegs { verdict: NFT_CONTINUE, chain: 0, data: [0; NFT_REGS_LEN] };
     let mut stack: Vec<(usize, usize)> = Vec::new();
     let (mut chain, mut rule) = (0usize, 0usize);

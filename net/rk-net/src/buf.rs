@@ -46,6 +46,8 @@ pub struct NetBuf {
     /// The type of the link address that the frame came to, `PACKET_HOST`,
     /// `PACKET_BROADCAST` or `PACKET_MULTICAST`, as `skb->pkt_type` of Linux.
     pub pkt_type: u8,
+    /// The start of the link header in `area`, as `skb->mac_header` of Linux, or `None`.
+    mac: Option<usize>,
 }
 
 impl NetBuf {
@@ -66,6 +68,7 @@ impl NetBuf {
             mark: 0,
             priority: 0,
             pkt_type: 0,
+            mac: None,
         }
     }
 
@@ -83,6 +86,7 @@ impl NetBuf {
             mark: 0,
             priority: 0,
             pkt_type: 0,
+            mac: None,
         }
     }
 
@@ -100,6 +104,7 @@ impl NetBuf {
             mark: 0,
             priority: 0,
             pkt_type: 0,
+            mac: None,
         }
     }
 
@@ -144,6 +149,8 @@ impl NetBuf {
             self.tail = room + self.len();
             self.head = room;
             self.area = area;
+            // The new area has the data only.
+            self.mac = None;
         }
         self.head -= len;
         &mut self.area[self.head..self.head + len]
@@ -185,6 +192,18 @@ impl NetBuf {
         self.tail = end;
     }
 
+    /// Tells that the `len` bytes before the data are the link header, as `skb_reset_mac_header`
+    /// of Linux before the pull of the link header.
+    pub fn set_mac_header(&mut self, len: usize) {
+        self.mac = self.head.checked_sub(len);
+    }
+
+    /// The link header and the data after it, as `skb_mac_header` of Linux, or `None` if the
+    /// buffer has no link header before the data, as `skb_mac_header_len` 0.
+    pub fn mac_data(&self) -> Option<&[u8]> {
+        self.mac.filter(|&m| m < self.head).map(|m| &self.area[m..self.tail])
+    }
+
     /// Removes the data after the first `len` bytes, as `skb_trim` of Linux. A receive path uses
     /// this to remove the padding after a packet. Does nothing if the data is not longer than
     /// `len`.
@@ -192,5 +211,26 @@ impl NetBuf {
         if len < self.len() {
             self.tail = self.head + len;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_link_header_stays_before_the_data() {
+        let mut b = NetBuf::from_slice(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(b.mac_data(), None);
+        b.pull(2);
+        b.set_mac_header(2);
+        assert_eq!(b.mac_data(), Some(&[1, 2, 3, 4, 5, 6][..]));
+        assert_eq!(b.data(), &[3, 4, 5, 6]);
+        // The header is not there after the data goes back to it.
+        b.push(2);
+        assert_eq!(b.mac_data(), None);
+        // A header longer than the room before the data is not there.
+        b.set_mac_header(64);
+        assert_eq!(b.mac_data(), None);
     }
 }

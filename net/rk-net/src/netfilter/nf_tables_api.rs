@@ -23,20 +23,23 @@ pub use self::nf_tables_core::{
 pub(crate) use self::nf_tables_core::{NftLog, nft_log_eval};
 
 use self::nf_tables_core::{
-    NFT_OBJECT_MAX, NFTA_FLOWTABLE_MAX, NFTA_OBJ_MAX, NftDynset, NftExpr, NftFlowtable, NftObj,
-    NftObjState, NftProg, nf_tables_dump_flowtable, nf_tables_dump_obj, nf_tables_expr_parse,
-    nf_tables_getflowtable, nf_tables_getobj, nft_check_loops, nft_do_chain, nft_expr_dump,
-    nft_expr_dump_state, nft_expr_needs_validate, nft_expr_targets, nft_expr_validate,
-    nft_obj_commit, nft_prog, nft_rule_needs_ct, nft_set_exprs_dump, nft_set_exprs_parse,
-    nft_setelem_parse_obj, nft_table_validate,
+    ETH_P_IP, ETH_P_IPV6, NFT_OBJECT_MAX, NFTA_FLOWTABLE_MAX, NFTA_OBJ_MAX, NftDynset, NftExpr,
+    NftFlowtable, NftObj, NftObjState, NftProg, nf_tables_dump_flowtable, nf_tables_dump_obj,
+    nf_tables_expr_parse, nf_tables_getflowtable, nf_tables_getobj, nft_check_loops, nft_do_chain,
+    nft_expr_dump, nft_expr_dump_state, nft_expr_needs_validate, nft_expr_targets,
+    nft_expr_validate, nft_obj_commit, nft_prog, nft_rule_needs_ct, nft_set_exprs_dump,
+    nft_set_exprs_parse, nft_setelem_parse_obj, nft_table_validate, nla_raw,
 };
 use crate::buf::NetBuf;
+use crate::consts::IFNAMSIZ;
 use crate::netfilter::nf_conntrack::{nf_ct_netns_get, nf_ct_netns_put};
 use crate::netfilter::nf_nat::nf_nat_inet_fn;
 use crate::netfilter::{
-    NF_ACCEPT, NF_DROP, NF_INET_NUMHOOKS, NF_IP_PRI_CONNTRACK, NF_QUEUE, NFPROTO_ARP,
-    NFPROTO_BRIDGE, NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6, NFPROTO_NETDEV, NFPROTO_UNSPEC,
-    NfHookFn, NfHookOps, NfHookState, nf_register_net_hooks, nf_unregister_net_hook,
+    NF_ACCEPT, NF_DROP, NF_INET_INGRESS, NF_INET_NUMHOOKS, NF_IP_PRI_CONNTRACK, NF_NETDEV_INGRESS,
+    NF_QUEUE, NFPROTO_ARP, NFPROTO_BRIDGE, NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6,
+    NFPROTO_NETDEV, NFPROTO_UNSPEC, NfDevHookOps, NfDevName, NfHookFn, NfHookOps, NfHookState,
+    nf_ingress_valid, nf_register_dev_hook, nf_register_net_hooks, nf_unregister_dev_hook,
+    nf_unregister_net_hook,
 };
 use crate::netlink::msg::{self, Attrs, Builder};
 use crate::netlink::nfnetlink::{
@@ -54,8 +57,8 @@ use core::ops::Bound::{Excluded, Included, Unbounded};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::netlink::{
-    NLA_F_NESTED, NLM_F_APPEND, NLM_F_CREATE, NLM_F_ECHO, NLM_F_EXCL, NLM_F_MULTI, NLM_F_NONREC,
-    NLM_F_REPLACE,
+    NLA_F_NESTED, NLA_TYPE_MASK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_ECHO, NLM_F_EXCL, NLM_F_MULTI,
+    NLM_F_NONREC, NLM_F_REPLACE,
 };
 use rk_frame::sync::{SpinLock, SpinLockGuard};
 use rk_vfs::inode::Result;
@@ -181,7 +184,18 @@ const NFT_CHAIN_FLAGS: u32 = NFT_CHAIN_BASE | NFT_CHAIN_HW_OFFLOAD | NFT_CHAIN_B
 // The attributes of the hook of a base chain, `NFTA_HOOK_*`.
 const NFTA_HOOK_HOOKNUM: u32 = 1;
 const NFTA_HOOK_PRIORITY: u32 = 2;
+const NFTA_HOOK_DEV: u32 = 3;
+const NFTA_HOOK_DEVS: u32 = 4;
 const NFTA_HOOK_MAX: u16 = 4;
+
+// The attributes of a device in a list of devices, `NFTA_DEVICE_*`.
+const NFTA_DEVICE_NAME: u16 = 1;
+const NFTA_DEVICE_PREFIX: u16 = 2;
+/// The most devices of a hook, `NFT_NETDEVICE_MAX`.
+const NFT_NETDEVICE_MAX: usize = 256;
+/// The most hook points of a family, `NFT_MAX_HOOKS`: the five of IPv4 and IPv6, and the
+/// ingress of `inet`.
+const NFT_MAX_HOOKS: u32 = NF_INET_NUMHOOKS as u32 + 1;
 
 // The attributes of a rule, `NFTA_RULE_*`.
 const NFTA_RULE_TABLE: u32 = 1;
@@ -337,23 +351,145 @@ struct NftChainType {
     nat: bool,
 }
 
-/// The type `filter` of the families `ip`, `ip6` and `inet`, as nft_chain_filter.c of Linux.
-/// The other families have no hooks here, and the type `route` comes later.
+/// The type `filter` of the families `ip` and `ip6`, as nft_chain_filter.c of Linux. The type
+/// `route` comes later.
 static NFT_CHAIN_FILTER: NftChainType =
     NftChainType { name: "filter", hook_mask: 0x1f, nat: false };
+
+/// The type `filter` of the family `inet`: the five hooks of IPv4 and IPv6, and
+/// `NF_INET_INGRESS`.
+static NFT_CHAIN_FILTER_INET: NftChainType =
+    NftChainType { name: "filter", hook_mask: 0x3f, nat: false };
+
+/// The type `filter` of the family `arp`: `NF_ARP_IN` and `NF_ARP_OUT`. The stack has no hooks
+/// on the path of ARP yet, so a chain of the family sees no packets.
+static NFT_CHAIN_FILTER_ARP: NftChainType =
+    NftChainType { name: "filter", hook_mask: 0x3, nat: false };
+
+/// The type `filter` of the family `bridge`: the five hooks of a bridge. The kernel has no
+/// bridges yet, so a chain of the family sees no packets.
+static NFT_CHAIN_FILTER_BRIDGE: NftChainType =
+    NftChainType { name: "filter", hook_mask: 0x1f, nat: false };
+
+/// The type `filter` of the family `netdev`: `NF_NETDEV_INGRESS` and `NF_NETDEV_EGRESS`.
+static NFT_CHAIN_FILTER_NETDEV: NftChainType =
+    NftChainType { name: "filter", hook_mask: 0x3, nat: false };
 
 /// The type `nat`, as nft_chain_nat.c of Linux: `NF_INET_PRE_ROUTING`, `NF_INET_LOCAL_IN`,
 /// `NF_INET_LOCAL_OUT` and `NF_INET_POST_ROUTING`.
 static NFT_CHAIN_NAT: NftChainType = NftChainType { name: "nat", hook_mask: 0x1b, nat: true };
 
-static NFT_CHAIN_TYPES_INET: [&NftChainType; 2] = [&NFT_CHAIN_FILTER, &NFT_CHAIN_NAT];
+static NFT_CHAIN_TYPES_IP: [&NftChainType; 2] = [&NFT_CHAIN_FILTER, &NFT_CHAIN_NAT];
+static NFT_CHAIN_TYPES_INET: [&NftChainType; 2] = [&NFT_CHAIN_FILTER_INET, &NFT_CHAIN_NAT];
+static NFT_CHAIN_TYPES_ARP: [&NftChainType; 1] = [&NFT_CHAIN_FILTER_ARP];
+static NFT_CHAIN_TYPES_BRIDGE: [&NftChainType; 1] = [&NFT_CHAIN_FILTER_BRIDGE];
+static NFT_CHAIN_TYPES_NETDEV: [&NftChainType; 1] = [&NFT_CHAIN_FILTER_NETDEV];
 
 /// The types of the family `family`, as `chain_type[family]` of Linux.
 fn nft_chain_types(family: u8) -> &'static [&'static NftChainType] {
     match family {
-        NFPROTO_IPV4 | NFPROTO_IPV6 | NFPROTO_INET => &NFT_CHAIN_TYPES_INET,
+        NFPROTO_IPV4 | NFPROTO_IPV6 => &NFT_CHAIN_TYPES_IP,
+        NFPROTO_INET => &NFT_CHAIN_TYPES_INET,
+        NFPROTO_ARP => &NFT_CHAIN_TYPES_ARP,
+        NFPROTO_BRIDGE => &NFT_CHAIN_TYPES_BRIDGE,
+        NFPROTO_NETDEV => &NFT_CHAIN_TYPES_NETDEV,
         _ => &[],
     }
+}
+
+/// Tells if a base chain of `family` at `hooknum` has a list of devices, as
+/// `nft_base_chain_netdev` of Linux.
+fn nft_base_chain_netdev(family: u8, hooknum: u8) -> bool {
+    family == NFPROTO_NETDEV || (family == NFPROTO_INET && hooknum == NF_INET_INGRESS)
+}
+
+/// Reads the name of a device of a hook, as `nft_netdev_hook_alloc` of Linux: `nla_strscpy`
+/// gives `E2BIG` for a name that does not fit in `IFNAMSIZ` bytes with its NUL.
+fn nft_netdev_hook_name(d: &[u8], prefix: bool) -> Result<NfDevName> {
+    let len = if d.last() == Some(&0) { d.len() - 1 } else { d.len() };
+    if len >= IFNAMSIZ {
+        return Err(Errno::E2BIG);
+    }
+    let name = d[..len].split(|&c| c == 0).next().unwrap_or_default();
+    Ok(NfDevName { name: name.to_vec(), prefix })
+}
+
+/// Finds `this` in the list `devs`, as `nft_hook_list_find` of Linux. The names compare as
+/// `strncmp` with the shorter length, where a name that is not a prefix counts its NUL, so a
+/// prefix finds the names that start with it. With `strict` the lengths must be the same.
+fn nft_hook_list_find(devs: &[NfDevName], this: &NfDevName, strict: bool) -> Option<usize> {
+    let len = |d: &NfDevName| d.name.len() + usize::from(!d.prefix);
+    let byte = |d: &NfDevName, i: usize| d.name.get(i).copied().unwrap_or(0);
+    devs.iter().position(|h| {
+        let n = len(h).min(len(this));
+        (!strict || len(h) == len(this)) && (0..n).all(|i| byte(h, i) == byte(this, i))
+    })
+}
+
+/// Reads the devices of the hook `ha` of a base chain of `family` at `hooknum`, as
+/// `nft_chain_parse_netdev` and `nf_tables_parse_netdev_hooks` of Linux. A chain that has no
+/// list of devices takes none. The devices do not need to exist: a device that comes later
+/// with the name gets the hook.
+fn nft_chain_parse_devs(
+    family: u8,
+    hooknum: u8,
+    ha: &Attrs<'_>,
+    flags: u32,
+) -> Result<Vec<NfDevName>> {
+    if !nft_base_chain_netdev(family, hooknum) {
+        if ha.has(NFTA_HOOK_DEV) || ha.has(NFTA_HOOK_DEVS) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        return Ok(Vec::new());
+    }
+    let mut devs: Vec<NfDevName> = Vec::new();
+    if let Some(d) = nla_string(ha, NFTA_HOOK_DEV, IFNAMSIZ - 1)? {
+        devs.push(NfDevName { name: d.to_vec(), prefix: false });
+    } else if let Some(list) = ha.get(NFTA_HOOK_DEVS) {
+        for (ty, d) in nla_raw(list) {
+            let prefix = match ty & NLA_TYPE_MASK as u16 {
+                NFTA_DEVICE_NAME => false,
+                NFTA_DEVICE_PREFIX => true,
+                _ => return Err(Errno::EINVAL),
+            };
+            let dev = nft_netdev_hook_name(d, prefix)?;
+            if nft_hook_list_find(&devs, &dev, false).is_some() {
+                return Err(Errno::EEXIST);
+            }
+            devs.push(dev);
+            if devs.len() == NFT_NETDEVICE_MAX {
+                return Err(Errno::EFBIG);
+            }
+        }
+    }
+    if flags & NFT_CHAIN_HW_OFFLOAD != 0 && devs.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    Ok(devs)
+}
+
+/// Puts the hook of a base chain: the hook number, the priority, and the devices of a chain
+/// with a list of devices, as `nft_dump_basechain_hook` of Linux. `devs` are the devices, or
+/// the devices that a change adds or removes. With one device that is not a prefix the hook
+/// has `NFTA_HOOK_DEV` too.
+fn nft_dump_basechain_hook(b: &mut Builder, family: u8, base: &NftBaseChain, devs: &[NfDevName]) {
+    let nest = b.nest(NFTA_CHAIN_HOOK as u16);
+    b.put(NFTA_HOOK_HOOKNUM as u16, &u32::from(base.hooknum).to_be_bytes())
+        .put(NFTA_HOOK_PRIORITY as u16, &base.priority.to_be_bytes());
+    if nft_base_chain_netdev(family, base.hooknum) {
+        let list = b.nest(NFTA_HOOK_DEVS as u16);
+        for d in devs {
+            let ty = if d.prefix { NFTA_DEVICE_PREFIX } else { NFTA_DEVICE_NAME };
+            b.put(ty, &cstr(&d.name));
+        }
+        b.end_nest(list);
+        if let [d] = devs
+            && !d.prefix
+        {
+            b.put(NFTA_HOOK_DEV as u16, &cstr(&d.name));
+        }
+    }
+    b.end_nest(nest);
 }
 
 /// The data of an element of a map.
@@ -772,6 +908,9 @@ struct NftBaseChain {
     policy: u32,
     /// The function in the hook list. It stays the same while the chain lives.
     ops: Arc<NftHookOps>,
+    /// The devices of a chain of the family `netdev` or of the ingress of `inet`, as
+    /// `hook_list` of Linux.
+    devs: Vec<NfDevName>,
 }
 
 /// A chain, as `struct nft_chain` of Linux.
@@ -902,14 +1041,17 @@ pub struct NftHookOps {
     prog: SpinLock<Arc<NftProg>>,
     /// The chain has the type `nat`.
     nat: bool,
+    /// The chain is on the hook `ingress` of the family `inet`.
+    inet_ingress: bool,
 }
 
 impl NftHookOps {
-    fn new(policy: u32, nat: bool) -> Self {
+    fn new(policy: u32, nat: bool, inet_ingress: bool) -> Self {
         Self {
             policy: AtomicU32::new(policy),
             prog: SpinLock::new(Arc::new(NftProg::default())),
             nat,
+            inet_ingress,
         }
     }
 }
@@ -918,6 +1060,24 @@ impl NfHookFn for NftHookOps {
     /// Runs the rules of the chain on `skb`. At the end of the chain the packet gets the
     /// policy of the chain.
     fn hook(&self, skb: &mut NetBuf, state: &NfHookState) -> u32 {
+        // A chain on the ingress of `inet` runs at the hook of the device, and sees an IPv4 or
+        // IPv6 packet at `NF_INET_INGRESS`, as `nft_do_chain_inet_ingress` of Linux. A packet
+        // with a header that is not valid is dropped, and the other frames go on.
+        let ingress;
+        let state = if self.inet_ingress {
+            let pf = match skb.protocol {
+                ETH_P_IP => NFPROTO_IPV4,
+                ETH_P_IPV6 => NFPROTO_IPV6,
+                _ => return NF_ACCEPT,
+            };
+            if !nf_ingress_valid(pf, skb.data()) {
+                return NF_DROP;
+            }
+            ingress = NfHookState { pf, hook: NF_INET_INGRESS, ..*state };
+            &ingress
+        } else {
+            state
+        };
         let prog = self.prog.lock().clone();
         let policy = self.policy.load(Ordering::Acquire);
         // A chain of NAT runs on the first packet of a connection, then each packet gets the
@@ -938,6 +1098,8 @@ struct NftablesPernet {
     tables: Vec<NftTable>,
     /// The hooks in the hook lists of the namespace.
     hooks: Vec<NfHookOps>,
+    /// The hooks in the hook lists of the devices of the namespace.
+    dev_hooks: Vec<NfDevHookOps>,
     /// The families for which the tables use connection tracking, with a user of
     /// `nf_ct_netns_get` for each.
     ct: Vec<u8>,
@@ -945,7 +1107,14 @@ struct NftablesPernet {
 
 impl Default for NftablesPernet {
     fn default() -> Self {
-        Self { base_seq: 1, table_handle: 0, tables: Vec::new(), hooks: Vec::new(), ct: Vec::new() }
+        Self {
+            base_seq: 1,
+            table_handle: 0,
+            tables: Vec::new(),
+            hooks: Vec::new(),
+            dev_hooks: Vec::new(),
+            ct: Vec::new(),
+        }
     }
 }
 
@@ -1197,6 +1366,10 @@ fn nf_tables_fill_table_info(
     b.finish()
 }
 
+/// Makes the message of a chain, as `nf_tables_fill_chain_info` of Linux. `devs` are the
+/// devices that a change adds or removes, for the notice of the change: the hook shows them in
+/// place of the devices of the chain, and a notice of a removal of devices shows the chain.
+#[allow(clippy::too_many_arguments)]
 fn nf_tables_fill_chain_info(
     portid: u32,
     seq: u32,
@@ -1205,6 +1378,7 @@ fn nf_tables_fill_chain_info(
     base_seq: u32,
     table: &NftTable,
     chain: &NftChain,
+    devs: Option<&[NfDevName]>,
 ) -> Vec<u8> {
     let mut b = nfnl_msg_put(
         portid,
@@ -1218,14 +1392,11 @@ fn nf_tables_fill_chain_info(
     b.put(NFTA_CHAIN_TABLE as u16, &cstr(&table.name))
         .put(NFTA_CHAIN_HANDLE as u16, &chain.handle.to_be_bytes())
         .put(NFTA_CHAIN_NAME as u16, &cstr(&chain.name));
-    if event == NFT_MSG_DELCHAIN || event == NFT_MSG_DESTROYCHAIN {
+    if (event == NFT_MSG_DELCHAIN || event == NFT_MSG_DESTROYCHAIN) && devs.is_none() {
         return b.finish();
     }
     if let Some(base) = &chain.base {
-        let nest = b.nest(NFTA_CHAIN_HOOK as u16);
-        b.put(NFTA_HOOK_HOOKNUM as u16, &u32::from(base.hooknum).to_be_bytes())
-            .put(NFTA_HOOK_PRIORITY as u16, &base.priority.to_be_bytes());
-        b.end_nest(nest);
+        nft_dump_basechain_hook(&mut b, table.family, base, devs.unwrap_or(&base.devs));
         b.put(NFTA_CHAIN_POLICY as u16, &base.policy.to_be_bytes());
         b.put(NFTA_CHAIN_TYPE as u16, &cstr(base.ty.name.as_bytes()));
     }
@@ -1537,6 +1708,7 @@ fn nf_tables_getchain(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<()> {
         nft.base_seq,
         table,
         &table.chains[c],
+        None,
     );
     drop(nft);
     info.req.reply(m);
@@ -1557,6 +1729,7 @@ fn nf_tables_dump_chains(info: &NfnlInfo<'_>, _nla: &Attrs<'_>) -> Result<Vec<Ve
                 nft.base_seq,
                 t,
                 c,
+                None,
             ));
         }
     }
@@ -1898,6 +2071,9 @@ struct NftBatch {
     changed: bool,
     /// The tables whose flags changed in the batch.
     updated: Vec<u64>,
+    /// The devices that the changes of base chains add, with the handle of the table, as the
+    /// hooks of the `NFT_MSG_NEWCHAIN` updates of Linux.
+    added_devs: Vec<(u64, NfDevName)>,
     /// The batch added a rule or an element that the commit must check, as
     /// `NFT_VALIDATE_NEED` of Linux.
     validate: bool,
@@ -1928,6 +2104,7 @@ fn nf_tables_begin(genid: u32) -> Option<Box<dyn NfnlBatch>> {
         listen: nfnetlink_has_listeners(NFNLGRP_NFTABLES),
         changed: false,
         updated: Vec::new(),
+        added_devs: Vec::new(),
         validate: false,
         net,
     }))
@@ -1963,6 +2140,19 @@ impl NftBatch {
     }
 
     fn notify_chain(&mut self, ctx: &NftCtx, event: u8, t: usize, c: usize) {
+        self.notify_chain_devs(ctx, event, t, c, None);
+    }
+
+    /// Keeps the notice of a chain whose hook shows the devices `devs` in place of its own: the
+    /// devices that a change adds or removes.
+    fn notify_chain_devs(
+        &mut self,
+        ctx: &NftCtx,
+        event: u8,
+        t: usize,
+        c: usize,
+        devs: Option<&[NfDevName]>,
+    ) {
         let flags = ctx.notify_flags();
         let (portid, s) = (ctx.portid, ctx.seq);
         let m = self.want(ctx).then(|| {
@@ -1975,6 +2165,7 @@ impl NftBatch {
                 self.next_seq,
                 table,
                 &table.chains[c],
+                devs,
             )
         });
         self.notify(ctx, m);
@@ -2275,7 +2466,8 @@ impl NftBatch {
     fn nft_chain_parse_hook(
         family: u8,
         nla: &Attrs<'_>,
-    ) -> Result<(u8, i32, &'static NftChainType)> {
+        flags: u32,
+    ) -> Result<(u8, i32, &'static NftChainType, Vec<NfDevName>)> {
         let Some(h) = nla.get(NFTA_CHAIN_HOOK) else { return Err(Errno::EINVAL) };
         let ha = Attrs::parse(h, NFTA_HOOK_MAX);
         let (Some(num), Some(prio)) =
@@ -2289,14 +2481,41 @@ impl NftBatch {
             Some(name) => *types.iter().find(|t| t.name.as_bytes() == name).ok_or(Errno::ENOENT)?,
             None => default,
         };
-        if num >= u32::from(NF_INET_NUMHOOKS) || ty.hook_mask & (1 << num) == 0 {
+        if num >= NFT_MAX_HOOKS || ty.hook_mask & (1 << num) == 0 {
             return Err(Errno::EOPNOTSUPP);
         }
         // A chain of NAT needs the connection of the packet.
         if ty.nat && prio as i32 <= NF_IP_PRI_CONNTRACK {
             return Err(Errno::EOPNOTSUPP);
         }
-        Ok((num as u8, prio as i32, ty))
+        let devs = nft_chain_parse_devs(family, num as u8, &ha, flags)?;
+        Ok((num as u8, prio as i32, ty, devs))
+    }
+
+    /// Reads the hook of a change of the base chain `base` of `family`, as
+    /// `nft_chain_parse_hook` of Linux with a base chain: the hook number, the priority and the
+    /// type can be there, and they must be the ones of the chain. Gives the devices.
+    fn nft_chain_parse_hook_update(
+        family: u8,
+        base: &NftBaseChain,
+        nla: &Attrs<'_>,
+        flags: u32,
+    ) -> Result<Vec<NfDevName>> {
+        let Some(h) = nla.get(NFTA_CHAIN_HOOK) else { return Err(Errno::EINVAL) };
+        let ha = Attrs::parse(h, NFTA_HOOK_MAX);
+        if be32(&ha, NFTA_HOOK_HOOKNUM)?.is_some_and(|n| n != u32::from(base.hooknum))
+            || be32(&ha, NFTA_HOOK_PRIORITY)?.is_some_and(|p| p as i32 != base.priority)
+        {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if let Some(name) = nla_string(nla, NFTA_CHAIN_TYPE, NFT_MODULE_AUTOLOAD_LIMIT)? {
+            let types = nft_chain_types(family);
+            let ty = types.iter().find(|t| t.name.as_bytes() == name).ok_or(Errno::ENOENT)?;
+            if ty.name != base.ty.name {
+                return Err(Errno::EEXIST);
+            }
+        }
+        nft_chain_parse_devs(family, base.hooknum, &ha, flags)
     }
 
     fn nf_tables_addchain(
@@ -2313,12 +2532,14 @@ impl NftBatch {
             if flags & NFT_CHAIN_BINDING != 0 {
                 return Err(Errno::EOPNOTSUPP);
             }
-            let (hooknum, priority, ty) = Self::nft_chain_parse_hook(ctx.family, nla)?;
+            let (hooknum, priority, ty, devs) = Self::nft_chain_parse_hook(ctx.family, nla, flags)?;
             if flags & NFT_CHAIN_HW_OFFLOAD != 0 {
                 return Err(Errno::EOPNOTSUPP);
             }
-            let ops = Arc::new(NftHookOps::new(policy, ty.nat));
-            (Some(NftBaseChain { hooknum, priority, ty, policy, ops }), flags | NFT_CHAIN_BASE)
+            let inet_ingress = ctx.family == NFPROTO_INET && hooknum == NF_INET_INGRESS;
+            let ops = Arc::new(NftHookOps::new(policy, ty.nat, inet_ingress));
+            let base = NftBaseChain { hooknum, priority, ty, policy, ops, devs };
+            (Some(base), flags | NFT_CHAIN_BASE)
         } else {
             if flags & NFT_CHAIN_BASE != 0 {
                 return Err(Errno::EINVAL);
@@ -2348,8 +2569,9 @@ impl NftBatch {
         Ok(())
     }
 
-    /// Changes a chain: the policy of a base chain, or the name, as `nf_tables_updchain` of
-    /// Linux. The hook of a base chain does not change.
+    /// Changes a chain: the policy of a base chain, the name, or the devices of a base chain
+    /// with a list of devices, as `nf_tables_updchain` of Linux. The hook number, the priority
+    /// and the type of a base chain do not change.
     #[allow(clippy::too_many_arguments)]
     fn nf_tables_updchain(
         &mut self,
@@ -2363,24 +2585,36 @@ impl NftBatch {
     ) -> Result<()> {
         let table = &self.tables[t];
         let chain = &table.chains[c];
-        if let Some(h) = nla.get(NFTA_CHAIN_HOOK) {
+        if flags != chain.flags {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        // The devices that the change adds to the hook.
+        let mut added = Vec::new();
+        if nla.has(NFTA_CHAIN_HOOK) {
             let Some(base) = &chain.base else {
                 return Err(bad(info, nla, NFTA_CHAIN_HOOK, Errno::EEXIST));
             };
-            let ha = Attrs::parse(h, NFTA_HOOK_MAX);
-            if be32(&ha, NFTA_HOOK_HOOKNUM)?.is_some_and(|n| n != u32::from(base.hooknum))
-                || be32(&ha, NFTA_HOOK_PRIORITY)?.is_some_and(|p| p as i32 != base.priority)
-            {
-                return Err(Errno::EOPNOTSUPP);
+            let devs =
+                Self::nft_chain_parse_hook_update(ctx.family, base, nla, flags).map_err(|e| {
+                    if e == Errno::EEXIST { bad(info, nla, NFTA_CHAIN_TYPE, e) } else { e }
+                })?;
+            for dev in devs {
+                // A device that a change of the batch adds to a chain of the table cannot come
+                // again, and one that the chain has is not added again.
+                let pending = |(h, d): &(u64, NfDevName)| {
+                    *h == table.handle
+                        && nft_hook_list_find(core::slice::from_ref(d), &dev, false).is_some()
+                };
+                if self.added_devs.iter().any(pending) {
+                    return Err(bad(info, nla, NFTA_CHAIN_HOOK, Errno::EEXIST));
+                }
+                if nft_hook_list_find(&base.devs, &dev, false).is_none() {
+                    added.push(dev);
+                }
             }
-            if let Some(name) = nla_string(nla, NFTA_CHAIN_TYPE, NFT_MODULE_AUTOLOAD_LIMIT)?
-                && name != base.ty.name.as_bytes()
-            {
-                return Err(bad(info, nla, NFTA_CHAIN_TYPE, Errno::EEXIST));
+            if !added.is_empty() && self.updated.contains(&table.handle) {
+                return Err(bad(info, nla, NFTA_CHAIN_HOOK, Errno::EOPNOTSUPP));
             }
-        }
-        if flags != chain.flags {
-            return Err(Errno::EOPNOTSUPP);
         }
         let rename = match (nla.has(NFTA_CHAIN_HANDLE), nla_name(nla, NFTA_CHAIN_NAME)?) {
             (true, Some(name)) if name != chain.name => {
@@ -2391,14 +2625,22 @@ impl NftBatch {
             }
             _ => None,
         };
+        let handle = self.tables[t].handle;
+        self.added_devs.extend(added.iter().map(|d| (handle, d.clone())));
         let chain = &mut self.tables[t].chains[c];
         if let (Some(p), Some(base)) = (policy, chain.base.as_mut()) {
             base.policy = p;
         }
+        if let Some(base) = chain.base.as_mut() {
+            base.devs.extend(added.iter().cloned());
+        }
         if let Some(name) = rename {
             chain.name = name;
         }
-        self.notify_chain(ctx, NFT_MSG_NEWCHAIN, t, c);
+        // The notice of a chain with a list of devices shows the devices that it adds.
+        let netdev =
+            chain.base.as_ref().is_some_and(|b| nft_base_chain_netdev(ctx.family, b.hooknum));
+        self.notify_chain_devs(ctx, NFT_MSG_NEWCHAIN, t, c, netdev.then_some(&added[..]));
         Ok(())
     }
 
@@ -2425,6 +2667,16 @@ impl NftBatch {
         if chain.flags & NFT_CHAIN_BINDING != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
+        if nla.has(NFTA_CHAIN_HOOK) {
+            if ctx.ty == NFT_MSG_DESTROYCHAIN || chain.flags & NFT_CHAIN_HW_OFFLOAD != 0 {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            if let Some(base) = &chain.base
+                && nft_base_chain_netdev(ctx.family, base.hooknum)
+            {
+                return self.nft_delchain_hook(&ctx, nla, t, c);
+            }
+        }
         let mut use_count = table.chain_use(chain.handle);
         if ctx.has(NLM_F_NONREC) && use_count > 0 {
             return Err(Errno::EBUSY);
@@ -2440,6 +2692,34 @@ impl NftBatch {
         }
         self.notify_chain(&ctx, NFT_MSG_DELCHAIN, t, c);
         self.tables[t].chains.remove(c);
+        Ok(())
+    }
+
+    /// Removes devices from the hook of a base chain with a list of devices, as
+    /// `nft_delchain_hook` of Linux. The chain stays, and its notice shows the devices that go.
+    fn nft_delchain_hook(
+        &mut self,
+        ctx: &NftCtx,
+        nla: &Attrs<'_>,
+        t: usize,
+        c: usize,
+    ) -> Result<()> {
+        let table = &self.tables[t];
+        if self.updated.contains(&table.handle) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let chain = &table.chains[c];
+        let Some(base) = &chain.base else { return Err(Errno::EINVAL) };
+        let devs = Self::nft_chain_parse_hook_update(ctx.family, base, nla, chain.flags)?;
+        let mut keep = base.devs.clone();
+        for dev in &devs {
+            let i = nft_hook_list_find(&keep, dev, true).ok_or(Errno::ENOENT)?;
+            keep.remove(i);
+        }
+        if let Some(base) = self.tables[t].chains[c].base.as_mut() {
+            base.devs = keep;
+        }
+        self.notify_chain_devs(ctx, NFT_MSG_DELCHAIN, t, c, Some(&devs));
         Ok(())
     }
 
@@ -3058,16 +3338,31 @@ fn nf_tables_set_alloc_name(table: &NftTable, name: &[u8]) -> Result<Vec<u8>> {
     (0..MAX).map(make).find(|v| !table.sets.iter().any(|s| &s.name == v)).ok_or(Errno::EMFILE)
 }
 
-/// The hooks of the base chains of the tables that are not dormant.
-type WantedHook = (Arc<NftHookOps>, u8, u8, i32, u32, Arc<NftProg>);
+/// The hook of a base chain of a table that is not dormant.
+struct WantedHook {
+    ops: Arc<NftHookOps>,
+    family: u8,
+    hooknum: u8,
+    priority: i32,
+    policy: u32,
+    prog: Arc<NftProg>,
+    devs: Arc<[NfDevName]>,
+}
 
 fn nft_wanted_hooks(tables: &[NftTable]) -> Vec<WantedHook> {
     let mut out = Vec::new();
     for t in tables.iter().filter(|t| t.flags & NFT_TABLE_F_DORMANT == 0) {
         for (i, c) in t.chains.iter().enumerate() {
             if let Some(b) = &c.base {
-                let prog = Arc::new(nft_prog(t, i));
-                out.push((b.ops.clone(), t.family, b.hooknum, b.priority, b.policy, prog));
+                out.push(WantedHook {
+                    ops: b.ops.clone(),
+                    family: t.family,
+                    hooknum: b.hooknum,
+                    priority: b.priority,
+                    policy: b.policy,
+                    prog: Arc::new(nft_prog(t, i)),
+                    devs: b.devs.as_slice().into(),
+                });
             }
         }
     }
@@ -3110,23 +3405,55 @@ fn nft_sync_ct(net: &mut NftablesPernet, tables: &[NftTable]) -> Result<()> {
 /// `tables` any more. The state of each base chain goes to its hook.
 fn nft_sync_hooks(net: &mut NftablesPernet, tables: &[NftTable]) -> Result<()> {
     nft_sync_ct(net, tables)?;
-    let want = nft_wanted_hooks(tables);
-    let same = |ops: &NfHookOps, w: &Arc<NftHookOps>| {
-        Arc::as_ptr(&ops.hook).cast::<u8>() == Arc::as_ptr(w).cast::<u8>()
+    let all = nft_wanted_hooks(tables);
+    for w in &all {
+        *w.ops.prog.lock() = w.prog.clone();
+        w.ops.policy.store(w.policy, Ordering::Release);
+    }
+    let same = |hook: &Arc<dyn NfHookFn>, w: &Arc<NftHookOps>| {
+        Arc::as_ptr(hook).cast::<u8>() == Arc::as_ptr(w).cast::<u8>()
     };
+    // The chains of `arp` and `bridge` have no packet path here, so they are on no hook.
+    let (dev, want): (Vec<&WantedHook>, Vec<&WantedHook>) = all
+        .iter()
+        .filter(|w| matches!(w.family, NFPROTO_IPV4 | NFPROTO_IPV6 | NFPROTO_INET | NFPROTO_NETDEV))
+        .partition(|w| nft_base_chain_netdev(w.family, w.hooknum));
+    // The chains with a list of devices are on the hooks of the devices. A chain on the
+    // ingress of `inet` is on the ingress of its devices.
+    for w in &dev {
+        let hooknum = if w.family == NFPROTO_INET { NF_NETDEV_INGRESS } else { w.hooknum };
+        let reg = NfDevHookOps {
+            hook: w.ops.clone(),
+            hooknum,
+            priority: w.priority,
+            devs: w.devs.clone(),
+        };
+        nf_register_dev_hook(&reg)?;
+        if !net.dev_hooks.iter().any(|h| same(&h.hook, &w.ops)) {
+            net.dev_hooks.push(reg);
+        }
+    }
+    net.dev_hooks.retain(|h| {
+        let keep = dev.iter().any(|w| same(&h.hook, &w.ops));
+        if !keep {
+            nf_unregister_dev_hook(h);
+        }
+        keep
+    });
     let new: Vec<NfHookOps> = want
         .iter()
-        .filter(|w| !net.hooks.iter().any(|h| same(h, &w.0)))
-        .map(|w| NfHookOps { hook: w.0.clone(), pf: w.1, hooknum: w.2, priority: w.3 })
+        .filter(|w| !net.hooks.iter().any(|h| same(&h.hook, &w.ops)))
+        .map(|w| NfHookOps {
+            hook: w.ops.clone(),
+            pf: w.family,
+            hooknum: w.hooknum,
+            priority: w.priority,
+        })
         .collect();
-    for w in &want {
-        *w.0.prog.lock() = w.5.clone();
-        w.0.policy.store(w.4, Ordering::Release);
-    }
     nf_register_net_hooks(&new)?;
     let mut hooks = Vec::with_capacity(want.len());
     for h in core::mem::take(&mut net.hooks) {
-        if want.iter().any(|w| same(&h, &w.0)) {
+        if want.iter().any(|w| same(&h.hook, &w.ops)) {
             hooks.push(h);
         } else {
             nf_unregister_net_hook(&h);
@@ -3459,7 +3786,8 @@ mod tests {
             priority: 0,
             ty,
             policy: NF_ACCEPT,
-            ops: Arc::new(NftHookOps::new(NF_ACCEPT, ty.nat)),
+            ops: Arc::new(NftHookOps::new(NF_ACCEPT, ty.nat, false)),
+            devs: Vec::new(),
         };
         // c1, nat at the output hook: tcp dport vmap { 1 : jump c2 }. c2: masquerade.
         let mut t = table();
@@ -3828,5 +4156,157 @@ mod tests {
                 c.elems.insert(start, NftElem { seq: seq as u64, ..elem(Some(end)) });
             }
         }
+    }
+
+    /// The attributes of a hook with `hooknum`, and the devices `devs` with `NFTA_HOOK_DEVS`.
+    fn hook_attrs(hooknum: u32, devs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut b = Builder::new(0, 0, 0, 0);
+        b.put(NFTA_HOOK_HOOKNUM as u16, &hooknum.to_be_bytes());
+        b.put(NFTA_HOOK_PRIORITY as u16, &0u32.to_be_bytes());
+        if !devs.is_empty() {
+            let n = b.nest(NFTA_HOOK_DEVS as u16 | NLA_F_NESTED as u16);
+            for (ty, d) in devs {
+                b.put(*ty, d);
+            }
+            b.end_nest(n);
+        }
+        b.finish()[msg::HDRLEN..].to_vec()
+    }
+
+    fn dev(name: &[u8], prefix: bool) -> NfDevName {
+        NfDevName { name: name.to_vec(), prefix }
+    }
+
+    #[test]
+    fn a_netdev_chain_takes_a_list_of_devices() {
+        let parse = |family, hooknum, devs: &[(u16, &[u8])], flags| {
+            let a = hook_attrs(hooknum, devs);
+            nft_chain_parse_devs(family, hooknum as u8, &Attrs::parse(&a, NFTA_HOOK_MAX), flags)
+        };
+        let lo = (NFTA_DEVICE_NAME, &b"lo\0"[..]);
+        let eth = (NFTA_DEVICE_PREFIX, &b"eth\0"[..]);
+        assert_eq!(
+            parse(NFPROTO_NETDEV, 0, &[lo, eth], 0).unwrap(),
+            alloc::vec![dev(b"lo", false), dev(b"eth", true)]
+        );
+        // A chain with no device, and the ingress of `inet`.
+        assert_eq!(parse(NFPROTO_NETDEV, 0, &[], 0).unwrap(), Vec::new());
+        assert_eq!(parse(NFPROTO_INET, u32::from(NF_INET_INGRESS), &[lo], 0).unwrap().len(), 1);
+        // The devices of a hook that is not on a device.
+        assert_eq!(parse(NFPROTO_INET, 0, &[lo], 0), Err(Errno::EOPNOTSUPP));
+        assert_eq!(parse(NFPROTO_IPV4, 0, &[], 0).unwrap(), Vec::new());
+        // A device two times, or one that the prefix of another one has.
+        assert_eq!(parse(NFPROTO_NETDEV, 0, &[lo, lo], 0), Err(Errno::EEXIST));
+        let eth0 = (NFTA_DEVICE_NAME, &b"eth0\0"[..]);
+        assert_eq!(parse(NFPROTO_NETDEV, 0, &[eth, eth0], 0), Err(Errno::EEXIST));
+        assert_eq!(parse(NFPROTO_NETDEV, 0, &[(3, b"lo\0")], 0), Err(Errno::EINVAL));
+        assert_eq!(
+            parse(NFPROTO_NETDEV, 0, &[(NFTA_DEVICE_NAME, b"0123456789abcdef\0")], 0),
+            Err(Errno::E2BIG)
+        );
+        assert_eq!(parse(NFPROTO_NETDEV, 0, &[], NFT_CHAIN_HW_OFFLOAD), Err(Errno::EINVAL));
+        // The list is full at `NFT_NETDEVICE_MAX`.
+        let names: Vec<Vec<u8>> =
+            (0..NFT_NETDEVICE_MAX).map(|i| format!("d{i}\0").into_bytes()).collect();
+        let many: Vec<(u16, &[u8])> =
+            names.iter().map(|n| (NFTA_DEVICE_NAME, n.as_slice())).collect();
+        assert_eq!(parse(NFPROTO_NETDEV, 0, &many, 0), Err(Errno::EFBIG));
+        assert_eq!(parse(NFPROTO_NETDEV, 0, &many[1..], 0).unwrap().len(), 255);
+    }
+
+    #[test]
+    fn a_device_is_found_as_strncmp_finds_it() {
+        let devs = [dev(b"lo", false), dev(b"eth", true)];
+        assert_eq!(nft_hook_list_find(&devs, &dev(b"lo", false), true), Some(0));
+        assert_eq!(nft_hook_list_find(&devs, &dev(b"l", true), false), Some(0));
+        assert_eq!(nft_hook_list_find(&devs, &dev(b"l", true), true), None);
+        assert_eq!(nft_hook_list_find(&devs, &dev(b"eth1", false), false), Some(1));
+        assert_eq!(nft_hook_list_find(&devs, &dev(b"eth1", false), true), None);
+        assert_eq!(nft_hook_list_find(&devs, &dev(b"lo0", false), false), None);
+    }
+
+    #[test]
+    fn the_hook_of_a_netdev_chain_shows_its_devices() {
+        let ty = nft_chain_types(NFPROTO_NETDEV)[0];
+        let base = NftBaseChain {
+            hooknum: 0,
+            priority: -500,
+            ty,
+            policy: NF_ACCEPT,
+            ops: Arc::new(NftHookOps::new(NF_ACCEPT, false, false)),
+            devs: alloc::vec![dev(b"lo", false)],
+        };
+        let hook = |devs: &[NfDevName]| {
+            let mut b = Builder::new(0, 0, 0, 0);
+            nft_dump_basechain_hook(&mut b, NFPROTO_NETDEV, &base, devs);
+            let m = b.finish();
+            let (_, h) = msg::attrs(&m[msg::HDRLEN..]).next().unwrap();
+            let h = Attrs::parse(h, NFTA_HOOK_MAX);
+            let list: Vec<(u16, Vec<u8>)> =
+                nla_raw(h.get(NFTA_HOOK_DEVS).unwrap()).map(|(t, d)| (t, d.to_vec())).collect();
+            (list, h.get(NFTA_HOOK_DEV).map(<[u8]>::to_vec))
+        };
+        // One device gives `NFTA_HOOK_DEV` too.
+        let (list, one) = hook(&base.devs);
+        assert_eq!(list, alloc::vec![(NFTA_DEVICE_NAME, b"lo\0".to_vec())]);
+        assert_eq!(one.as_deref(), Some(&b"lo\0"[..]));
+        let (list, one) = hook(&[dev(b"lo", false), dev(b"eth", true)]);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1], (NFTA_DEVICE_PREFIX, b"eth\0".to_vec()));
+        assert_eq!(one, None);
+        assert_eq!(hook(&[dev(b"eth", true)]).1, None);
+        assert_eq!(hook(&[]), (Vec::new(), None));
+    }
+
+    #[test]
+    fn the_chain_types_follow_the_family() {
+        let mask = |f| nft_chain_types(f).first().map(|t| t.hook_mask);
+        assert_eq!(mask(NFPROTO_IPV4), Some(0x1f));
+        assert_eq!(mask(NFPROTO_INET), Some(0x3f));
+        assert_eq!(mask(NFPROTO_ARP), Some(0x3));
+        assert_eq!(mask(NFPROTO_BRIDGE), Some(0x1f));
+        assert_eq!(mask(NFPROTO_NETDEV), Some(0x3));
+        assert!(nft_base_chain_netdev(NFPROTO_NETDEV, 1));
+        assert!(nft_base_chain_netdev(NFPROTO_INET, NF_INET_INGRESS));
+        assert!(!nft_base_chain_netdev(NFPROTO_INET, 0));
+        assert!(!nft_base_chain_netdev(NFPROTO_IPV4, NF_INET_INGRESS));
+    }
+
+    #[test]
+    fn an_inet_ingress_chain_sees_ip_packets_at_the_ingress_hook() {
+        use crate::netfilter::NF_NETDEV_INGRESS;
+        // A chain with no rule.
+        let mut t = table();
+        t.family = NFPROTO_INET;
+        t.chains.push(NftChain {
+            name: b"c".to_vec(),
+            handle: 2,
+            flags: NFT_CHAIN_BASE,
+            udata: None,
+            base: None,
+            rules: Vec::new(),
+            txn_id: None,
+        });
+        let prog = Arc::new(nft_prog(&t, 0));
+        let ops = NftHookOps::new(NF_DROP, false, true);
+        *ops.prog.lock() = prog.clone();
+        let state =
+            NfHookState { hook: NF_NETDEV_INGRESS, pf: NFPROTO_NETDEV, in_dev: 1, out_dev: 0 };
+        let mut ip = [0u8; 20];
+        ip[0] = 0x45;
+        ip[3] = 20;
+        let mut skb = NetBuf::from_slice(&ip);
+        // Another protocol goes on; an IPv4 packet gets the policy of the chain.
+        assert_eq!(ops.hook(&mut skb, &state), NF_ACCEPT);
+        skb.protocol = ETH_P_IP;
+        assert_eq!(ops.hook(&mut skb, &state) & 0xff, NF_DROP);
+        let ops = NftHookOps::new(NF_ACCEPT, false, true);
+        *ops.prog.lock() = prog;
+        assert_eq!(ops.hook(&mut skb, &state), NF_ACCEPT);
+        // A header that is not valid is dropped.
+        ip[3] = 40;
+        let mut bad = NetBuf::from_slice(&ip);
+        bad.protocol = ETH_P_IP;
+        assert_eq!(ops.hook(&mut bad, &state), NF_DROP);
     }
 }
