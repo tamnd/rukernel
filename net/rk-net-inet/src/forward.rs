@@ -8,7 +8,8 @@
 //! that must not get fragments. An IPv4 packet that can get fragments goes out in fragments.
 //! The host sends an ICMP redirect when the packet goes out on the device that it came in on.
 //!
-//! The pure parts are `verdict`, `fwd_proxy` and `neigh::Redirects`, for the host tests.
+//! The pure parts are `verdict`, `fwd_proxy`, `arp_sender_remote` and `neigh::Redirects`, for
+//! the host tests.
 
 use crate::ip::{self, Ip};
 use crate::ipv4::{self, DF, HLEN, Header, MF, OFFSET_MASK};
@@ -80,6 +81,15 @@ pub fn fwd_proxy(proxy_arp: bool, in_medium: i32, out_medium: i32) -> bool {
         -1 => false,
         m => out_medium != m && out_medium != -1,
     }
+}
+
+/// Tells if the host takes the sender of an ARP packet as another host, as the check of the
+/// source in `ip_route_input_noref` that `arp_process` in net/ipv4/arp.c of Linux does before it
+/// answers a request. A local address is a martian source, as `fib_validate_source`, unless
+/// `accept_local` of the device or of `all` is set. So the host does not answer the announcement
+/// of an address that it puts on another of its interfaces.
+pub fn arp_sender_remote(t: &route::Table, sender: ipv4::Addr, accept_local: bool) -> bool {
+    accept_local || !t.is_local(sender)
 }
 
 /// The value of a configuration of IPv4 of `all` or of the device, as the `IN_DEV_ORCONF`

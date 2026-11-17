@@ -1687,6 +1687,21 @@ fn proxy_arp_medium() {
     assert!(!fwd_proxy(true, 1, -1));
 }
 
+/// An ARP packet with a local address as the sender is not from another host, unless
+/// `accept_local` is set. networkd announces an IPv4 link local address on one end of a veth
+/// pair, and an answer from the other end was a conflict for it.
+#[test]
+fn an_arp_sender_with_a_local_address_is_a_martian() {
+    use crate::forward::arp_sender_remote;
+    let t = qemu_table();
+    assert!(!arp_sender_remote(&t, [10, 0, 2, 15], false));
+    assert!(!arp_sender_remote(&t, ipv4::LOOPBACK, false));
+    assert!(arp_sender_remote(&t, [10, 0, 2, 15], true));
+    assert!(arp_sender_remote(&t, [10, 0, 2, 2], false));
+    // A probe for duplicate addresses has the sender 0.0.0.0.
+    assert!(arp_sender_remote(&t, ipv4::ANY, false));
+}
+
 /// The proxy entries of `pneigh_lookup`: an entry of the device or of each device.
 #[test]
 fn proxy_entries() {
