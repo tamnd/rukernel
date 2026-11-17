@@ -16896,7 +16896,7 @@ static void test_selinux(void)
 	/*
 	 * The SID of the task, as selinux_lsm_getattr, selinux_lsm_setattr and selinux_bprm_creds_for_exec of Linux. init ran before
 	 * the load, so it has the SID init, and without the policy capability userspace_initial_context, init has the context of
-	 * kernel. The files have no label yet, so an exec in permissive mode makes denials for the file unlabeled_t.
+	 * kernel. An exec in permissive mode makes denials for the file tmpfs_t.
 	 */
 	mkdir("/proc", 0555);
 	check("selinux: proc mounts", mount("proc", "/proc", "proc", 0, NULL) == 0);
@@ -16908,8 +16908,42 @@ static void test_selinux(void)
 	check("selinux: a write of a context that the policy does not know to attr/exec gives EINVAL", aa_write("/proc/self/attr/exec", "system_u:system_r:nothing_t:s0", 30, 0) == EINVAL);
 	check("selinux: attr/fscreate takes a context with a NUL and gives it back", aa_write("/proc/self/attr/fscreate", "system_u:object_r:etc_t:s0", 27, 0) == 0 && aa_read("/proc/self/attr/fscreate", buf, 256) == 27 && strcmp(buf, "system_u:object_r:etc_t:s0") == 0);
 	check("selinux: a new line clears attr/fscreate", aa_write("/proc/self/attr/fscreate", "\n", 1, 0) == 0 && aa_read("/proc/self/attr/fscreate", buf, 256) == 0);
+	/*
+	 * The labels of the files, as inode_doinit_with_dentry and selinux_inode_getsecurity of Linux: a genfscon rule for the path
+	 * in proc and sysfs, the rule for / in selinuxfs, no rule for rootfs, and a type transition from the task that made the
+	 * file in tmpfs. The value of security.selinux has a NUL at the end.
+	 */
+	n = getxattr("/sys/fs/selinux/enforce", "security.selinux", buf, 256);
+	check("selinux: a file of selinuxfs has the label of the genfscon rule", n == 32 && strcmp(buf, "system_u:object_r:security_t:s0") == 0);
+	n = getxattr("/sys", "security.selinux", buf, 256);
+	check("selinux: sysfs has the label sysfs_t", n == 29 && strcmp(buf, "system_u:object_r:sysfs_t:s0") == 0);
+	n = getxattr("/proc", "security.selinux", buf, 256);
+	check("selinux: proc has the label proc_t", n == 28 && strcmp(buf, "system_u:object_r:proc_t:s0") == 0);
+	n = getxattr("/proc/sys/kernel", "security.selinux", buf, 256);
+	check("selinux: /proc/sys/kernel has the label of the rule for /sys", n == 29 && strcmp(buf, "system_u:object_r:sysfs_t:s0") == 0);
+	n = lgetxattr("/proc/self", "security.selinux", buf, 256);
+	check("selinux: the link /proc/self has a label with genfs_seclabel_symlinks", n == 28 && strcmp(buf, "system_u:object_r:proc_t:s0") == 0);
+	n = getxattr("/", "security.selinux", buf, 256);
+	check("selinux: rootfs has no rule and the label unlabeled_t", n == 33 && strcmp(buf, "system_u:object_r:unlabeled_t:s0") == 0);
+	n = getxattr("/proc", "security.selinux", NULL, 0);
+	check("selinux: getxattr gives the size for a size of 0", n == 28);
+	n = listxattr("/proc", buf, 256);
+	check("selinux: listxattr names security.selinux", n == 17 && memcmp(buf, "security.selinux", 17) == 0);
+	check("selinux: another attribute of security. is for the file system", getxattr("/proc", "security.ima", buf, 256) < 0 && errno == ENODATA);
 	mkdir("/tmp", 01777);
+	check("selinux: tmpfs mounts on /tmp", mount("tmpfs", "/tmp", "tmpfs", 0, NULL) == 0);
 	check("selinux: the test program is there", aa_copy("/init", "/tmp/rk-sub") == 0);
+	n = getxattr("/tmp", "security.selinux", buf, 256);
+	check("selinux: tmpfs has the label of fs_use_trans", n == 29 && strcmp(buf, "system_u:object_r:tmpfs_t:s0") == 0);
+	n = getxattr("/tmp/rk-sub", "security.selinux", buf, 256);
+	check("selinux: a file of kernel_t in tmpfs has the label tmpfs_t", n == 29 && strcmp(buf, "system_u:object_r:tmpfs_t:s0") == 0);
+	{
+		char *files[] = { "rk-sub", "files", NULL };
+
+		aa_run_at("/tmp/rk-sub", init, files, buf, 256);
+		n = getxattr("/tmp/rk-aa-w", "security.selinux", buf, 256);
+		check("selinux: a file of init_t in tmpfs follows the type_transition rule", n == 27 && strcmp(buf, "system_u:object_r:etc_t:s0") == 0);
+	}
 	n = aa_run_at("/tmp/rk-sub", init, sub, buf, 256);
 	check("selinux: an exec after a write to attr/exec runs with the new context", n == (int)sizeof(init) && strcmp(buf, init) == 0);
 	n = aa_run_at("/tmp/rk-sub", NULL, sub, buf, 256);
@@ -16934,9 +16968,12 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the denial of setenforce in enforcing mode", strstr(buf, "{ setenforce } for  pid=1 comm=\"init\" scontext=system_u:system_r:kernel_t:s0-s1:c0.c2 tcontext=system_u:object_r:security_t:s0 tclass=security permissive=0") != NULL);
 	check("selinux: the kernel log has the denials of the other files", strstr(buf, "{ compute_av } for") != NULL && strstr(buf, "{ check_context } for") != NULL && strstr(buf, "{ compute_create } for") != NULL && strstr(buf, "{ load_policy } for") != NULL);
 	check("selinux: the kernel log has the unknown classes", strstr(buf, "SELinux:  Class tcp_socket not defined in policy.") != NULL && strstr(buf, "SELinux: the above unknown classes and permissions will be denied") != NULL);
-	check("selinux: the kernel log has the denial of the entrypoint", strstr(buf, "avc:  denied  { entrypoint } for  pid=") != NULL && strstr(buf, " comm=\"init\" path=\"/tmp/rk-sub\" dev=\"") != NULL && strstr(buf, "scontext=system_u:system_r:init_t:s0 tcontext=system_u:object_r:unlabeled_t:s0 tclass=file permissive=1") != NULL);
+	check("selinux: the kernel log has the denial of the entrypoint", strstr(buf, "avc:  denied  { entrypoint } for  pid=") != NULL && strstr(buf, " comm=\"init\" path=\"/tmp/rk-sub\" dev=\"") != NULL && strstr(buf, "scontext=system_u:system_r:init_t:s0 tcontext=system_u:object_r:tmpfs_t:s0 tclass=file permissive=1") != NULL);
 	check("selinux: the kernel log has the denials of noatsecure and execute_no_trans", strstr(buf, "{ noatsecure } for") != NULL && strstr(buf, "{ execute_no_trans } for") != NULL);
 	check("selinux: the kernel log has the denial of setexec in enforcing mode", strstr(buf, "{ setexec } for  pid=1 comm=\"init\" scontext=system_u:system_r:kernel_t:s0-s1:c0.c2 tcontext=system_u:system_r:kernel_t:s0-s1:c0.c2 tclass=process permissive=0") != NULL);
+	unlink("/tmp/rk-aa-w");
+	unlink("/tmp/rk-sub");
+	umount("/tmp");
 	umount("/proc");
 	umount("/sys/fs/selinux");
 	umount("/sys");

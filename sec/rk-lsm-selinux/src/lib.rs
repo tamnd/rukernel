@@ -26,6 +26,7 @@ pub mod avtab;
 pub mod classmap;
 pub mod context;
 pub mod ebitmap;
+pub mod inode;
 pub mod policydb;
 pub mod selinuxfs;
 pub mod server;
@@ -39,7 +40,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use rk_frame::sync::SpinLock;
-use rk_vfs::inode::Result;
+use rk_vfs::dentry::Location;
+use rk_vfs::inode::{Inode, Result};
+use rk_vfs::security::blob::Blob;
 use rk_vfs::security::{
     BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks, Task,
     id,
@@ -68,6 +71,23 @@ impl SecurityHooks for SeLinux {
     fn setprocattr(&self, name: &str, value: &[u8]) -> Option<Result<usize>> {
         Some(task::setprocattr(name, value))
     }
+
+    fn inode_alloc_security(&self, _inode: &dyn Inode, blob: &Blob) {
+        inode::alloc_security(blob);
+    }
+
+    fn inode_getsecurity(
+        &self,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        name: &[u8],
+    ) -> Option<Result<Vec<u8>>> {
+        inode::getsecurity(inode, at, name)
+    }
+
+    fn inode_listsecurity(&self, inode: &dyn Inode, at: Option<&Location>) -> Vec<Vec<u8>> {
+        inode::listsecurity(inode, at)
+    }
 }
 
 /// The description of the module, as `DEFINE_LSM(selinux)` of Linux. SELinux is a major module
@@ -77,7 +97,7 @@ pub static LSM: LsmInfo = LsmInfo {
     id: LsmId { name: "selinux", id: id::SELINUX },
     order: Order::Mutable,
     flags: FLAG_LEGACY_MAJOR | FLAG_EXCLUSIVE,
-    blobs: BlobSizes { cred: task::CRED_BLOB, ..BlobSizes::NONE },
+    blobs: BlobSizes { cred: task::CRED_BLOB, inode: inode::INODE_BLOB, ..BlobSizes::NONE },
     hooks: &SeLinux,
 };
 

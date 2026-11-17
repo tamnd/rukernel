@@ -490,6 +490,25 @@ pub trait SecurityHooks: Sync {
         Ok(())
     }
 
+    /// `inode_getsecurity`: the value of the attribute `security.NAME` of `inode` for
+    /// `getxattr`, where `name` is the part after `security.`. `at` is the path of the inode, if
+    /// the caller has one. `None` lets the file system give the value, as `-EOPNOTSUPP` of
+    /// Linux.
+    fn inode_getsecurity(
+        &self,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        name: &[u8],
+    ) -> Option<Result<Vec<u8>>> {
+        None
+    }
+
+    /// `inode_listsecurity`: the names of the attributes that the module adds to the list of
+    /// `listxattr` for `inode`, as `security.selinux`.
+    fn inode_listsecurity(&self, inode: &dyn Inode, at: Option<&Location>) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
     /// `sb_mount`: `mount(2)` on `req.at`, before the check of `CAP_SYS_ADMIN`.
     fn sb_mount(&self, req: &super::MountReq<'_>) -> Result<()> {
         Ok(())

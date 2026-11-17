@@ -2,10 +2,11 @@
 //! Linux. They use the loaded policy, its table of SIDs and its map of the classes of the
 //! kernel.
 
+use crate::policydb::{Context, Policydb, fs_use};
 use crate::services::{self, AvDecision, Mapping, NEVERAUDIT, PERMISSIVE, set_mapping};
 use crate::sidtab::{Entry, INITIAL_NAMES, NUM_INITIAL, Sidtab, sid};
 use crate::{POLICY, POLICY_MUTEX, POLICYCAP_NAMES, POLICYLOAD, SEQUENCE};
-use crate::{avc, classmap, enforcing, policy, policydb::Policydb};
+use crate::{avc, classmap, enforcing, policy};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -292,6 +293,62 @@ pub fn member_sid(ssid: u32, tsid: u32, tclass: u32) -> Result<u32, Errno> {
 /// As [`transition_sid`].
 pub fn change_sid(ssid: u32, tsid: u32, tclass: u32) -> Result<u32, Errno> {
     compute_sid(ssid, tsid, tclass, crate::avtab::spec::CHANGE, None, false)
+}
+
+/// The SID of the context that `find` gives from the policy, as `ocontext_to_sid` of Linux, or
+/// `None` before the first policy load or if `find` gives no context. A policy load between
+/// the search and the table of the SIDs makes the search again in the new policy.
+fn ocontext_sid(mut find: impl FnMut(&Policy) -> Option<Context>) -> Option<u32> {
+    loop {
+        let p = policy()?;
+        let context = find(&p)?;
+        let mut tab = p.sidtab.lock();
+        if !tab.frozen {
+            return Some(tab.context_to_sid(&p.db, Entry { context, invalid: None }));
+        }
+    }
+}
+
+/// The context of the first `genfscon` rule of the file system type `fstype` for the path
+/// `path` and the class `tclass` of the kernel, as `__security_genfs_sid` of Linux. The rules
+/// of a type are sorted with the longest path first, and a rule is for a path that starts with
+/// its path. A rule without a class is for each class.
+fn genfs_context(p: &Policy, fstype: &str, path: &[u8], tclass: u16) -> Option<Context> {
+    let class = services::unmap_class(&p.map, tclass);
+    let (_, rules) = p.db.genfs.iter().find(|(name, _)| name == fstype)?;
+    let rule = rules
+        .iter()
+        .find(|r| (r.sclass == 0 || r.sclass == class) && path.starts_with(r.path.as_bytes()))?;
+    Some(rule.context.clone())
+}
+
+/// The way that the policy labels the files of the file system type `fstype`, and the SID of
+/// the file system, as `security_fs_use` of Linux. A `fs_use_*` rule for the type gives its
+/// behavior and its context. Else the `genfscon` rule of the type for `/` gives
+/// [`fs_use::GENFS`] and its context, and a type without a rule gets [`fs_use::NONE`] and the
+/// SID `unlabeled`. Before the first policy load, all types get [`fs_use::NONE`].
+pub fn fs_use(fstype: &str) -> (u32, u32) {
+    let mut behavior = fs_use::NONE;
+    let sid = ocontext_sid(|p| {
+        if let Some(c) = p.db.ocon.fsuse.iter().find(|c| c.key.fstype == fstype) {
+            behavior = c.key.behavior;
+            return Some(c.context.clone());
+        }
+        let c = genfs_context(p, fstype, b"/", classmap::class::DIR);
+        behavior = if c.is_some() { fs_use::GENFS } else { fs_use::NONE };
+        c
+    });
+    (behavior, sid.unwrap_or(sid::UNLABELED))
+}
+
+/// The SID of the file `path` of the class `tclass` of the kernel in a file system of the type
+/// `fstype`, from the `genfscon` rules, as `security_genfs_sid` of Linux.
+///
+/// # Errors
+///
+/// `ENOENT` if no rule is for the file, or before the first policy load.
+pub fn genfs_sid(fstype: &str, path: &[u8], tclass: u16) -> Result<u32, Errno> {
+    ocontext_sid(|p| genfs_context(p, fstype, path, tclass)).ok_or(Errno::ENOENT)
 }
 
 /// Checks that the type of the SID `new` is the type of the SID `old` or has it in its chain of

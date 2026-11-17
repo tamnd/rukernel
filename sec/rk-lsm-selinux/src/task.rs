@@ -66,10 +66,9 @@ pub fn cred_sid(cred: &Cred) -> u32 {
     load(cred, slot::SID)
 }
 
-/// The SID of a file. The inodes have no label yet, so each file has the SID `unlabeled`, as an
-/// inode without a label on Linux.
-fn file_sid(_at: &Location) -> u32 {
-    sid::UNLABELED
+/// The SID of the file `at`, from [`crate::inode::inode_sid`].
+fn file_sid(at: &Location) -> u32 {
+    crate::inode::inode_sid(&**at.inode(), Some(at))
 }
 
 /// The fields of the file `at` in an AVC record, as `LSM_AUDIT_DATA_FILE` in

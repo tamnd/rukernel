@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_vfs::InodeRef;
 use rk_vfs::acl;
+use rk_vfs::dentry::Location;
 use rk_vfs::xattr::{XATTR_CREATE, XATTR_REPLACE};
 
 /// The longest name of an attribute, without the null byte.
@@ -18,8 +19,9 @@ const XATTR_LIST_MAX: usize = 65536;
 /// The namespaces that the kernel knows. In `system.`, only the names of the ACLs are known.
 const NAMESPACES: [&[u8]; 3] = [b"user.", b"trusted.", b"security."];
 
-/// The file of an attribute call. A file descriptor of a pipe or a socket has no inode.
-type Target = Option<InodeRef>;
+/// The file of an attribute call, with its path if it has one. A file descriptor of a pipe or a
+/// socket has no inode.
+type Target = Option<(InodeRef, Option<Location>)>;
 
 /// Finds the inode of the path at `path`. For a `change`, the mount must be writable, as
 /// `mnt_want_write` in `path_setxattr` and `path_removexattr` of Linux.
@@ -31,7 +33,7 @@ fn path_target(cx: &Cx<'_>, path: u64, follow: bool, change: bool) -> Result<Tar
     if change {
         at.mount.want_write()?;
     }
-    Ok(Some(at.inode().clone()))
+    Ok(Some((at.inode().clone(), Some(at))))
 }
 
 /// Finds the inode of the open file `fd`. For a `change`, the mount must be writable, as
@@ -41,7 +43,7 @@ fn fd_target(cx: &Cx<'_>, fd: u64, change: bool) -> Result<Target, Errno> {
     if change {
         file.want_write()?;
     }
-    Ok(file.inode().cloned())
+    Ok(file.inode().map(|i| (i.clone(), file.location().cloned())))
 }
 
 /// Reads the name of an attribute. An empty name or a name that is too long gives `ERANGE`, and
@@ -88,7 +90,7 @@ fn give(cx: &Cx<'_>, addr: u64, size: u64, data: &[u8], max: usize) -> SysResult
 }
 
 fn set(cx: &Cx<'_>, target: Target, name: Vec<u8>, value: u64, size: u64, flags: u64) -> SysResult {
-    let Some(inode) = target else {
+    let Some((inode, _)) = target else {
         return Err(Errno::EOPNOTSUPP);
     };
     rk_vfs::inode::check_fixed(&*inode)?;
@@ -116,17 +118,29 @@ fn set_args(cx: &Cx<'_>, name: u64, size: u64, flags: u64) -> Result<Vec<u8>, Er
     Ok(name)
 }
 
+/// Gives the value of the attribute `name`. A security module can give the value of an
+/// attribute of `security.`, as `xattr_getsecurity` in `vfs_getxattr` of Linux.
 fn get(cx: &Cx<'_>, target: Target, name: Vec<u8>, value: u64, size: u64) -> SysResult {
-    let Some(inode) = target else {
+    let Some((inode, at)) = target else {
         return Err(Errno::ENODATA);
     };
     check(cx, &inode, &name, false)?;
-    let data = if is_acl(&name) { acl::get(&*inode, &name)? } else { inode.get_xattr(&name)? };
+    let lsm = match name.strip_prefix(b"security.") {
+        Some(n) => rk_vfs::security::inode_getsecurity(&*inode, at.as_ref(), n),
+        None => None,
+    };
+    let data = match lsm {
+        Some(r) => r?,
+        None if is_acl(&name) => acl::get(&*inode, &name)?,
+        None => inode.get_xattr(&name)?,
+    };
     give(cx, value, size, &data, XATTR_SIZE_MAX)
 }
 
+/// Gives the names of the attributes, with the names that the security modules add, as
+/// `security_inode_listsecurity` in `vfs_listxattr` and `simple_xattr_list` of Linux.
 fn list(cx: &Cx<'_>, target: Target, addr: u64, size: u64) -> SysResult {
-    let Some(inode) = target else {
+    let Some((inode, at)) = target else {
         return Ok(0);
     };
     // Only a process with `CAP_SYS_ADMIN` sees the `trusted.` attributes.
@@ -139,11 +153,17 @@ fn list(cx: &Cx<'_>, target: Target, addr: u64, size: u64) -> SysResult {
         out.extend_from_slice(&name);
         out.push(0);
     }
+    for name in rk_vfs::security::inode_listsecurity(&*inode, at.as_ref()) {
+        if !out.split(|&c| c == 0).any(|n| n == name) {
+            out.extend_from_slice(&name);
+            out.push(0);
+        }
+    }
     give(cx, addr, size, &out, XATTR_LIST_MAX)
 }
 
 fn remove(cx: &Cx<'_>, target: Target, name: Vec<u8>) -> SysResult {
-    let Some(inode) = target else {
+    let Some((inode, _)) = target else {
         return Err(Errno::ENODATA);
     };
     rk_vfs::inode::check_fixed(&*inode)?;
