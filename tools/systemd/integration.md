@@ -21,23 +21,23 @@ python3 tools/systemd/integration.py --linux --modules /lib/modules/6.8.0-147-ge
 python3 tools/systemd/integration.py --report it-linux/*.log it-rk/*.log
 ```
 
-`--append systemd.log_level=debug` adds parameters to the command line of the kernel, and `--match-subtest` and `--match-testcase` run a part of a test. For arm64, add `--arch aarch64`, and give an arm64 tree (`tools/systemd/build.sh FILE arm64`) and an arm64 BusyBox.
+`--append systemd.log_level=debug` adds parameters to the command line of the kernel, and `--match-subtest` and `--match-testcase` run a part of a test. Each one is a bash regular expression on the path of the subtest script or on the name of the test case, for example `--match-subtest '\.(protect-control-groups|private-pids)\.sh$'`. For arm64, add `--arch aarch64`, and give an arm64 tree (`tools/systemd/build.sh FILE arm64`) and an arm64 BusyBox.
 
 Each test boots once in QEMU without KVM, with 2 CPUs and 1 GiB of memory. The test-control.sh of the image runs each subtest and each test case, and does not stop at the first failure, so one boot gives the result of each one.
 
 ## Results
 
-The runs are from 2026-11-16, with rukernel 0.5.34 and the changes of #536, and with QEMU without KVM.
+The runs of TEST-07-PID1 and TEST-19-CGROUP on rukernel are from 2026-11-17, with rukernel 0.5.36 at 66ecf91. The runs of Linux and of TEST-55-OOMD are from 2026-11-16, with rukernel 0.5.34 and the changes of #536. All runs use QEMU without KVM.
 
-- x86_64: rukernel and Linux 6.8.0-147-generic ran on server1, one machine at a time. The load average was between 0.2 and 9 during the runs of rukernel.
-- arm64: rukernel ran on server2, with a load average between 20 and 42 from other jobs. TEST-07-PID1 is from the last build. TEST-19-CGROUP and TEST-55-OOMD are from an earlier build, rukernel 0.5.30 with the earlier changes of #536. There is no arm64 run of Linux, because the arm64 reference kernel has no PSI, which TEST-55-OOMD needs, and a run of TEST-07-PID1 takes more than 3 hours on that host.
+- x86_64: rukernel and Linux 6.8.0-147-generic ran on server1, one machine at a time. On 2026-11-17, TEST-07-PID1 took 1029 s and TEST-19-CGROUP took 174 s, with a load average between 0.0 and 1.7. On 2026-11-16 the load average was between 0.2 and 9 during the runs of rukernel.
+- arm64: rukernel ran on server2, with other jobs on the host. TEST-19-CGROUP took 1045 s, with a load average between 4.5 and 13.8. A run of all of TEST-07-PID1 takes more than 90 minutes on that host, so TEST-07-PID1 ran in two parts with a time limit of 90 minutes. The first run stopped at the time limit in the subtest mask, with a load average between 13.6 and 22.6, so it gives the rows from DeferReactivation to main-PID-change. The second run, with `--match-subtest` for protect-control-groups and private-pids, took 691 s with a load average between 18.6 and 21.9. The other rows of TEST-07-PID1 are from 2026-11-16, with rukernel 0.5.34. TEST-55-OOMD is from an earlier build, rukernel 0.5.30 with the earlier changes of #536. There is no arm64 run of Linux, because the arm64 reference kernel has no PSI, which TEST-55-OOMD needs, and a run of TEST-07-PID1 takes more than 3 hours on that host.
 - #762: the x86_64 row of TEST-07-PID1 exec-context and the rows of TEST-62-RESTRICT-IFACES are from 2026-11-17, with the changes of #762. rukernel ran on server1 with a load average between 1 and 3, and Linux 6.8.0-147-generic ran TEST-62-RESTRICT-IFACES on server2 with a load average between 11 and 20. There is no arm64 run of TEST-62-RESTRICT-IFACES.
 
 ### x86_64
 
 | Test | Subtest or test case | Linux 6.8.0-147-generic | rukernel |
 | --- | --- | --- | --- |
-| TEST-07-PID1 | (all) | fail (exit-code, 1) | fail (exit-code, 1) |
+| TEST-07-PID1 | (all) | fail (exit-code, 1) | pass |
 | TEST-07-PID1 | DeferReactivation | pass | pass |
 | TEST-07-PID1 | aux-scope | pass | pass |
 | TEST-07-PID1 | exec-context | pass | pass |
@@ -107,10 +107,10 @@ The runs are from 2026-11-16, with rukernel 0.5.34 and the changes of #536, and 
 
 | Test | Subtest or test case | rukernel |
 | --- | --- | --- |
-| TEST-07-PID1 | (all) | fail (exit-code, 1) |
+| TEST-07-PID1 | (all) | no result (time limit) |
 | TEST-07-PID1 | DeferReactivation | pass |
 | TEST-07-PID1 | aux-scope | pass |
-| TEST-07-PID1 | exec-context | fail |
+| TEST-07-PID1 | exec-context | pass |
 | TEST-07-PID1 | exec-deserialization | pass |
 | TEST-07-PID1 | exec-deserialization testcase_added_after | pass |
 | TEST-07-PID1 | exec-deserialization testcase_added_before | pass |
@@ -174,11 +174,13 @@ The runs are from 2026-11-16, with rukernel 0.5.34 and the changes of #536, and 
 
 ### Differences and exceptions
 
-- TEST-07-PID1 exec-context failed on rukernel before #762 at `SocketBindAllow=` and `SocketBindDeny=`. The verifier of rukernel stopped the BPF program `sd_bind4` of systemd at the limit of 1000000 instructions, so systemd turned off `bpf-socket-bind`, and `ncat` ran until `timeout` stopped it with 124. With the state pruning of the verifier (#769), the verifier processes 39829 instructions of `sd_bind4`, and exec-context passes on x86_64. The arm64 row is from before that change. This subtest does not use `RestrictNetworkInterfaces=`.
+- TEST-07-PID1 exec-context failed on rukernel before #762 at `SocketBindAllow=` and `SocketBindDeny=`. The verifier of rukernel stopped the BPF program `sd_bind4` of systemd at the limit of 1000000 instructions, so systemd turned off `bpf-socket-bind`, and `ncat` ran until `timeout` stopped it with 124. With the state pruning of the verifier (#769), the verifier processes 39829 instructions of `sd_bind4`, and exec-context passes on x86_64 and arm64. This subtest does not use `RestrictNetworkInterfaces=`.
 - TEST-62-RESTRICT-IFACES runs ping in units with `RestrictNetworkInterfaces=`. On rukernel it needs three changes of #762: `mmap` of the `BPF_F_MMAPABLE` array map that holds the `.rodata` of `restrict_ifaces_bpf`, `BPF_LINK_CREATE` with an `O_PATH` descriptor of the cgroup, and `ifindex` in the `struct __sk_buff` of the packet programs.
 - TEST-07-PID1 exec-deserialization and DeferReactivation depend on the time between two jobs. Under TCG they fail on some runs of both kernels. In these runs Linux failed testcase_removal and testcase_swapped, and rukernel passed them.
 - TEST-07-PID1 private-pids is skipped on both kernels.
+- TEST-07-PID1 (all) on x86_64 passed on rukernel in the run of 2026-11-17. Linux failed it because exec-deserialization failed. A run with `--match-subtest` or `--match-testcase` gives the result of (all) for the subtests that ran.
+- After the test makes /testok, it runs `systemctl --no-block exit 123`. The stop of the system can stop the service of the test with SIGTERM before the service exits, so integration.py counts a test that made /testok and stopped with SIGTERM as a pass.
 - TEST-07-PID1 type-exec-parallel failed on arm64 with "Failed to start transient service unit: Connection timed out" from `systemd-run`. The test starts 20 services at the same time, and the D-Bus call took more than its time limit at a load of 40. It passes on x86_64.
 - TEST-55-OOMD testcase_basic_system failed in the first x86_64 run of rukernel. At that time other jobs used all the memory of the host except 100 MB, and systemd-journald stopped with a watchdog error. The table has the second run, where it passed.
-- TEST-55-OOMD testcase_preference_avoid and the other cases that wait for a kill by systemd-oomd need memory pressure from reclaim. rukernel has no reclaim of anonymous memory and no swap, so `pgscan` stays 0 and systemd-oomd does not kill. This is #752.
+- TEST-55-OOMD testcase_preference_avoid and the other cases that wait for a kill by systemd-oomd need memory pressure from reclaim. rukernel has no reclaim of anonymous memory to swap, so systemd-oomd does not kill. TEST-55-OOMD waits for #752 item 3, so it is blocked, and this file has no new run of it.
 - An arm64 run of an earlier build stopped once at `systemctl daemon-reload` in TEST-07-PID1 and once in TEST-55-OOMD. Two debug runs and the last run of TEST-07-PID1 did not stop there.
