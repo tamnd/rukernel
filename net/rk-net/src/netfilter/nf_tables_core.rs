@@ -27,6 +27,7 @@ use super::{
 };
 use crate::buf::NetBuf;
 use crate::consts::IFNAMSIZ;
+use crate::ether::HLEN;
 use crate::netfilter::nf_conntrack::{IP_CT_DIR_ORIGINAL, IP_CT_DIR_REPLY, IP_CT_IS_REPLY};
 use crate::netfilter::nf_nat::{
     NF_NAT_MANIP_DST, NF_NAT_MANIP_SRC, NF_NAT_RANGE_MAP_IPS, NF_NAT_RANGE_MASK,
@@ -1685,6 +1686,36 @@ impl NftRegs {
     }
 }
 
+/// The most bytes that a `payload` expression loads, `NFT_DATA_VALUE_MAXLEN` of Linux.
+const VLAN_PAYLOAD_MAX: usize = NFT_DATA_VALUE_MAXLEN as usize;
+
+/// The bytes of the link header of `skb` at `offset`, with the tag of `skb.vlan` in the
+/// link header again after the link addresses, as `nft_payload_copy_vlan` of Linux. Gives the
+/// bytes and their number, or `None` when the frame is too short.
+fn payload_vlan(
+    skb: &NetBuf,
+    offset: usize,
+    len: usize,
+) -> Option<([u8; VLAN_PAYLOAD_MAX], usize)> {
+    let (proto, tci) = skb.vlan?;
+    let m = skb.mac_data().filter(|m| m.len() >= HLEN)?;
+    let mut head = [0u8; HLEN + 4];
+    head[..12].copy_from_slice(&m[..12]);
+    head[12..14].copy_from_slice(&proto.to_be_bytes());
+    head[14..16].copy_from_slice(&tci.to_be_bytes());
+    head[16..].copy_from_slice(&skb.protocol.to_be_bytes());
+    let rest = &m[HLEN..];
+    if len > VLAN_PAYLOAD_MAX || offset + len > head.len() + rest.len() {
+        return None;
+    }
+    let mut v = [0u8; VLAN_PAYLOAD_MAX];
+    for (i, b) in v[..len].iter_mut().enumerate() {
+        let at = offset + i;
+        *b = if at < head.len() { head[at] } else { rest[at - head.len()] };
+    }
+    Some((v, len))
+}
+
 /// Runs the stateful expressions of the element that a `lookup` or a `dynset` found, after
 /// the verdict that it gave, as `nft_set_elem_update_expr` of Linux. An expression that ends
 /// the rule changes the verdict.
@@ -1759,6 +1790,16 @@ fn nft_eval(
                 };
                 if !ok {
                     regs.verdict = NFT_BREAK;
+                }
+            }
+            // A frame with its tag out of the frame (`NetBuf::vlan`) has the tag in the link
+            // header again for the bytes from the link type on, as `nft_payload_copy_vlan`.
+            NftExpr::Payload { base: NFT_PAYLOAD_LL_HEADER, offset, len, dreg }
+                if skb.vlan.is_some() && offset + len > 12 =>
+            {
+                match payload_vlan(skb, *offset, *len) {
+                    Some((v, n)) => regs.store(*dreg, &v[..n]),
+                    None => regs.verdict = NFT_BREAK,
                 }
             }
             NftExpr::Payload { base, offset, len, dreg } => {
@@ -2697,5 +2738,26 @@ mod tests {
         want[..6].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0x22, 0x22]);
         want[15] = 9;
         assert_eq!((r6.min_addr, r6.max_addr), (want, want));
+    }
+
+    #[test]
+    fn the_link_header_has_the_tag_that_the_frame_lost() {
+        // A frame of 802.1ad with the ID 123, after `skb_vlan_untag`: the link header has the
+        // type of the IP header, and the tag is in `vlan`.
+        let mut f = NetBuf::from_slice(&[
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x08, 0x00, 0x45, 0, 0, 20,
+        ]);
+        let _ = f.pull(HLEN);
+        f.set_mac_header(HLEN);
+        f.protocol = 0x0800;
+        f.vlan = Some((0x88a8, 123));
+        let at = |o, l| payload_vlan(&f, o, l).map(|(v, n)| v[..n].to_vec());
+        assert_eq!(at(6, 6), Some(vec![7, 8, 9, 10, 11, 12]));
+        assert_eq!(at(12, 2), Some(vec![0x88, 0xa8]));
+        assert_eq!(at(14, 2), Some(vec![0, 123]));
+        assert_eq!(at(16, 2), Some(vec![0x08, 0x00]));
+        assert_eq!(at(16, 4), Some(vec![0x08, 0x00, 0x45, 0]));
+        assert_eq!(at(18, 4), Some(vec![0x45, 0, 0, 20]));
+        assert_eq!(at(20, 4), None);
     }
 }

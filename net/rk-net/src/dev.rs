@@ -109,6 +109,12 @@ pub trait NetDriver: Send + Sync {
         None
     }
 
+    /// The lower device of a device that sends on another device, as a VLAN device, for
+    /// `IFLA_LINK`, as the `ndo_get_iflink` of Linux.
+    fn lower(&self) -> Option<Arc<NetDevice>> {
+        None
+    }
+
     /// The files that the driver adds to the directory of the device in sysfs, with their
     /// text, as the `sysfs_groups` that a driver of Linux gives to its device.
     fn sysfs_files(&self) -> Vec<(&'static str, String)> {
@@ -374,6 +380,8 @@ pub struct NetDevice {
 pub const NET_ADDR_PERM: u8 = 0;
 /// The driver made a random address, as `NET_ADDR_RANDOM`.
 pub const NET_ADDR_RANDOM: u8 = 1;
+/// The address is the one of another device, as `NET_ADDR_STOLEN` of a VLAN device of Linux.
+pub const NET_ADDR_STOLEN: u8 = 2;
 /// A process set the address, as `NET_ADDR_SET`.
 pub const NET_ADDR_SET: u8 = 3;
 
@@ -524,6 +532,11 @@ impl NetDevice {
     /// The other end of a pair of devices.
     pub fn peer(&self) -> Option<Arc<NetDevice>> {
         self.driver.peer()
+    }
+
+    /// The lower device of a VLAN device.
+    pub fn lower(&self) -> Option<Arc<NetDevice>> {
+        self.driver.lower()
     }
 
     /// The driver.
@@ -848,7 +861,16 @@ impl NetDevice {
             add(&self.counters.tx_dropped, 1);
             return Err(Errno::ENETDOWN);
         }
-        if frame.len() < HLEN || frame.len() - HLEN > self.mtu() as usize {
+        // A frame with a VLAN tag can be longer than the MTU by the tag, as the
+        // `hard_header_len` of a VLAN device of Linux.
+        let tag = if frame.len() >= HLEN
+            && crate::vlan::is_vlan_proto(u16::from_be_bytes([frame.data()[12], frame.data()[13]]))
+        {
+            crate::vlan::VLAN_HLEN
+        } else {
+            0
+        };
+        if frame.len() < HLEN || frame.len() - HLEN > self.mtu() as usize + tag {
             add(&self.counters.tx_dropped, 1);
             return Err(Errno::EMSGSIZE);
         }
@@ -896,6 +918,21 @@ impl NetDevice {
                 Err(e)
             }
         }
+    }
+
+    /// Counts a frame that a VLAN device receives from its lower device, with the interface
+    /// index set, and gives it, as `vlan_do_receive` of Linux. Gives `None` if the device is
+    /// down.
+    pub fn received(&self, mut frame: NetBuf) -> Option<NetBuf> {
+        if !self.is_up() {
+            add(&self.counters.rx_dropped, 1);
+            return None;
+        }
+        add(&self.counters.rx_packets, 1);
+        add(&self.counters.rx_bytes, frame.len());
+        frame.ifindex = self.ifindex();
+        crate::packet::tap(self, &frame, crate::packet::Direction::In);
+        Some(frame)
     }
 
     /// Takes at most `budget` received frames from the driver and gives each to `deliver`, with
@@ -1058,6 +1095,8 @@ pub fn unregister(dev: &Arc<NetDevice>) {
     if let Some(peer) = dev.peer() {
         unregister(&peer);
     }
+    // The VLAN devices of the device go too.
+    crate::vlan::unregistered(dev);
 }
 
 /// Moves a device to the namespace `to`, as `__dev_change_net_namespace` of Linux. The device

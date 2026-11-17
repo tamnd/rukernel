@@ -48,6 +48,9 @@ pub struct NetBuf {
     pub pkt_type: u8,
     /// The start of the link header in `area`, as `skb->mac_header` of Linux, or `None`.
     mac: Option<usize>,
+    /// The VLAN tag that the receive path took out of the frame: its protocol and its TCI, as
+    /// `skb->vlan_proto` and `skb->vlan_tci` of Linux.
+    pub vlan: Option<(u16, u16)>,
 }
 
 impl NetBuf {
@@ -69,6 +72,7 @@ impl NetBuf {
             priority: 0,
             pkt_type: 0,
             mac: None,
+            vlan: None,
         }
     }
 
@@ -87,6 +91,7 @@ impl NetBuf {
             priority: 0,
             pkt_type: 0,
             mac: None,
+            vlan: None,
         }
     }
 
@@ -105,6 +110,7 @@ impl NetBuf {
             priority: 0,
             pkt_type: 0,
             mac: None,
+            vlan: None,
         }
     }
 
