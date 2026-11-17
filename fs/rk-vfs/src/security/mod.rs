@@ -598,6 +598,23 @@ pub fn inode_getattr(at: &Location) -> Result<()> {
     call_int_hook!(inode_getattr, at)
 }
 
+/// `security_inode_getsecurity`: the value of the attribute `security.NAME` of `inode` from
+/// the first module that has it, or `None` if the file system gives it, as `xattr_getsecurity`
+/// of Linux.
+pub fn inode_getsecurity(
+    inode: &dyn Inode,
+    at: Option<&Location>,
+    name: &[u8],
+) -> Option<Result<Vec<u8>>> {
+    modules().iter().find_map(|m| m.info.hooks.inode_getsecurity(inode, at, name))
+}
+
+/// `security_inode_listsecurity`: the names of the attributes that the modules add to the list
+/// of `listxattr` for `inode`.
+pub fn inode_listsecurity(inode: &dyn Inode, at: Option<&Location>) -> Vec<Vec<u8>> {
+    modules().iter().flat_map(|m| m.info.hooks.inode_listsecurity(inode, at)).collect()
+}
+
 /// The arguments of `mount(2)` for the `sb_mount` hook, as `security_sb_mount` of Linux gives
 /// them.
 pub struct MountReq<'a> {

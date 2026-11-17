@@ -566,6 +566,11 @@ impl Mount {
         self.source.lock().clone()
     }
 
+    /// The name of the type of the file system, as `s_type->name` of the super block of Linux.
+    pub fn fstype(&self) -> &'static str {
+        self.source.lock().fstype
+    }
+
     /// The flags: `MS_RDONLY`, `MS_NOATIME` and the others.
     pub fn flags(&self) -> u64 {
         self.source.lock().flags
