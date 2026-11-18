@@ -29,13 +29,14 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::in6::{
-    IPV6_ADDRFORM, IPV6_FREEBIND, IPV6_MTU_DISCOVER, IPV6_RECVERR, IPV6_RECVHOPLIMIT,
-    IPV6_RECVPKTINFO, IPV6_RECVTCLASS, IPV6_TCLASS, IPV6_UNICAST_HOPS, IPV6_V6ONLY,
+    IPV6_2292PKTOPTIONS, IPV6_ADDRFORM, IPV6_FREEBIND, IPV6_HOPLIMIT, IPV6_MTU_DISCOVER,
+    IPV6_PKTINFO, IPV6_RECVERR, IPV6_RECVHOPLIMIT, IPV6_RECVPKTINFO, IPV6_RECVTCLASS, IPV6_TCLASS,
+    IPV6_UNICAST_HOPS, IPV6_V6ONLY,
 };
 use rk_abi::native::inet::{
     IP_ADD_MEMBERSHIP, IP_BIND_ADDRESS_NO_PORT, IP_DROP_MEMBERSHIP, IP_FREEBIND, IP_MTU_DISCOVER,
-    IP_PKTINFO, IP_RECVERR, IP_RECVTOS, IP_RECVTTL, IP_TOS, IP_TTL, IP_UNICAST_IF, IPPROTO_IP,
-    IPPROTO_IPV6, IPPROTO_TCP,
+    IP_PKTINFO, IP_PKTOPTIONS, IP_RECVERR, IP_RECVTOS, IP_RECVTTL, IP_TOS, IP_TTL, IP_UNICAST_IF,
+    IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP,
 };
 use rk_abi::native::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
@@ -121,6 +122,61 @@ fn int(v: i32) -> Vec<u8> {
 fn int_of(value: &[u8]) -> Result<i32> {
     let Some(v) = value.first_chunk::<4>() else { return Err(Errno::EINVAL) };
     Ok(i32::from_ne_bytes(*v))
+}
+
+/// Adds a control message to `out`, as `put_cmsg` of Linux: `struct cmsghdr`, the data, and
+/// the padding to 8 bytes.
+fn put_cmsg(out: &mut Vec<u8>, level: u32, kind: u32, data: &[u8]) {
+    let len = 16 + data.len();
+    out.extend_from_slice(&(len as u64).to_ne_bytes());
+    out.extend_from_slice(&level.to_ne_bytes());
+    out.extend_from_slice(&kind.to_ne_bytes());
+    out.extend_from_slice(data);
+    out.resize(out.len().next_multiple_of(8), 0);
+}
+
+/// What a connection keeps of its SYN for `IP_PKTOPTIONS` and `IPV6_2292PKTOPTIONS`. These are
+/// `mc_index` and `mc_ttl` of Linux, which `tcp_v4_syn_recv_sock` sets, and `mcast_oif`,
+/// `mcast_hops` and `rcv_flowinfo`, which `tcp_v6_syn_recv_sock` sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SynInfo {
+    /// The interface of the SYN, `inet_iif` of Linux.
+    ifindex: u32,
+    /// The TTL or the hop limit of the SYN.
+    hops: u8,
+    /// The traffic class of the SYN, for IPv6.
+    tclass: u8,
+}
+
+impl SynInfo {
+    /// The values of a socket that is not from `accept`: no interface, and the TTL 1, which is
+    /// the default of `mc_ttl` and `mcast_hops` of Linux.
+    const NONE: SynInfo = SynInfo { ifindex: 0, hops: 1, tclass: 0 };
+
+    /// The values of the SYN in the IP packet `packet`, which came in on `ifindex`.
+    fn of(packet: &[u8], ifindex: u32) -> SynInfo {
+        let byte = |i: usize| packet.get(i).copied().unwrap_or(0);
+        if byte(0) >> 4 == 6 {
+            SynInfo { ifindex, hops: byte(7), tclass: (byte(0) << 4) | (byte(1) >> 4) }
+        } else {
+            SynInfo { ifindex, hops: byte(8), tclass: 0 }
+        }
+    }
+}
+
+/// The interface of a segment to `dst` that came in on `ifindex`, for `SynInfo`. `dif` is 0
+/// for the loopback device. A segment on the loopback device to a local address gives the
+/// device of the address, as `inet_iif` and `tcp_v6_iif` of Linux: the `rt_iif` of the route
+/// of the sender, or the device of `rt6i_idev`.
+fn syn_iif(dst: &Ip, dif: u32, ifindex: u32) -> u32 {
+    if dif != 0 {
+        return ifindex;
+    }
+    let local = match ip::v4(dst) {
+        Some(a) => stack::ROUTES.lock().local_dev(a),
+        None => stack6::ROUTES6.lock().local_dev(dst),
+    };
+    local.unwrap_or(ifindex)
 }
 
 /// The phase of the socket for `connect`, `sock->state` of Linux.
@@ -212,6 +268,8 @@ struct Inner {
     cgroup: u32,
     /// The state at the last `collect`, for the counters of /proc/net/snmp.
     counted: State,
+    /// The values of the SYN of a connection from `accept`.
+    syn: SynInfo,
 }
 
 impl Inner {
@@ -257,6 +315,7 @@ impl Inner {
             uid: rk_vfs::cred::current().fsuid,
             cgroup: rk_net::filter::sock_cgroup_current(),
             counted: State::Closed,
+            syn: SynInfo::NONE,
         }
     }
 
@@ -277,6 +336,46 @@ impl Inner {
         } else {
             self.ip_flags.remove(&(level, name));
         }
+    }
+
+    /// The control messages of `IP_PKTOPTIONS`, as `do_ip_getsockopt` of Linux: `IP_PKTINFO`
+    /// with the interface of the SYN and the local address, and `IP_TTL` with the TTL of the
+    /// SYN, for the flags that are set. systemd-resolved takes the interface of a TCP
+    /// connection from it.
+    fn pktoptions(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.ip_flag(IPPROTO_IP, IP_PKTINFO) != 0 {
+            // `struct in_pktinfo`: the interface, `ipi_spec_dst` and the address.
+            let a = ip::v4(&self.local).unwrap_or(ipv4::ANY);
+            let info = [&self.syn.ifindex.to_ne_bytes()[..], &a, &a].concat();
+            put_cmsg(&mut out, IPPROTO_IP, IP_PKTINFO, &info);
+        }
+        if self.ip_flag(IPPROTO_IP, IP_RECVTTL) != 0 {
+            put_cmsg(&mut out, IPPROTO_IP, IP_TTL, &int(i32::from(self.syn.hops)));
+        }
+        out
+    }
+
+    /// The control messages of `IPV6_2292PKTOPTIONS`, as `do_ipv6_getsockopt` of Linux when the
+    /// socket keeps no packet: `IPV6_PKTINFO` with the interface of the SYN, `IPV6_HOPLIMIT`
+    /// and `IPV6_TCLASS`, for the flags that are set. As in Linux, the address of
+    /// `IPV6_PKTINFO` is the address of the peer, or `::` without an interface.
+    fn pktoptions6(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.ip_flag(IPPROTO_IPV6, IPV6_RECVPKTINFO) != 0 {
+            // `struct in6_pktinfo`: the address and the interface.
+            let peer = self.remote.map_or(ip::ANY, |(a, _)| a);
+            let a = if self.syn.ifindex != 0 { peer } else { ip::ANY };
+            let info = [&a[..], &self.syn.ifindex.to_ne_bytes()].concat();
+            put_cmsg(&mut out, IPPROTO_IPV6, IPV6_PKTINFO, &info);
+        }
+        if self.ip_flag(IPPROTO_IPV6, IPV6_RECVHOPLIMIT) != 0 {
+            put_cmsg(&mut out, IPPROTO_IPV6, IPV6_HOPLIMIT, &int(i32::from(self.syn.hops)));
+        }
+        if self.ip_flag(IPPROTO_IPV6, IPV6_RECVTCLASS) != 0 {
+            put_cmsg(&mut out, IPPROTO_IPV6, IPV6_TCLASS, &int(i32::from(self.syn.tclass)));
+        }
+        out
     }
 
     fn reuse(&self) -> bool {
@@ -494,7 +593,8 @@ pub(crate) fn input(
         if !rk_net::filter::cgroup_skb_ingress(l.cgroup(), ifindex, packet) {
             return;
         }
-        if l.syn(&key, &seg) {
+        let info = SynInfo::of(packet, syn_iif(&dst, dif, ifindex));
+        if l.syn(&key, &seg, info) {
             return;
         }
     }
@@ -771,7 +871,7 @@ impl Stream {
 
     /// Takes a SYN on a listening socket, as `tcp_conn_request` of Linux. Gives `false` if the
     /// segment needs an RST.
-    fn syn(&self, key: &Key, seg: &Seg) -> bool {
+    fn syn(&self, key: &Key, seg: &Seg, info: SynInfo) -> bool {
         if seg.has(RST) {
             return true;
         }
@@ -824,6 +924,7 @@ impl Stream {
             c.algo = s.algo;
             c.uid = s.uid;
             c.cgroup = s.cgroup;
+            c.syn = info;
             c.conn = Some(Conn::accept(&c.config(&remote), seg, now));
             c.tune(now);
             (Stream::with(c), s.reuse(), s.v6only)
@@ -1423,6 +1524,7 @@ impl Socket for Stream {
                 IP_BIND_ADDRESS_NO_PORT => int(i32::from(s.bind_no_port)),
                 // `do_ip_getsockopt` gives the index in the byte order of the network.
                 IP_UNICAST_IF => s.uc_index.to_be_bytes().to_vec(),
+                IP_PKTOPTIONS => s.pktoptions(),
                 _ if name == IP_MTU_DISCOVER || is_ip_flag(level, name) => {
                     int(s.ip_flag(level, name))
                 }
@@ -1432,6 +1534,7 @@ impl Socket for Stream {
                 IPV6_V6ONLY => int(i32::from(s.v6only)),
                 IPV6_UNICAST_HOPS => int(i32::from(s.hops.unwrap_or(ipv6::DEFAULT_HOPS))),
                 IPV6_TCLASS => int(i32::from(s.tclass)),
+                IPV6_2292PKTOPTIONS => s.pktoptions6(),
                 _ if name == IPV6_MTU_DISCOVER || is_ip_flag(level, name) => {
                     int(s.ip_flag(level, name))
                 }
