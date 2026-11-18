@@ -179,9 +179,9 @@ fn fill_event(
     if event != IFLA_EVENT_NONE {
         b.u32(IFLA_EVENT as u16, event);
     }
-    // The other end of a pair, as `nla_put_iflink` of Linux.
-    if let Some(peer) = dev.peer() {
-        b.u32(IFLA_LINK as u16, peer.ifindex());
+    // The other end of a pair, or the lower device, as `nla_put_iflink` of Linux.
+    if let Some(other) = dev.peer().or_else(|| dev.lower()) {
+        b.u32(IFLA_LINK as u16, other.ifindex());
     }
     b.put(IFLA_ADDRESS as u16, &dev.mac().0).put(IFLA_BROADCAST as u16, &dev.broadcast().0);
     if ext & RTEXT_FILTER_SKIP_STATS == 0 {
@@ -456,6 +456,9 @@ fn create(h: &[u8], a: &Attrs<'_>) -> Result<()> {
         };
         return configure(&dev, h, a).inspect_err(|_| dev::unregister(&dev));
     }
+    if info.str(IFLA_INFO_KIND) == Some(crate::vlan::KIND.as_bytes()) {
+        return create_vlan(h, a, &info);
+    }
     if info.str(IFLA_INFO_KIND) != Some(veth::KIND.as_bytes()) {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -481,6 +484,54 @@ fn create(h: &[u8], a: &Attrs<'_>) -> Result<()> {
     configure(&peer, peer_h, &peer_a)
         .and_then(|()| configure(&dev, h, a))
         .inspect_err(|_| dev::unregister(&dev))
+}
+
+/// Makes a VLAN device, as `vlan_validate` and `vlan_newlink` of Linux. `IFLA_LINK` is the
+/// lower device, in the current namespace. Gives `EINVAL` with no `IFLA_INFO_DATA`, no
+/// `IFLA_VLAN_ID` or no `IFLA_LINK`, `EPROTONOSUPPORT` for a protocol that is not 802.1Q or
+/// 802.1ad, `ERANGE` for an ID above 4094, `EINVAL` for flags that Linux does not know, and
+/// `ENODEV` if the lower device is not there. The new device is in the namespace of
+/// `IFLA_NET_NS_PID` or `IFLA_NET_NS_FD`, else in the current namespace.
+fn create_vlan(h: &[u8], a: &Attrs<'_>, info: &Attrs<'_>) -> Result<()> {
+    use crate::vlan::{IFLA_VLAN_FLAGS, IFLA_VLAN_ID, IFLA_VLAN_MAX, IFLA_VLAN_PROTOCOL};
+    // The flags that Linux knows: `VLAN_FLAG_REORDER_HDR`, `VLAN_FLAG_GVRP`,
+    // `VLAN_FLAG_LOOSE_BINDING`, `VLAN_FLAG_MVRP` and `VLAN_FLAG_BRIDGE_BINDING`.
+    const VLAN_FLAGS: u32 = 0x1f;
+    let mac = new_addr(a)?;
+    let data = Attrs::parse(info.get(IFLA_INFO_DATA).ok_or(Errno::EINVAL)?, IFLA_VLAN_MAX);
+    let proto = match data.get(IFLA_VLAN_PROTOCOL as u32) {
+        Some(&[x, y]) => u16::from_be_bytes([x, y]),
+        Some(_) => return Err(Errno::EINVAL),
+        None => crate::vlan::ETH_P_8021Q,
+    };
+    if !crate::vlan::is_vlan_proto(proto) {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+    let id = match data.get(IFLA_VLAN_ID as u32) {
+        Some(&[x, y]) => u16::from_ne_bytes([x, y]),
+        Some(_) => return Err(Errno::EINVAL),
+        None => return Err(Errno::EINVAL),
+    };
+    if id >= crate::vlan::VLAN_VID_MASK {
+        return Err(Errno::ERANGE);
+    }
+    if let Some(f) = data.get(IFLA_VLAN_FLAGS as u32) {
+        let f: [u8; 8] = f.try_into().map_err(|_| Errno::EINVAL)?;
+        let flags = u32::from_ne_bytes([f[0], f[1], f[2], f[3]]);
+        let mask = u32::from_ne_bytes([f[4], f[5], f[6], f[7]]);
+        if flags & mask & !VLAN_FLAGS != 0 {
+            return Err(Errno::EINVAL);
+        }
+    }
+    let link = a.u32(IFLA_LINK)?.ok_or(Errno::EINVAL)?;
+    let lower = dev::by_index(link).ok_or(Errno::ENODEV)?;
+    let dev_ns = target_ns(a)?;
+    let mtu = a.u32(IFLA_MTU)?;
+    let dev = {
+        let _in = dev_ns.as_deref().map(ns::enter);
+        crate::vlan::create(a.str(IFLA_IFNAME), &lower, proto, id, mac, mtu)?
+    };
+    configure(&dev, h, a).inspect_err(|_| dev::unregister(&dev))
 }
 
 /// The address in `IFLA_ADDRESS` of a new device, as `dummy_validate` and `veth_validate` of

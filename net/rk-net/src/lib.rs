@@ -35,6 +35,7 @@ pub mod procfs;
 pub mod sysctl;
 pub mod tun;
 pub mod veth;
+pub mod vlan;
 
 pub use options::{Options, Timeout};
 

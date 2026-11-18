@@ -980,6 +980,9 @@ pub fn receive(dev: &NetDevice, mut frame: NetBuf) {
         frame.set_mac_header(rk_net::ether::HLEN);
     }
     frame.protocol = eth.ethertype;
+    // A frame with a VLAN tag loses its tag before the hooks, as `skb_vlan_untag` in
+    // `__netif_receive_skb_core` of Linux.
+    rk_net::vlan::untag(&mut frame);
     // The type of the frame, as `eth_type_trans` of Linux.
     frame.pkt_type = if eth.dst.is_broadcast() {
         rk_net::packet::PACKET_BROADCAST
@@ -995,10 +998,25 @@ pub fn receive(dev: &NetDevice, mut frame: NetBuf) {
     if nf_hook_netdev(NF_NETDEV_INGRESS, dev, &mut frame) != NfResult::Accept {
         return;
     }
+    // A tagged frame goes to the VLAN device of its tag, as `vlan_do_receive` of Linux, with
+    // its link header again. With no VLAN device, a frame with a VLAN ID is not for this host,
+    // and a frame with the ID 0 (a tag of priority only) goes on here.
+    if let Some((proto, tci)) = frame.vlan.take() {
+        if let Some(vdev) = rk_net::vlan::find(dev, proto, tci) {
+            frame.push(rk_net::ether::HLEN);
+            if let Some(frame) = vdev.received(frame) {
+                receive(&vdev, frame);
+            }
+            return;
+        }
+        if tci & rk_net::vlan::VLAN_VID_MASK != 0 {
+            return;
+        }
+    }
     if frame.pkt_type == rk_net::packet::PACKET_OTHERHOST {
         return;
     }
-    match u32::from(eth.ethertype) {
+    match u32::from(frame.protocol) {
         ETH_P_ARP => arp_input(dev, frame.data()),
         // A frame to a link multicast or broadcast address is not `PACKET_HOST`, and the stack
         // does not forward it.
