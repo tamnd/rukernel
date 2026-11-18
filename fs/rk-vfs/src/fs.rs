@@ -109,7 +109,7 @@ impl FsContext {
     ///
     /// Gives `EACCES` if the access is not allowed.
     pub fn permission(&self, at: &Location, mask: u32) -> Result<()> {
-        self.cred.inode_permission(&**at.inode(), mask)
+        self.cred.inode_permission_at(&**at.inode(), Some(at), mask)
     }
 
     /// Checks that the process can make its current directory or its root at `at`: it must be a
@@ -122,7 +122,7 @@ impl FsContext {
         if !at.inode().metadata().is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        self.cred.inode_permission(&**at.inode(), may::EXEC)
+        self.cred.inode_permission_at(&**at.inode(), Some(at), may::EXEC)
     }
 
     /// Checks that the process can add or remove a name in the directory `dir`.
@@ -520,7 +520,7 @@ impl FsContext {
             return Err(Errno::EISDIR);
         }
         if !created {
-            self.cred.inode_permission(&**at.inode(), open_mask(flags))?;
+            self.cred.inode_permission_at(&**at.inode(), Some(&at), open_mask(flags))?;
         }
         // A mount with `MS_NODEV` does not open a device, as `may_open_dev` of Linux.
         let nodev = u64::from(rk_abi::native::mount::MS_NODEV);
@@ -998,7 +998,9 @@ fn open_mask(flags: u32) -> u32 {
         o::O_WRONLY => may::WRITE,
         _ => may::READ | may::WRITE,
     };
-    if flags & o::O_TRUNC != 0 { mask | may::WRITE } else { mask }
+    let mask = if flags & o::O_TRUNC != 0 { mask | may::WRITE } else { mask };
+    // `MAY_APPEND` of `build_open_flags` of Linux, for the LSM hook.
+    if flags & o::O_APPEND != 0 { mask | may::APPEND } else { mask }
 }
 
 fn is_type(inode: &InodeRef, kind: FileType) -> bool {

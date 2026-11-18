@@ -22,7 +22,7 @@ pub use hooks::{HOOK_COUNT, HOOK_NAMES, SecurityHooks, hook_index};
 use crate::cred::{Cred, IpcOwner};
 use crate::dentry::Location;
 use crate::file::File;
-use crate::inode::{Inode, Result};
+use crate::inode::{Inode, Result, SetAttr};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -488,8 +488,13 @@ fn d_instantiate(inode: &dyn Inode) {
 }
 
 /// `security_inode_permission`.
-pub fn inode_permission(cred: &Cred, inode: &dyn Inode, mask: u32) -> Result<()> {
-    call_int_hook!(inode_permission, cred, inode, mask)
+pub fn inode_permission(
+    cred: &Cred,
+    inode: &dyn Inode,
+    at: Option<&Location>,
+    mask: u32,
+) -> Result<()> {
+    call_int_hook!(inode_permission, cred, inode, at, mask)
 }
 
 /// `security_file_permission`.
@@ -591,6 +596,11 @@ pub fn path_chmod(at: &Location, mode: u32) -> Result<()> {
 /// `security_path_chown`.
 pub fn path_chown(at: &Location, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
     call_int_hook!(path_chown, at, uid, gid)
+}
+
+/// `security_inode_setattr`.
+pub fn inode_setattr(inode: &dyn Inode, at: Option<&Location>, attr: &SetAttr) -> Result<()> {
+    call_int_hook!(inode_setattr, inode, at, attr)
 }
 
 /// `security_inode_getattr`.

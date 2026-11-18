@@ -247,12 +247,38 @@ pub mod process2 {
     pub const NOSUID_TRANSITION: u32 = 1 << 1;
 }
 
-/// The permissions of the class `file`, `FILE__*` of Linux.
+/// The permissions of the class `file`, `FILE__*` of Linux. The permissions of the common
+/// list `file` have the same bits in each class of files, as `dir` and `chr_file`.
 pub mod file {
+    /// `ioctl`.
+    pub const IOCTL: u32 = 1 << 0;
+    /// `read`.
+    pub const READ: u32 = 1 << 1;
+    /// `write`.
+    pub const WRITE: u32 = 1 << 2;
+    /// `getattr`.
+    pub const GETATTR: u32 = 1 << 4;
+    /// `setattr`.
+    pub const SETATTR: u32 = 1 << 5;
+    /// `append`.
+    pub const APPEND: u32 = 1 << 9;
+    /// `execute`.
+    pub const EXECUTE: u32 = 1 << 14;
+    /// `audit_access`.
+    pub const AUDIT_ACCESS: u32 = 1 << 17;
+    /// `open`.
+    pub const OPEN: u32 = 1 << 18;
     /// `execute_no_trans`.
     pub const EXECUTE_NO_TRANS: u32 = 1 << 26;
     /// `entrypoint`.
     pub const ENTRYPOINT: u32 = 1 << 27;
+}
+
+/// The permissions of the class `dir` that the other classes of files do not have, `DIR__*`
+/// of Linux.
+pub mod dir {
+    /// `search`.
+    pub const SEARCH: u32 = 1 << 29;
 }
 
 /// The permissions of the class `key`, `KEY__*` of Linux.
@@ -355,6 +381,22 @@ mod tests {
         assert_eq!(bit(class::PROCESS2, "nosuid_transition"), process2::NOSUID_TRANSITION);
         assert_eq!(bit(class::FILE, "execute_no_trans"), file::EXECUTE_NO_TRANS);
         assert_eq!(bit(class::FILE, "entrypoint"), file::ENTRYPOINT);
+        for (perm, v) in [
+            ("ioctl", file::IOCTL),
+            ("read", file::READ),
+            ("write", file::WRITE),
+            ("getattr", file::GETATTR),
+            ("setattr", file::SETATTR),
+            ("append", file::APPEND),
+            ("execute", file::EXECUTE),
+            ("audit_access", file::AUDIT_ACCESS),
+            ("open", file::OPEN),
+        ] {
+            assert_eq!(bit(class::FILE, perm), v, "{perm}");
+            assert_eq!(bit(class::DIR, perm), v, "{perm}");
+            assert_eq!(bit(class::CHR_FILE, perm), v, "{perm}");
+        }
+        assert_eq!(bit(class::DIR, "search"), dir::SEARCH);
         assert_eq!(bit(class::KEY, "create"), key::CREATE);
     }
 }

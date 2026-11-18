@@ -11,7 +11,7 @@ use super::{Bprm, ExecFiles, Sock, Task};
 use crate::cred::{Cred, IpcOwner};
 use crate::dentry::Location;
 use crate::file::File;
-use crate::inode::{Inode, Result};
+use crate::inode::{Inode, Result, SetAttr};
 use alloc::vec::Vec;
 
 /// The names of the LSM hooks of Linux, in the order of include/linux/lsm_hook_defs.h.
@@ -374,8 +374,14 @@ pub trait SecurityHooks: Sync {
     fn d_instantiate(&self, inode: &dyn Inode) {}
 
     /// `inode_permission`: the access `mask` (the `MAY_*` bits) to `inode`, after the checks of
-    /// the mode and the ACL.
-    fn inode_permission(&self, cred: &Cred, inode: &dyn Inode, mask: u32) -> Result<()> {
+    /// the mode and the ACL. `at` is the path of the inode, if the caller has one.
+    fn inode_permission(
+        &self,
+        cred: &Cred,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        mask: u32,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -482,6 +488,18 @@ pub trait SecurityHooks: Sync {
     /// `path_chown`: `chown` of the file `at` to the user `uid` and the group `gid`. `None`
     /// keeps the ID.
     fn path_chown(&self, at: &Location, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        Ok(())
+    }
+
+    /// `inode_setattr`: the change `attr` of the attributes of `inode` by `chmod`, `chown` or
+    /// `utimensat`, after `path_chmod` or `path_chown`. `at` is the path of the inode, if the
+    /// caller has one. A truncate has `path_truncate` or `file_truncate`.
+    fn inode_setattr(
+        &self,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        attr: &SetAttr,
+    ) -> Result<()> {
         Ok(())
     }
 

@@ -7,7 +7,6 @@ use crate::sidtab::sid;
 use crate::{avc, server, services};
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::fmt::Write;
 use rk_abi::Errno;
 use rk_abi::native::mount::MS_NOSUID;
 use rk_vfs::cred::{Cred, cap};
@@ -71,24 +70,6 @@ fn file_sid(at: &Location) -> u32 {
     crate::inode::inode_sid(&**at.inode(), Some(at))
 }
 
-/// The fields of the file `at` in an AVC record, as `LSM_AUDIT_DATA_FILE` in
-/// `dump_common_audit_data` of Linux: ` path="/bin/sh" dev="vda" ino=12`. The device is the
-/// name of the device of the mount, or for a mount without a device the name of the type of the
-/// file system, as `s_id` of Linux.
-fn file_fields(at: &Location) -> impl FnOnce(&mut String) + '_ {
-    move |s| {
-        s.push_str(" path=");
-        avc::untrusted(s, &at.absolute_path());
-        let source = at.mount.source();
-        s.push_str(" dev=");
-        match source.source.strip_prefix(b"/dev/") {
-            Some(dev) if !dev.is_empty() => avc::untrusted(s, dev),
-            _ => avc::untrusted(s, source.fstype.as_bytes()),
-        }
-        let _ = write!(s, " ino={}", at.inode().metadata().ino);
-    }
-}
-
 /// The SID of the task after the exec of `bprm`, as `selinux_bprm_creds_for_exec` of Linux.
 /// The task gets the SID of `/proc/self/attr/exec`, or else the SID of a `type_transition`
 /// rule for the file, or else keeps its SID. The new credentials have no SID for the next exec
@@ -137,11 +118,17 @@ pub fn bprm_creds_for_exec(bprm: &mut Bprm<'_>) -> Result<()> {
             isid,
             class::FILE,
             file::EXECUTE_NO_TRANS,
-            file_fields(bprm.file),
+            crate::file::path_fields(bprm.file),
         );
     }
-    avc::has_perm(old, new, class::PROCESS, process::TRANSITION, file_fields(bprm.file))?;
-    avc::has_perm(new, isid, class::FILE, file::ENTRYPOINT, file_fields(bprm.file))?;
+    avc::has_perm(
+        old,
+        new,
+        class::PROCESS,
+        process::TRANSITION,
+        crate::file::path_fields(bprm.file),
+    )?;
+    avc::has_perm(new, isid, class::FILE, file::ENTRYPOINT, crate::file::path_fields(bprm.file))?;
     if let Some(tracer) = bprm.tracer {
         avc::has_perm(cred_sid(tracer), new, class::PROCESS, process::PTRACE, |_| {})
             .map_err(|_| Errno::EPERM)?;

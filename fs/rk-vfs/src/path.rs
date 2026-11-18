@@ -158,7 +158,7 @@ impl<'a> Walk<'a> {
         if !at.inode().metadata().is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        self.cred.inode_permission(&**at.inode(), may::EXEC)
+        self.cred.inode_permission_at(&**at.inode(), Some(at), may::EXEC)
     }
 
     /// Gives the location of `path`. A relative path starts at `start`. If `follow` is `false`, a
