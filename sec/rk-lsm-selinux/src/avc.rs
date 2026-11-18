@@ -122,18 +122,22 @@ pub fn has_perm(
     extra: impl FnOnce(&mut String),
 ) -> Result<(), Errno> {
     let (avd, rc) = has_perm_noaudit(ssid, tsid, tclass, requested);
-    audit(ssid, tsid, tclass, requested, &avd, rc, extra);
+    audit(ssid, tsid, tclass, requested, &avd, rc, 0, extra);
     rc
 }
 
 /// The permissions that make an audit record and the denied permissions, as
-/// `avc_audit_required` of Linux.
-fn audit_required(requested: u32, avd: &AvDecision, failed: bool) -> (u32, u32) {
+/// `avc_audit_required` of Linux. A denial makes no record if `auditdeny` has a permission
+/// that the policy does not audit, as `audit_access` for `access(2)`.
+fn audit_required(requested: u32, avd: &AvDecision, failed: bool, auditdeny: u32) -> (u32, u32) {
     if avd.flags & NEVERAUDIT != 0 {
         return (0, 0);
     }
     let denied = requested & !avd.allowed;
     if denied != 0 {
+        if auditdeny != 0 && auditdeny & avd.auditdeny == 0 {
+            return (0, denied);
+        }
         (denied & avd.auditdeny, denied)
     } else if failed {
         (requested, requested)
@@ -142,7 +146,9 @@ fn audit_required(requested: u32, avd: &AvDecision, failed: bool) -> (u32, u32) 
     }
 }
 
-/// Makes the audit record of a check, as `avc_audit` of Linux.
+/// Makes the audit record of a check, as `avc_audit` of Linux. `auditdeny` is as in
+/// `avc_audit_required`, 0 for most checks.
+#[allow(clippy::too_many_arguments)]
 pub fn audit(
     ssid: u32,
     tsid: u32,
@@ -150,9 +156,10 @@ pub fn audit(
     requested: u32,
     avd: &AvDecision,
     rc: Result<(), Errno>,
+    auditdeny: u32,
     extra: impl FnOnce(&mut String),
 ) {
-    let (audited, denied) = audit_required(requested, avd, rc.is_err());
+    let (audited, denied) = audit_required(requested, avd, rc.is_err(), auditdeny);
     if audited == 0 || tclass == 0 || usize::from(tclass) > CLASSES.len() {
         return;
     }
@@ -268,11 +275,14 @@ mod tests {
         avd.allowed = 1;
         avd.auditallow = 1;
         avd.auditdeny = !4;
-        assert_eq!(audit_required(1, &avd, false), (1, 0));
-        assert_eq!(audit_required(1, &avd, true), (1, 1));
-        assert_eq!(audit_required(6, &avd, false), (2, 6));
+        assert_eq!(audit_required(1, &avd, false, 0), (1, 0));
+        assert_eq!(audit_required(1, &avd, true, 0), (1, 1));
+        assert_eq!(audit_required(6, &avd, false, 0), (2, 6));
+        // A permission of `auditdeny` that the policy does not audit stops the record.
+        assert_eq!(audit_required(6, &avd, false, 4), (0, 6));
+        assert_eq!(audit_required(6, &avd, false, 2), (2, 6));
         avd.flags = NEVERAUDIT;
-        assert_eq!(audit_required(6, &avd, false), (0, 0));
+        assert_eq!(audit_required(6, &avd, false, 0), (0, 0));
         let mut s = String::new();
         untrusted(&mut s, b"a b");
         assert_eq!(s, "612062");

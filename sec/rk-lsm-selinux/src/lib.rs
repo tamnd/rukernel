@@ -6,8 +6,9 @@
 //! ([`selinuxfs`]), the read of the binary policy ([`policydb`]) with its bitmaps
 //! ([`ebitmap`]) and its rules ([`avtab`]), the security server ([`server`] and [`services`])
 //! with its table of SIDs ([`sidtab`]), the text of the contexts ([`context`]), the classes of
-//! the kernel ([`classmap`]), the access vector cache ([`avc`]), and the SIDs of the tasks with
-//! their change at an exec and their attributes in `/proc/PID/attr` ([`task`]).
+//! the kernel ([`classmap`]), the access vector cache ([`avc`]), the SIDs of the tasks with
+//! their change at an exec and their attributes in `/proc/PID/attr` ([`task`]), the labels of
+//! the files ([`inode`]), and the checks of the access to the files ([`file`]).
 //!
 //! The module is active when the command line has `selinux=1`, when `lsm=` names it, or with
 //! `security=selinux`. With `selinux=0` it is not active. The module starts in permissive
@@ -26,6 +27,7 @@ pub mod avtab;
 pub mod classmap;
 pub mod context;
 pub mod ebitmap;
+pub mod file;
 pub mod inode;
 pub mod policydb;
 pub mod selinuxfs;
@@ -40,8 +42,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use rk_frame::sync::SpinLock;
+use rk_vfs::cred::Cred;
 use rk_vfs::dentry::Location;
-use rk_vfs::inode::{Inode, Result};
+use rk_vfs::file::File;
+use rk_vfs::inode::{Inode, Result, SetAttr};
 use rk_vfs::security::blob::Blob;
 use rk_vfs::security::{
     BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks, Task,
@@ -87,6 +91,41 @@ impl SecurityHooks for SeLinux {
 
     fn inode_listsecurity(&self, inode: &dyn Inode, at: Option<&Location>) -> Vec<Vec<u8>> {
         inode::listsecurity(inode, at)
+    }
+
+    fn inode_permission(
+        &self,
+        cred: &Cred,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        mask: u32,
+    ) -> Result<()> {
+        file::inode_permission(cred, inode, at, mask)
+    }
+
+    fn file_open(&self, f: &File, cred: &Cred, flags: u32) -> Result<()> {
+        file::file_open(f, cred, flags)
+    }
+
+    fn inode_getattr(&self, at: &Location) -> Result<()> {
+        file::inode_getattr(at)
+    }
+
+    fn inode_setattr(
+        &self,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        attr: &SetAttr,
+    ) -> Result<()> {
+        file::inode_setattr(inode, at, attr)
+    }
+
+    fn path_truncate(&self, at: &Location) -> Result<()> {
+        file::path_truncate(at)
+    }
+
+    fn file_truncate(&self, f: &File) -> Result<()> {
+        file::file_truncate(f)
     }
 }
 

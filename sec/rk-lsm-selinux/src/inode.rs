@@ -162,14 +162,21 @@ pub fn alloc_security(blob: &Blob) {
 /// label from the policy here, which needs `at` for most file systems. Before the first policy
 /// load, and for a file without a known label, the SID is `unlabeled`.
 pub fn inode_sid(inode: &dyn Inode, at: Option<&Location>) -> u32 {
+    inode_label(inode, at).0
+}
+
+/// The SID and the class of the file `inode`, as [`inode_sid`]. A file without a label has the
+/// class of its mode.
+pub fn inode_label(inode: &dyn Inode, at: Option<&Location>) -> (u32, u16) {
+    let unlabeled = || (sid::UNLABELED, mode_to_class(inode.metadata().mode));
     if !crate::initialized() {
-        return sid::UNLABELED;
+        return unlabeled();
     }
     let part = inode_offset().zip(rk_vfs::security::blob::inode_blob(inode));
     if let Some((off, blob)) = &part
         && blob.load(off + slot::STATE) == 1
     {
-        return blob.load(off + slot::SID) as u32;
+        return (blob.load(off + slot::SID) as u32, blob.load(off + slot::SCLASS) as u16);
     }
     let task_sid =
         part.as_ref().map_or(sid::KERNEL, |(off, b)| match b.load(off + slot::TASK_SID) {
@@ -177,14 +184,14 @@ pub fn inode_sid(inode: &dyn Inode, at: Option<&Location>) -> u32 {
             s => s as u32,
         });
     let Some((sid, sclass)) = at.and_then(|at| label(inode, at, task_sid)) else {
-        return sid::UNLABELED;
+        return unlabeled();
     };
     if let Some((off, blob)) = &part {
         blob.store(off + slot::SID, u64::from(sid));
         blob.store(off + slot::SCLASS, u64::from(sclass));
         blob.store(off + slot::STATE, 1);
     }
-    sid
+    (sid, sclass)
 }
 
 /// The value of the attribute `security.` + `name` of `inode`, as `selinux_inode_getsecurity`

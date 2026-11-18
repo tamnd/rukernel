@@ -1687,9 +1687,11 @@ fn change_attr(
     if attr.mode.is_some() && meta.file_type() == Some(rk_vfs::inode::FileType::Symlink) {
         return Err(Errno::EOPNOTSUPP);
     }
+    // As `security_inode_setattr` in `notify_change` of Linux.
+    rk_vfs::security::inode_setattr(&**inode, at, attr)?;
     let cred = cx.process().cred();
     if change == Change::Touch && !cred.owns(&meta) {
-        cred.inode_permission(&**inode, rk_vfs::cred::may::WRITE)?;
+        cred.inode_permission_at(&**inode, at, rk_vfs::cred::may::WRITE)?;
     }
     let mut attr = *attr;
     cred.setattr_prepare(&meta, &mut attr)?;
@@ -1867,7 +1869,10 @@ pub(crate) fn faccessat(cx: &Cx<'_>, dirfd: u64, path: u64, mode: u64, flags: u6
     let cred = cx.process().cred();
     let cred = if flags & AT_EACCESS as u32 == 0 { cred.for_access() } else { (*cred).clone() };
     match inode {
-        Some(inode) => cred.inode_permission(&*inode, mode as u32)?,
+        // `MAY_ACCESS` tells the LSM that the check is from `access`, as `do_faccessat` of Linux.
+        Some(inode) => {
+            cred.inode_permission_at(&*inode, at.as_ref(), mode as u32 | rk_vfs::cred::may::ACCESS)?
+        }
         None => cred.permission(&meta, mode as u32)?,
     }
     // SuS v2 wants `EROFS` for a read only mount too, as `do_faccessat` of Linux.

@@ -184,6 +184,12 @@ pub mod may {
     pub const WRITE: u32 = 2;
     /// Read.
     pub const READ: u32 = 4;
+    /// Write at the end of the file only, with `O_APPEND`. Only the LSM hook gets it.
+    pub const APPEND: u32 = 8;
+    /// The check of `access` and `faccessat`. Only the LSM hook gets it.
+    pub const ACCESS: u32 = 0x10;
+    /// The bits of the check of the mode and the ACL.
+    pub const RWX: u32 = EXEC | WRITE | READ;
 }
 
 /// The owner, the creator and the mode of a System V IPC object, as `struct kern_ipc_perm` of
@@ -376,6 +382,24 @@ impl Cred {
     /// cgroup refuses the access to a device file, and `EIO` for a damaged ACL. The file system
     /// can give another error.
     pub fn inode_permission(&self, inode: &dyn Inode, mask: u32) -> Result<()> {
+        self.inode_permission_at(inode, None, mask)
+    }
+
+    /// Checks the access `mask` to `inode`, as [`Cred::inode_permission`]. `at` is the path of
+    /// the inode for the LSM hook, if the caller has one. The bits [`may::APPEND`] and
+    /// [`may::ACCESS`] go only to the LSM hook.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Cred::inode_permission`].
+    pub fn inode_permission_at(
+        &self,
+        inode: &dyn Inode,
+        at: Option<&crate::dentry::Location>,
+        mask: u32,
+    ) -> Result<()> {
+        let full = mask;
+        let mask = mask & may::RWX;
         let meta = inode.metadata();
         match inode.permission(self, mask) {
             Some(r) => r?,
@@ -391,7 +415,7 @@ impl Cred {
                 mask,
             )?;
         }
-        crate::security::inode_permission(self, inode, mask)
+        crate::security::inode_permission(self, inode, at, full)
     }
 
     /// The check of [`Cred::permission`]. `acl` gives the access ACL. The ACL applies only to

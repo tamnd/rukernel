@@ -16825,6 +16825,12 @@ static int sel_xact(const char *path, const char *req, char *buf, int size)
 	return n;
 }
 
+/* Writes the text s to the open file fd at the offset 0, as a file of selinuxfs or of /proc/PID/attr wants. Gives 0 or the errno of the write. */
+static int sel_pwrite(int fd, const char *s)
+{
+	return pwrite(fd, s, strlen(s), 0) < 0 ? errno : 0;
+}
+
 /*
  * The checks of SELinux with selinux=1: selinuxfs, the load of the policy /etc/rk_test.sel,
  * which checkpolicy makes from sec/rk-lsm-selinux/tests/rk_test.conf, the requests to the
@@ -16838,9 +16844,11 @@ static void test_selinux(void)
 	unsigned long long ids[4] = { 0 }, ctx[16] = { 0 };
 	unsigned int size = sizeof(ids), csize = sizeof(ctx), st4[5];
 	char *sub[] = { "rk-sub", NULL };
+	static char want[512];
 	struct statfs sfs;
 	struct stat st;
-	int n, fd, len;
+	unsigned long ino_w = 0, ino_e = 0;
+	int n, fd, len, efd, xfd, cfd;
 
 	n = klogctl(3, buf, sizeof(buf) - 1);
 	buf[n > 0 ? n : 0] = 0;
@@ -16943,20 +16951,36 @@ static void test_selinux(void)
 		aa_run_at("/tmp/rk-sub", init, files, buf, 256);
 		n = getxattr("/tmp/rk-aa-w", "security.selinux", buf, 256);
 		check("selinux: a file of init_t in tmpfs follows the type_transition rule", n == 27 && strcmp(buf, "system_u:object_r:etc_t:s0") == 0);
+		check("selinux: a chmod that the policy does not allow works in permissive mode", chmod("/tmp/rk-aa-w", 0644) == 0 && stat("/tmp/rk-aa-w", &st) == 0 && (st.st_mode & 07777) == 0644);
+		ino_w = st.st_ino;
 	}
 	n = aa_run_at("/tmp/rk-sub", init, sub, buf, 256);
 	check("selinux: an exec after a write to attr/exec runs with the new context", n == (int)sizeof(init) && strcmp(buf, init) == 0);
 	n = aa_run_at("/tmp/rk-sub", NULL, sub, buf, 256);
 	check("selinux: an exec without a rule keeps the context", n == (int)sizeof(kernel) && strcmp(buf, kernel) == 0);
 	check("selinux: attr/exec of init stays empty", aa_read("/proc/self/attr/exec", buf, 256) == 0);
+	/* The policy does not allow kernel_t to open the files of selinuxfs and /proc for a write, so init opens them before the enforcing mode, as on Linux. */
+	efd = open("/sys/fs/selinux/enforce", O_WRONLY);
+	xfd = open("/proc/self/attr/exec", O_WRONLY);
+	cfd = open("/sys/fs/selinux/checkreqprot", O_WRONLY);
+	check("selinux: an open for a write that the policy does not allow works in permissive mode", efd >= 0 && xfd >= 0 && cfd >= 0);
+	if (stat("/sys/fs/selinux/enforce", &st) == 0)
+		ino_e = st.st_ino;
 	check("selinux: a write of 1 to enforce works in permissive mode", aa_write("/sys/fs/selinux/enforce", "1", 1, O_TRUNC) == 0 && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "1") == 0);
 	n = aa_read("/sys/fs/selinux/status", buf, 64);
 	memcpy(st4, buf, sizeof(st4));
 	check("selinux: status has the enforcing mode and the second load", n == 20 && st4[1] == 6 && st4[2] == 1 && st4[3] == 2);
-	check("selinux: a write of 0 to enforce gives EACCES in enforcing mode", aa_write("/sys/fs/selinux/enforce", "0\n", 2, 0) == EACCES && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "1") == 0);
-	check("selinux: a write to attr/exec gives EACCES in enforcing mode", aa_write("/proc/self/attr/exec", init, strlen(init), 0) == EACCES && aa_read("/proc/self/attr/exec", buf, 256) == 0);
-	check("selinux: a write of text to enforce gives EINVAL", aa_write("/sys/fs/selinux/enforce", "x", 1, 0) == EINVAL);
-	check("selinux: a write to checkreqprot does nothing", aa_write("/sys/fs/selinux/checkreqprot", "1", 1, 0) == 0 && aa_read("/sys/fs/selinux/checkreqprot", buf, 64) == 1 && strcmp(buf, "0") == 0);
+	check("selinux: a write of 0 to enforce gives EACCES in enforcing mode", sel_pwrite(efd, "0\n") == EACCES && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "1") == 0);
+	check("selinux: a write to attr/exec gives EACCES in enforcing mode", sel_pwrite(xfd, init) == EACCES && aa_read("/proc/self/attr/exec", buf, 256) == 0);
+	check("selinux: a write of text to enforce gives EINVAL", sel_pwrite(efd, "x") == EINVAL);
+	check("selinux: a write to checkreqprot does nothing", sel_pwrite(cfd, "1") == 0 && aa_read("/sys/fs/selinux/checkreqprot", buf, 64) == 1 && strcmp(buf, "0") == 0);
+	close(efd);
+	close(xfd);
+	close(cfd);
+	check("selinux: an open of enforce for a write gives EACCES in enforcing mode", aa_write("/sys/fs/selinux/enforce", "0", 1, 0) == EACCES);
+	check("selinux: a stat and an open for a read that the policy allows work in enforcing mode", stat("/tmp/rk-aa-w", &st) == 0 && (fd = open("/tmp/rk-aa-w", O_RDONLY)) >= 0 && close(fd) == 0);
+	check("selinux: access gives EACCES for a write that the policy does not allow", access("/tmp/rk-aa-w", R_OK) == 0 && access("/tmp/rk-aa-w", W_OK) < 0 && errno == EACCES);
+	check("selinux: an open with O_APPEND, a chmod, a truncate and a touch give EACCES in enforcing mode", aa_write("/tmp/rk-aa-w", "x", 1, O_APPEND) == EACCES && chmod("/tmp/rk-aa-w", 0600) < 0 && errno == EACCES && truncate("/tmp/rk-aa-w", 0) < 0 && errno == EACCES && utimensat(AT_FDCWD, "/tmp/rk-aa-w", NULL, 0) < 0 && errno == EACCES && stat("/tmp/rk-aa-w", &st) == 0 && (st.st_mode & 07777) == 0644);
 	n = klogctl(3, buf, sizeof(buf) - 1);
 	buf[n > 0 ? n : 0] = 0;
 	check("selinux: the kernel log has the policy capabilities", n > 0 && strstr(buf, "SELinux:  policy capability network_peer_controls=1") != NULL && strstr(buf, "SELinux:  policy capability always_check_network=0") != NULL && strstr(buf, "SELinux:  policy capability bpf_token_perms=0") != NULL);
@@ -16971,6 +16995,15 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the denial of the entrypoint", strstr(buf, "avc:  denied  { entrypoint } for  pid=") != NULL && strstr(buf, " comm=\"init\" path=\"/tmp/rk-sub\" dev=\"") != NULL && strstr(buf, "scontext=system_u:system_r:init_t:s0 tcontext=system_u:object_r:tmpfs_t:s0 tclass=file permissive=1") != NULL);
 	check("selinux: the kernel log has the denials of noatsecure and execute_no_trans", strstr(buf, "{ noatsecure } for") != NULL && strstr(buf, "{ execute_no_trans } for") != NULL);
 	check("selinux: the kernel log has the denial of setexec in enforcing mode", strstr(buf, "{ setexec } for  pid=1 comm=\"init\" scontext=system_u:system_r:kernel_t:s0-s1:c0.c2 tcontext=system_u:system_r:kernel_t:s0-s1:c0.c2 tclass=process permissive=0") != NULL);
+	check("selinux: the kernel log has a denial of a write to selinuxfs in permissive mode", strstr(buf, "avc:  denied  { write } for  pid=1 comm=\"init\" name=\"") != NULL && strstr(buf, "tcontext=system_u:object_r:security_t:s0 tclass=file permissive=1") != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { write } for  pid=1 comm=\"init\" name=\"enforce\" dev=\"selinuxfs\" ino=%lu scontext=%s tcontext=system_u:object_r:security_t:s0 tclass=file permissive=0", ino_e, kernel);
+	check("selinux: the kernel log has the denial of the open of enforce in enforcing mode", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { setattr } for  pid=1 comm=\"init\" name=\"rk-aa-w\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=1", ino_w, kernel);
+	check("selinux: the kernel log has the denial of the chmod in permissive mode", strstr(buf, want) != NULL);
+	want[strlen(want) - 1] = '0';
+	check("selinux: the kernel log has the denial of the chmod in enforcing mode", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { append } for  pid=1 comm=\"init\" name=\"rk-aa-w\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0", ino_w, kernel);
+	check("selinux: the kernel log has the denial of the open with O_APPEND", strstr(buf, want) != NULL);
 	unlink("/tmp/rk-aa-w");
 	unlink("/tmp/rk-sub");
 	umount("/tmp");
