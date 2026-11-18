@@ -129,6 +129,8 @@ pub const NFT_MSG_DESTROYSETELEM: u8 = 30;
 pub const NFT_MSG_DESTROYOBJ: u8 = 31;
 /// Deletes a flowtable, with no error if it is not there.
 pub const NFT_MSG_DESTROYFLOWTABLE: u8 = 32;
+/// Gets or dumps elements, and resets their counters and quotas.
+pub const NFT_MSG_GETSETELEM_RESET: u8 = 33;
 /// The number of messages, `NFT_MSG_MAX`.
 const NFT_MSG_MAX: usize = 34;
 
@@ -1161,6 +1163,8 @@ static NF_TABLES_CB: [NfnlCallback; NFT_MSG_MAX] = {
     cb[NFT_MSG_GETSETELEM as usize] =
         rcu(Some(nf_tables_getsetelem), Some(nf_tables_dump_set), NFTA_SET_ELEM_LIST_MAX);
     cb[NFT_MSG_DELSETELEM as usize] = batch(NFTA_SET_ELEM_LIST_MAX);
+    cb[NFT_MSG_GETSETELEM_RESET as usize] =
+        rcu(Some(nf_tables_getsetelem), Some(nf_tables_dump_set), NFTA_SET_ELEM_LIST_MAX);
     cb[NFT_MSG_DESTROYSETELEM as usize] = batch(NFTA_SET_ELEM_LIST_MAX);
     cb[NFT_MSG_GETGEN as usize] = rcu(Some(nf_tables_getgen), None, 0);
     cb[NFT_MSG_NEWOBJ as usize] = batch(NFTA_OBJ_MAX);
@@ -1544,13 +1548,16 @@ fn nft_data_dump(b: &mut Builder, attr: u32, data: &NftData, table: &NftTable) {
     b.end_nest(nest);
 }
 
-/// Adds one element in a list, as `nf_tables_fill_setelem` of Linux.
+/// Adds one element in a list, as `nf_tables_fill_setelem` of Linux. With `reset`, the
+/// counters and the quotas of the element give what they counted and start again from 0, as
+/// Linux 7.4. The time left of the element stays as it is.
 fn nf_tables_fill_setelem(
     b: &mut Builder,
     table: &NftTable,
     set: &NftSet,
     key: &ElemKey,
     elem: &NftElem,
+    reset: bool,
 ) {
     let nest = b.nest(NFTA_LIST_ELEM);
     if !key.catchall {
@@ -1566,7 +1573,7 @@ fn nf_tables_fill_setelem(
         Some(d) => nft_data_dump(b, NFTA_SET_ELEM_DATA, d, table),
         None => {}
     }
-    nft_set_exprs_dump(b, (NFTA_SET_ELEM_EXPR, NFTA_SET_ELEM_EXPRESSIONS), &elem.exprs, false);
+    nft_set_exprs_dump(b, (NFTA_SET_ELEM_EXPR, NFTA_SET_ELEM_EXPRESSIONS), &elem.exprs, reset);
     if elem.flags != 0 {
         b.put(NFTA_SET_ELEM_FLAGS as u16, &elem.flags.to_be_bytes());
     }
@@ -1595,6 +1602,7 @@ fn nf_tables_fill_setelem_info(
     table: &NftTable,
     set: &NftSet,
     elems: &[(&ElemKey, &NftElem)],
+    reset: bool,
 ) -> Vec<u8> {
     let mut b = nfnl_msg_put(
         portid,
@@ -1609,7 +1617,7 @@ fn nf_tables_fill_setelem_info(
         .put(NFTA_SET_ELEM_LIST_SET as u16, &cstr(&set.name));
     let nest = b.nest(NFTA_SET_ELEM_LIST_ELEMENTS as u16);
     for (k, e) in elems {
-        nf_tables_fill_setelem(&mut b, table, set, k, e);
+        nf_tables_fill_setelem(&mut b, table, set, k, e, reset);
     }
     b.end_nest(nest);
     b.finish()
@@ -1859,8 +1867,10 @@ fn nf_tables_dump_sets(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<Vec<Vec<u
 const ELEM_DUMP_SIZE: usize = 3000;
 
 /// The dump of the elements of one set, as `nf_tables_dump_set` of Linux. The elements go in
-/// as many messages as they need.
+/// as many messages as they need. `NFT_MSG_GETSETELEM_RESET` also resets the counters and the
+/// quotas of the elements.
 fn nf_tables_dump_set(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<Vec<Vec<u8>>> {
+    let reset = nfnl_msg_type(info.nlh.ty) == NFT_MSG_GETSETELEM_RESET;
     let family = info.nfmsg.nfgen_family;
     let nft = NFT.lock();
     let t = nft_table_lookup(&nft.tables, nla_name(nla, NFTA_SET_ELEM_LIST_TABLE)?, family, 0)?;
@@ -1887,6 +1897,7 @@ fn nf_tables_dump_set(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<Vec<Vec<u8
                 table,
                 set,
                 &part,
+                reset,
             ));
             part.clear();
             size = 0;
@@ -1904,14 +1915,16 @@ fn nf_tables_dump_set(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<Vec<Vec<u8
             table,
             set,
             &part,
+            reset,
         ));
     }
     Ok(out)
 }
 
 /// Gets the elements of the list, as `nf_tables_getsetelem` of Linux. Each element comes in a
-/// message of its own.
+/// message of its own. `NFT_MSG_GETSETELEM_RESET` also resets their counters and quotas.
 fn nf_tables_getsetelem(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<()> {
+    let reset = nfnl_msg_type(info.nlh.ty) == NFT_MSG_GETSETELEM_RESET;
     let family = info.nfmsg.nfgen_family;
     let nft = NFT.lock();
     let t = nft_table_lookup(&nft.tables, nla_name(nla, NFTA_SET_ELEM_LIST_TABLE)?, family, 0)
@@ -1941,6 +1954,7 @@ fn nf_tables_getsetelem(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<()> {
             table,
             set,
             &[(&key, e)],
+            reset,
         ));
     }
     drop(nft);
@@ -2234,6 +2248,7 @@ impl NftBatch {
                 table,
                 set,
                 &[(k, e)],
+                false,
             ))
         });
         self.notify(ctx, m);
@@ -3954,6 +3969,67 @@ mod tests {
         // A reset gives what the counter counted, then sets it back to 0, as Linux.
         assert_eq!(dump(true), (3, 252));
         assert_eq!(dump(false), (0, 0));
+    }
+
+    #[test]
+    fn a_reset_of_an_element_resets_its_counter_and_not_its_expiry() {
+        use crate::netlink::nfnetlink::NFGENMSG_LEN;
+        // `counter packets 5 bytes 30` of an element: NFTA_EXPR_NAME (1) and NFTA_EXPR_DATA (2)
+        // with NFTA_COUNTER_PACKETS (1) and NFTA_COUNTER_BYTES (2).
+        let nested = NLA_F_NESTED as u16;
+        let mut b = Builder::new(0, 0, 0, 0);
+        let x = b.nest(1 | nested);
+        b.put(1, b"counter\0");
+        let d = b.nest(2 | nested);
+        b.put(1, &5u64.to_be_bytes()).put(2, &30u64.to_be_bytes());
+        b.end_nest(d).end_nest(x);
+        let raw = b.finish()[msg::HDRLEN..].to_vec();
+        let t = table();
+        let exprs = nft_set_exprs_parse(&t, 0, &Attrs::parse(&raw, 2), (1, 2), false, &[])
+            .unwrap()
+            .unwrap();
+        let mut s = set(b"s");
+        s.flags = NFT_SET_TIMEOUT;
+        s.timeout = 30 * 60 * 1000;
+        let key = ElemKey { catchall: false, key: alloc::vec![1, 0, 0, 1], end: false };
+        let expires = nft_now_ns() + 20 * 60 * 1_000_000_000;
+        let elem = NftElem {
+            key_end: None,
+            data: None,
+            flags: 0,
+            udata: None,
+            timeout: 0,
+            expires,
+            exprs,
+            seq: 0,
+        };
+        // The packets of the counter, and whether the element has its time left.
+        let dump = |reset| {
+            let m = nf_tables_fill_setelem_info(
+                0,
+                0,
+                NFT_MSG_NEWSETELEM,
+                0,
+                1,
+                &t,
+                &s,
+                &[(&key, &elem)],
+                reset,
+            );
+            let a = Attrs::parse(&m[msg::HDRLEN + NFGENMSG_LEN..], NFTA_SET_ELEM_LIST_MAX);
+            let (_, e) = msg::attrs(a.get(NFTA_SET_ELEM_LIST_ELEMENTS).unwrap()).next().unwrap();
+            let ea = Attrs::parse(e, NFTA_SET_ELEM_MAX);
+            let x = Attrs::parse(ea.get(NFTA_SET_ELEM_EXPR).unwrap(), 2);
+            let c = Attrs::parse(x.get(2).unwrap(), 2);
+            let packets = u64::from_be_bytes(c.get(1).unwrap().try_into().unwrap());
+            (packets, ea.has(NFTA_SET_ELEM_EXPIRATION))
+        };
+        assert_eq!(dump(false), (5, true));
+        // A reset gives what the counter counted, then sets it back to 0, as Linux 7.4. The
+        // element keeps the time when it expires.
+        assert_eq!(dump(true), (5, true));
+        assert_eq!(dump(false), (0, true));
+        assert_eq!(elem.expires, expires);
     }
 
     #[test]

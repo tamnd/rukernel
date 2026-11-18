@@ -367,6 +367,14 @@ fn setlink_dev(dev: &Arc<NetDevice>, h: &[u8], a: &Attrs<'_>) -> Result<()> {
     if a.has(IFLA_MAP) {
         return Err(Errno::EOPNOTSUPP);
     }
+    // No device takes ports yet, so a device cannot get a master, as `do_set_master` of Linux
+    // with a master that has no `ndo_add_slave`: `EINVAL` for a master that is not there, and
+    // `EOPNOTSUPP` for one that is. A device has no master, so 0 changes nothing.
+    match a.u32(IFLA_MASTER)? {
+        None | Some(0) => {}
+        Some(m) if dev::by_index(m).is_none() => return Err(Errno::EINVAL),
+        Some(_) => return Err(Errno::EOPNOTSUPP),
+    }
     if let Some(v) = a.get(IFLA_ADDRESS) {
         // The family is the type of the device, as in `do_setlink` of Linux.
         let mut m = [0; 6];
@@ -443,7 +451,7 @@ fn target_ns(a: &Attrs<'_>) -> Result<Option<Arc<NetNs>>> {
 }
 
 /// Makes a device of a kind, as `rtnl_create_link`, `veth_newlink` and the `dummy` link of
-/// Linux. The kinds `veth` and `dummy` are here. The new device is in the namespace of
+/// Linux. The kinds `veth`, `dummy`, `vlan` and `bridge` are here. The new device is in the namespace of
 /// `IFLA_NET_NS_PID` or `IFLA_NET_NS_FD`, else in the current namespace. The other end of a
 /// veth pair has its own attributes in `VETH_INFO_PEER`.
 fn create(h: &[u8], a: &Attrs<'_>) -> Result<()> {
@@ -458,6 +466,19 @@ fn create(h: &[u8], a: &Attrs<'_>) -> Result<()> {
     }
     if info.str(IFLA_INFO_KIND) == Some(crate::vlan::KIND.as_bytes()) {
         return create_vlan(h, a, &info);
+    }
+    if info.str(IFLA_INFO_KIND) == Some(crate::bridge::KIND.as_bytes()) {
+        // The options of a bridge (`IFLA_BR_*`, as `ip link add br0 type bridge stp_state 1`)
+        // are not here, and a request with them fails rather than makes a bridge without them.
+        if info.get(IFLA_INFO_DATA).is_some_and(|d| !d.is_empty()) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let dev_ns = target_ns(a)?;
+        let dev = {
+            let _in = dev_ns.as_deref().map(ns::enter);
+            crate::bridge::create(a.str(IFLA_IFNAME), new_addr(a)?)?
+        };
+        return configure(&dev, h, a).inspect_err(|_| dev::unregister(&dev));
     }
     if info.str(IFLA_INFO_KIND) != Some(veth::KIND.as_bytes()) {
         return Err(Errno::EOPNOTSUPP);

@@ -34,8 +34,8 @@ WORDS = {
     "chk-dump": "no dump", "tainted": "tainted", "timeout": "timeout", "error": "error",
     "panic": "panic", "hang": "hang", "crash": "crash", "noboot": "no boot",
 }
-# The tests that expect what the reference kernel (Linux 6.8) does, where rukernel does what Linux
-# 7.4 does. The report gives the note of each one.
+# The tests that expect what another Linux (most of them the reference kernel, Linux 6.8) does,
+# where rukernel does what Linux 7.4 does. The report gives the note of each one.
 LINUX_7_4 = {
     "testcases/chains/netdev_chain_0":
         "The dump of the test has no chain, because Linux 6.8 deletes a netdev chain when its "
@@ -45,6 +45,11 @@ LINUX_7_4 = {
         "The dump of the test has no chain, because Linux 6.8 deletes a netdev chain when its "
         "last device goes. Linux 7.4 keeps the chain and its devices by name (nft_netdev_event), "
         "and rukernel too.",
+    "testcases/sets/reset_command_0":
+        "The test expects that a reset also sets the time left of an element back to its "
+        "timeout (\"counters and expiry are reset\"), and Linux 6.8 fails it there too. Linux "
+        "7.4 (nf_tables_getsetelem) resets the counters and the quotas of the elements only, and "
+        "rukernel too.",
 }
 
 
@@ -154,8 +159,8 @@ def main():
         if ts:
             o.append(f"- {d}: {len(ts)}: " + ", ".join(link(t) for t in ts) + ".")
     o += ["", "## Where rukernel follows Linux 7.4", "",
-          "The reference kernel is Linux 6.8. These tests expect what Linux 6.8 does, and rukernel "
-          "does what Linux 7.4 does.", ""]
+          "The reference kernel is Linux 6.8. These tests expect what another version of Linux "
+          "does (Linux 6.8 for most of them), and rukernel does what Linux 7.4 does.", ""]
     o += [f"- {link(t)}: {n}" for t, n in sorted(LINUX_7_4.items())]
     o += ["", "## Each test", "",
           "| Test | Linux | rukernel x86_64 | rukernel arm64 | Note |",
