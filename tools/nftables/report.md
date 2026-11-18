@@ -49,10 +49,11 @@ These tests pass on Linux and do not pass on rukernel x86_64.
 
 ## Where rukernel follows Linux 7.4
 
-The reference kernel is Linux 6.8. These tests expect what Linux 6.8 does, and rukernel does what Linux 7.4 does.
+The reference kernel is Linux 6.8. These tests expect what another version of Linux does (Linux 6.8 for most of them), and rukernel does what Linux 7.4 does.
 
 - [chains/netdev_chain_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/chains/netdev_chain_0?h=v1.0.9): The dump of the test has no chain, because Linux 6.8 deletes a netdev chain when its last device goes. Linux 7.4 keeps the chain and its devices by name (nft_netdev_event), and rukernel too.
 - [json/netdev](https://git.netfilter.org/nftables/tree/tests/shell/testcases/json/netdev?h=v1.0.9): The dump of the test has no chain, because Linux 6.8 deletes a netdev chain when its last device goes. Linux 7.4 keeps the chain and its devices by name (nft_netdev_event), and rukernel too.
+- [sets/reset_command_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/reset_command_0?h=v1.0.9): The test expects that a reset also sets the time left of an element back to its timeout ("counters and expiry are reset"), and Linux 6.8 fails it there too. Linux 7.4 (nf_tables_getsetelem) resets the counters and the quotas of the elements only, and rukernel too.
 
 ## Each test
 
@@ -389,7 +390,7 @@ The reference kernel is Linux 6.8. These tests expect what Linux 6.8 does, and r
 | [sets/errors_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/errors_0?h=v1.0.9) | pass | pass | pass |  |
 | [sets/exact_overlap_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/exact_overlap_0?h=v1.0.9) | pass | pass | pass |  |
 | [sets/inner_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/inner_0?h=v1.0.9) | pass | skip | skip |  |
-| [sets/reset_command_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/reset_command_0?h=v1.0.9) | fail | skip | skip | counters and expiry are reset: FAIL |
+| [sets/reset_command_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/reset_command_0?h=v1.0.9) | fail | skip | skip | The test expects that a reset also sets the time left of an element back to its timeout ("counters and expiry are reset"), and Linux 6.8 fails it there too. Linux 7.4 (nf_tables_getsetelem) resets the counters and the quotas of the elements only, and rukernel too. |
 | [sets/set_eval_0](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/set_eval_0?h=v1.0.9) | pass | pass | pass |  |
 | [sets/sets_with_ifnames](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/sets_with_ifnames?h=v1.0.9) | pass | fail | fail | Expected 3 matching rules, got 0, packets 9 in v4icmp |
 | [sets/type_set_symbol](https://git.netfilter.org/nftables/tree/tests/shell/testcases/sets/type_set_symbol?h=v1.0.9) | pass | pass | pass |  |

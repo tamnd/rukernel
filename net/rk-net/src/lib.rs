@@ -17,6 +17,7 @@ extern crate alloc;
 
 pub mod alg;
 pub mod arp;
+pub mod bridge;
 pub mod buf;
 pub mod consts;
 pub mod dev;
