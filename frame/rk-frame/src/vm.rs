@@ -1243,12 +1243,19 @@ impl VmSpace {
 
     /// Starts the move of the page at `addr` to a swap area, as `shrink_folio_list` of Linux
     /// starts with an anonymous page. Only a 4 KiB anonymous page that only this entry maps and
-    /// that no other part of the kernel holds can go, and not a page that KSM merged. The page
+    /// that no other part of the kernel holds can go, and not a page that KSM merged. A
+    /// transparent huge page that only this entry maps becomes 4 KiB pages first. The page
     /// becomes read only, so its data does not change while the write to the swap area runs: a
     /// write to it is a fault. Gives the frame of the page, or `None` if the page cannot go.
     pub fn swap_out_start(&self, addr: VirtAddr) -> Option<Arc<Frame>> {
         let a = addr.get();
         let mut b = self.block(a)?.lock();
+        // A transparent huge page of this space only goes to swap as 4 KiB pages, as
+        // `shrink_folio_list` of Linux splits a large folio when it cannot swap it in one piece.
+        let own = |f: &Mapped| Arc::strong_count(&f.0) == 1 && f.map_count() == 1 && f.is_anon();
+        if b.huge.as_ref().is_some_and(|h| h.thp && h.frames.iter().all(own)) {
+            self.split(&mut b, block_of(a));
+        }
         if b.huge.is_some() {
             return None;
         }

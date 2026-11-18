@@ -441,6 +441,11 @@ fn self_test_timeout(cmdline: &str) -> Duration {
 /// TPM, so a timeout at that load is the effect of the load and not of the TPM (#541).
 const SMP_TEST_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// The longest time that the `swap` boot test can take. It writes a swap file of about 180 MB and
+/// fills more memory than the VM has, so the pages go to the swap file and come back. On server2
+/// at load 10 the debug kernel on x86_64 needs about 660 s.
+const SWAP_TEST_TIMEOUT: Duration = Duration::from_secs(1500);
+
 /// The longest time that a boot test of a root file system can take. The `alpine` test makes and
 /// checks file systems on two disks, and it is slow on a busy host.
 const ROOTFS_TIMEOUT: Duration = Duration::from_secs(300);
@@ -2253,6 +2258,12 @@ const BLK_DISK_SIZE: usize = 1 << 20;
 const EXT2_DISK_SIZE: u64 = 512 << 20;
 /// The size of the disk of the `swap` boot test. tests/user/init.c has the same value.
 const SWAP_DISK_SIZE: u64 = 16 << 20;
+/// The size of the ext2 disk of the `swap` boot test, for its swap file. tests/user/init.c has
+/// the same value.
+const SWAPFS_DISK_SIZE: u64 = 256 << 20;
+/// The memory of the VM of the `swap` boot test. The test fills more memory than this with a swap
+/// file active.
+const SWAP_MEMORY: &str = "128M";
 /// The size of the disk that the `alpine` test makes an ext4 file system on.
 const EXT4_DISK_SIZE: u64 = 64 << 20;
 /// The size of the disk that the `alpine` test makes an XFS file system on. mkfs.xfs does not make
@@ -2286,20 +2297,39 @@ fn write_blk_disk(path: &Path) -> Result {
 /// system of memcontrol03. Gives `false` if the host has no `mkfs.ext2`, and then the test runs
 /// without the disk.
 fn make_ext2_disk(path: &Path) -> Result<bool> {
+    let made = make_ext2(path, EXT2_DISK_SIZE, &[])?;
+    if !made {
+        println!("boot test blk: the host has no mkfs.ext2, so the test has no ext2 disk");
+    }
+    Ok(made)
+}
+
+/// Makes the ext2 disk of the swap file of the `swap` boot test. The blocks are 4 KiB, so that
+/// each page of the swap file is a page of the disk. Gives `false` if the host has no
+/// `mkfs.ext2`, and then the test has no swap file.
+fn make_swapfs_disk(path: &Path) -> Result<bool> {
+    let made = make_ext2(path, SWAPFS_DISK_SIZE, &["-b", "4096"])?;
+    if !made {
+        println!("boot test swap: the host has no mkfs.ext2, so the test has no swap file");
+    }
+    Ok(made)
+}
+
+/// Makes an ext2 file system of `size` bytes in the new file `path`, with the options `args` of
+/// `mkfs.ext2`. Gives `false` if the host has no `mkfs.ext2`.
+fn make_ext2(path: &Path, size: u64, args: &[&str]) -> Result<bool> {
     let file = fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    file.set_len(EXT2_DISK_SIZE).map_err(|e| format!("{}: {e}", path.display()))?;
+    file.set_len(size).map_err(|e| format!("{}: {e}", path.display()))?;
     let made = ["mkfs.ext2", "/sbin/mkfs.ext2", "/usr/sbin/mkfs.ext2"].iter().any(|mkfs| {
         Command::new(mkfs)
             .args(["-q", "-F"])
+            .args(args)
             .arg(path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|s| s.success())
     });
-    if !made {
-        println!("boot test blk: the host has no mkfs.ext2, so the test has no ext2 disk");
-    }
     Ok(made)
 }
 
@@ -3053,8 +3083,11 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
             (qemu_command(&kernel, &cmdline), BOOT_TEST_TIMEOUT)
         } else {
             let cmdline = test_cmdline(test);
-            let timeout =
-                if *test == "smp" { SMP_TEST_TIMEOUT } else { self_test_timeout(&cmdline) };
+            let timeout = match *test {
+                "smp" => SMP_TEST_TIMEOUT,
+                "swap" => SWAP_TEST_TIMEOUT,
+                _ => self_test_timeout(&cmdline),
+            };
             (qemu_command(&kernel, &cmdline), timeout)
         };
         // The `alpine` test runs fio on the disk. In the `systemd` test, a unit with
@@ -3067,12 +3100,23 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 .args(["-device", "virtio-blk-pci,drive=disk0"]);
         }
         // The `swap` test makes the disk a swap area.
+        // The ext2 disk has the swap file. QEMU uses the last `-m`.
         if *test == "swap" {
             let disk = kernel.with_file_name("swap.img");
             make_swap_disk(&disk)?;
             cmd.arg("-drive")
                 .arg(format!("if=none,id=swap,format=raw,cache=unsafe,file={}", disk.display()))
                 .args(["-device", "virtio-blk-pci,drive=swap"]);
+            let disk = kernel.with_file_name("swapfs.img");
+            if make_swapfs_disk(&disk)? {
+                cmd.arg("-drive")
+                    .arg(format!(
+                        "if=none,id=swapfs,format=raw,cache=unsafe,file={}",
+                        disk.display()
+                    ))
+                    .args(["-device", "virtio-blk-pci,drive=swapfs"]);
+            }
+            cmd.args(["-m", SWAP_MEMORY]);
         }
         // The `blk` test writes 50 MB to a file on an ext2 disk, as memcontrol03 of LTP.
         if *test == "blk" {
@@ -3474,6 +3518,17 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
                 .arg(format!("if=none,id=swap,format=raw,cache=unsafe,file={}", disk.display()))
                 .arg("-device")
                 .arg(format!("{blk_device},drive=swap{bus}"));
+            let disk = elf_path.with_file_name("swapfs.img");
+            if make_swapfs_disk(&disk)? {
+                cmd.arg("-drive")
+                    .arg(format!(
+                        "if=none,id=swapfs,format=raw,cache=unsafe,file={}",
+                        disk.display()
+                    ))
+                    .arg("-device")
+                    .arg(format!("{blk_device},drive=swapfs{bus}"));
+            }
+            cmd.args(["-m", SWAP_MEMORY]);
         }
         if *test == "inet" {
             let device = format!("{net_device},netdev=n0{bus}");

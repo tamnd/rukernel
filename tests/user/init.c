@@ -8639,6 +8639,27 @@ static void test_ext2(void)
 
 /* The size of the disk of the swap boot test. xtask/src/main.rs has the same value. */
 #define SWAP_DISK_SIZE (16 * 1024 * 1024)
+/* The size of the ext2 disk of the swap file of the swap boot test. xtask/src/main.rs has the
+ * same value. */
+#define SWAPFS_DISK_SIZE (256 * 1024 * 1024)
+
+/* Gives the disk of the swap boot test with `size` bytes, /dev/vda or /dev/vdb, or NULL. On arm64
+ * the order of the virtio-mmio disks is not the order of the QEMU command line. */
+static const char *swap_disk(unsigned long long size)
+{
+	static const char *const disks[] = { "/dev/vda", "/dev/vdb" };
+
+	for (int i = 0; i < 2; i++) {
+		unsigned long long n = 0;
+		int fd = open(disks[i], O_RDONLY);
+		int ok = fd >= 0 && ioctl(fd, BLKGETSIZE64, &n) == 0 && n == size;
+		if (fd >= 0)
+			close(fd);
+		if (ok)
+			return disks[i];
+	}
+	return NULL;
+}
 
 /* Writes the header of mkswap to the first page of fd, for an area of `pages` pages. */
 static int write_swap_header(int fd, unsigned int pages)
@@ -8842,7 +8863,7 @@ static void test_memcg_swap(void)
 
 /* swapoff of an area with used pages reads the pages back into the processes that have them, as
  * try_to_unuse of Linux. A child of fork has the same swap entries, and it gets its own pages. */
-static void test_swapoff(long total)
+static void test_swapoff(const char *dev, long total)
 {
 	enum { N = 64 };
 	long len = N * 4096L;
@@ -8866,7 +8887,7 @@ static void test_swapoff(long total)
 	}
 	check("the child of fork for swapoff starts", pid > 0 && read(from[0], &c, 1) == 1);
 	long long in = swap_vmstat("pswpin");
-	check("swapoff of the swap disk with used pages", syscall(SYS_swapoff, "/dev/vda") == 0);
+	check("swapoff of the swap disk with used pages", syscall(SYS_swapoff, dev) == 0);
 	check("SwapTotal goes back after swapoff", meminfo("SwapTotal") == total);
 	check("swapoff reads the pages of the parent and of the child",
 	      swap_vmstat("pswpin") == in + 2 * N);
@@ -8883,7 +8904,7 @@ static void test_swapoff(long total)
 	check("no page comes from a disk after swapoff", swap_vmstat("pswpin") == in + 2 * N);
 	char buf[512];
 	check("/proc/swaps has no area after swapoff",
-	      read_small("/proc/swaps", buf, sizeof(buf)) > 0 && strstr(buf, "/dev/vda") == NULL);
+	      read_small("/proc/swaps", buf, sizeof(buf)) > 0 && strstr(buf, dev) == NULL);
 	munmap(m, len);
 	close(to[0]);
 	close(to[1]);
@@ -8891,12 +8912,91 @@ static void test_swapoff(long total)
 	close(from[1]);
 }
 
+/* Writes the swap file `path` of `kib` KiB on ext2, with fsync after each 8 MiB, so that its
+ * page cache is clean and can go. Gives 0, or -1 on an error. */
+static int write_swap_file(const char *path, long kib)
+{
+	static char zero[1 << 20];
+	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+
+	if (fd < 0)
+		return -1;
+	int ok = 1;
+	for (long i = 0; ok && i < kib / 1024; i++) {
+		ok = write(fd, zero, sizeof(zero)) == (ssize_t)sizeof(zero);
+		if (ok && i % 8 == 7)
+			ok = fsync(fd) == 0;
+	}
+	ok = ok && write_swap_header(fd, (unsigned int)(kib / 4)) == 0;
+	return close(fd) == 0 && ok ? 0 : -1;
+}
+
+/* With a swap file on ext2 active, a child fills more anonymous memory than the VM has, and its
+ * data comes back. The reclaim of the system writes the anonymous pages to the swap file when no
+ * frame is free, as the reclaim of Linux before out_of_memory (#752). */
+static void test_swapfile(void)
+{
+	const char *dev = swap_disk(SWAPFS_DISK_SIZE);
+	mkdir("/swapfs", 0755);
+	if (dev == NULL || mount(dev, "/swapfs", "ext2", 0, NULL) != 0) {
+		check("mount of the ext2 disk of the swap file", 0);
+		return;
+	}
+	/* The sizes are in KiB, as /proc/meminfo gives them. */
+	long mem = meminfo("MemTotal"), fill = mem + 16 * 1024, file = fill + 32 * 1024;
+	check("the swap file is written", mem > 0 && write_swap_file("/swapfs/swapfile", file) == 0);
+	check("swapon of the swap file", syscall(SYS_swapon, "/swapfs/swapfile", 0) == 0);
+
+	/* A transparent huge page goes to swap as 4 KiB pages, as the split of a large folio in
+	 * shrink_folio_list of Linux. */
+	const long huge = 2L << 20;
+	unsigned char *r = mmap(NULL, 2 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+				-1, 0);
+	unsigned char *h = r == MAP_FAILED ? NULL :
+		(unsigned char *)(((unsigned long)r + huge - 1) & ~(huge - 1));
+	if (h != NULL) {
+		madvise(h, huge, MADV_HUGEPAGE);
+		for (long i = 0; i < huge; i++)
+			h[i] = swap_byte(i);
+	}
+	check("a transparent huge page for the swap file", h && meminfo("AnonHugePages") >= 2048);
+	long long out = swap_vmstat("pswpout");
+	check("MADV_PAGEOUT writes each 4 KiB page of the transparent huge page to swap",
+	      h && madvise(h, huge, MADV_PAGEOUT) == 0 && swap_vmstat("pswpout") == out + huge / 4096);
+	check("the pages of the transparent huge page come back from swap", h && swap_data(h, huge));
+	if (r != MAP_FAILED)
+		munmap(r, 2 * huge);
+	out = swap_vmstat("pswpout");
+	pid_t pid = fork();
+	if (pid == 0) {
+		long len = fill * 1024;
+		unsigned char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m == MAP_FAILED)
+			_exit(2);
+		for (long i = 0; i < len; i++)
+			m[i] = swap_byte(i);
+		_exit(swap_data(m, len) ? 0 : 1);
+	}
+	int status = 0;
+	check("a child fills more memory than the VM has, and its data comes back",
+	      pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		      WEXITSTATUS(status) == 0);
+	check("the pages over the memory of the VM went to the swap file",
+	      swap_vmstat("pswpout") >= out + (fill - mem) / 4);
+	check("SwapFree comes back at the end of the child", meminfo("SwapFree") == meminfo("SwapTotal"));
+	check("swapoff of the swap file", syscall(SYS_swapoff, "/swapfs/swapfile") == 0);
+	unlink("/swapfs/swapfile");
+	check("umount of the ext2 disk of the swap file", umount("/swapfs") == 0);
+	rmdir("/swapfs");
+}
+
 static void test_swap(void)
 {
 	/* With the argument "only", the general checks did not make /proc. */
 	mkdir("/proc", 0555);
 	mount("proc", "/proc", "proc", 0, NULL);
-	int fd = open("/dev/vda", O_RDWR);
+	const char *dev = swap_disk(SWAP_DISK_SIZE);
+	int fd = dev ? open(dev, O_RDWR) : -1;
 	check("the swap disk opens", fd >= 0);
 	if (fd < 0)
 		return;
@@ -8904,11 +9004,11 @@ static void test_swap(void)
 	check("the header of mkswap goes to the swap disk", write_swap_header(fd, pages) == 0);
 	close(fd);
 	long total = meminfo("SwapTotal");
-	check("swapon of the swap disk", syscall(SYS_swapon, "/dev/vda", 0) == 0);
-	char buf[512];
+	check("swapon of the swap disk", syscall(SYS_swapon, dev, 0) == 0);
+	char buf[512], line[96];
+	snprintf(line, sizeof(line), "%-40spartition\t16380\t\t0\t\t-2\n", dev);
 	check("/proc/swaps has the disk with no used page",
-	      read_small("/proc/swaps", buf, sizeof(buf)) > 0 &&
-		      strstr(buf, "/dev/vda                                partition\t16380\t\t0\t\t-2\n"));
+	      read_small("/proc/swaps", buf, sizeof(buf)) > 0 && strstr(buf, line));
 	check("SwapTotal and SwapFree of /proc/meminfo have the area",
 	      meminfo("SwapTotal") == total + 16380 && meminfo("SwapFree") == meminfo("SwapTotal"));
 	struct sysinfo si;
@@ -8917,7 +9017,8 @@ static void test_swap(void)
 		      si.freeswap == si.totalswap);
 	test_pageout();
 	test_memcg_swap();
-	test_swapoff(total);
+	test_swapoff(dev, total);
+	test_swapfile();
 	umount("/proc");
 }
 
