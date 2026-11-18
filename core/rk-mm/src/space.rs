@@ -1956,21 +1956,22 @@ impl AddressSpace {
             if n >= want {
                 break;
             }
-            let Some(slot) = SwapSlot::alloc(self.memcg()) else { break };
             scanned += 1;
-            n += usize::from(self.swap_out(page, slot));
+            // A page that cannot go takes no swap entry.
+            let Some(frame) = self.vm.swap_out_start(page) else { continue };
+            let Some(slot) = SwapSlot::alloc(self.memcg()) else { break };
+            n += usize::from(self.swap_out(page, &frame, slot));
         }
         (scanned, n)
     }
 
-    /// Writes the page at `page` to the swap entry `slot`, and puts the entry in place of the
-    /// page, as `shrink_folio_list` of Linux does for an anonymous page. The write runs with no
-    /// lock, and the page is read only while it runs. Gives `false` if the page cannot go or the
-    /// write failed. Then the entry is free again, and the next write to the page makes it
-    /// writable again.
-    fn swap_out(&self, page: VirtAddr, slot: SwapSlot) -> bool {
-        let Some(frame) = self.vm.swap_out_start(page) else { return false };
-        slot.write(&frame).is_ok() && self.vm.swap_out_end(page, &frame, Arc::new(slot))
+    /// Writes the page `frame` at `page`, which `swap_out_start` gave, to the swap entry `slot`,
+    /// and puts the entry in place of the page, as `shrink_folio_list` of Linux does for an
+    /// anonymous page. The write runs with no lock, and the page is read only while it runs.
+    /// Gives `false` if the write failed or the page changed. Then the entry is free again, and
+    /// the next write to the page makes it writable again.
+    fn swap_out(&self, page: VirtAddr, frame: &Arc<Frame>, slot: SwapSlot) -> bool {
+        slot.write(frame).is_ok() && self.vm.swap_out_end(page, frame, Arc::new(slot))
     }
 
     /// Tells if an area of the space maps a file of hugetlbfs.
