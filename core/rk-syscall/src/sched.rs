@@ -46,8 +46,11 @@ const ATTR_SIZE: u32 = size_of::<SchedAttr>() as u32;
 /// A flag of the scheduler governor of Linux. `sched_setattr` accepts it.
 const SCHED_FLAG_SUGOV: u64 = 0x1000_0000;
 
-/// The time slice of the fair class, `BASE_SLICE` of rk-sched.
-const FAIR_SLICE: u64 = 3_000_000;
+/// The time slice of the fair class for the CPUs that run, `base_slice` of rk-sched. Linux 6.12
+/// gives `se.slice` here.
+fn fair_slice() -> u64 {
+    rk_sched::base_slice(rk_frame::cpu::count())
+}
 
 /// The smallest and the largest period of `SCHED_DEADLINE`, in nanoseconds. These are the
 /// default values of `sched_deadline_period_min_us` and `sched_deadline_period_max_us`.
@@ -418,7 +421,7 @@ fn get_attr(thread: &Thread) -> SchedAttr {
         attr.sched_priority = p.priority;
     } else {
         attr.sched_nice = p.nice;
-        attr.sched_runtime = FAIR_SLICE;
+        attr.sched_runtime = fair_slice();
     }
     attr
 }

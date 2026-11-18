@@ -238,6 +238,8 @@ fn random_entity(rng: &mut Rng, base: u64) -> Entity {
         deadline: vruntime + rng.below(30),
         weight: weight_of(rng.below(40) as i32 - 20),
         lag: 0,
+        slice: BASE_SLICE,
+        picked: 0,
     }
 }
 
@@ -454,7 +456,8 @@ fn a_task_that_wakes_runs_when_the_current_task_reaches_parity() {
     // The current task ran alone, so it is at the average and keeps the CPU to the end of its
     // slice: a task that wakes with no lag does not stop it.
     let mut q = Eevdf::new();
-    let curr = entity(10_000_000, 10_000_000 + BASE_SLICE);
+    let deadline = 10_000_000 + BASE_SLICE;
+    let curr = Entity { picked: deadline, ..entity(10_000_000, deadline) };
     let mut woken = Entity { lag: 0, ..Entity::default() };
     q.place(&mut woken, Some(&curr), false);
     q.push('w', woken);
@@ -493,5 +496,65 @@ fn a_task_that_wakes_runs_when_the_current_task_used_its_slice() {
     q.push('w', woken);
     assert!(!q.wakeup_preempt(&curr, &woken));
     let early = Entity { deadline: BASE_SLICE - 1, ..woken };
+    assert!(q.wakeup_preempt(&curr, &early));
+}
+
+#[test]
+fn the_base_slice_grows_with_the_log_of_the_cpus() {
+    // `get_update_sysctl_factor` of Linux: 1 + ilog2 of the CPUs, at most 8 CPUs.
+    assert_eq!(base_slice(0), 750_000);
+    assert_eq!(base_slice(1), 750_000);
+    assert_eq!(base_slice(2), 1_500_000);
+    assert_eq!(base_slice(3), 1_500_000);
+    assert_eq!(base_slice(4), 2_250_000);
+    assert_eq!(base_slice(8), 3_000_000);
+    assert_eq!(base_slice(64), 3_000_000);
+}
+
+#[test]
+fn the_slice_of_the_task_sets_its_deadline() {
+    let mut q = Eevdf::new();
+    q.push('a', entity(1000, 4000));
+    let mut e = Entity { slice: base_slice(4), ..Entity::default() };
+    q.place(&mut e, None, false);
+    assert_eq!(e.deadline, e.vruntime + base_slice(4));
+    let start = e.deadline;
+    assert!(e.charge(e.deadline - e.vruntime));
+    assert_eq!(e.deadline, start + base_slice(4));
+}
+
+#[test]
+fn the_lag_is_at_most_two_slices_or_a_tick() {
+    // `update_entity_lag` of Linux: the limit is the larger of two slices and one tick.
+    let mut q = Eevdf::new();
+    q.push('a', entity(10_000_000, 10_000_000 + BASE_SLICE));
+    let mut e = entity(0, BASE_SLICE);
+    q.save_lag(&mut e, 1_000_000);
+    assert_eq!(e.lag, 2 * BASE_SLICE as i64);
+    let mut e = entity(0, BASE_SLICE);
+    q.save_lag(&mut e, 4_000_000);
+    assert_eq!(e.lag, 4_000_000);
+}
+
+#[test]
+fn the_current_task_has_no_protection_after_the_slice_of_its_pick() {
+    // `pick_eevdf` of Linux keeps the current task only while its deadline is the deadline at
+    // the pick. After a new slice, a task that wakes with an earlier deadline takes the CPU.
+    let mut q = Eevdf::new();
+    let mut curr = entity(10_000_000, 10_000_000 + BASE_SLICE);
+    curr.picked = curr.deadline;
+    let mut woken = Entity { lag: 0, ..Entity::default() };
+    q.place(&mut woken, Some(&curr), false);
+    let early = Entity { deadline: curr.deadline - 1, ..woken };
+    q.push('w', early);
+    assert!(!q.wakeup_preempt(&curr, &early));
+    let start = curr.deadline;
+    assert!(curr.charge(curr.deadline - curr.vruntime));
+    assert_ne!(curr.deadline, curr.picked);
+    let mut q = Eevdf::new();
+    let mut woken = Entity { lag: 0, ..Entity::default() };
+    q.place(&mut woken, Some(&curr), false);
+    let early = Entity { deadline: start + BASE_SLICE / 2, ..woken };
+    q.push('w', early);
     assert!(q.wakeup_preempt(&curr, &early));
 }
