@@ -6,11 +6,11 @@ These are the results of the tests of runtest/controllers of LTP 20260930 on ruk
 
 The Linux code column links to the code of Linux 7.3 that the test checks. The note is the note in notes.txt, or else the first TFAIL, TBROK or TCONF line of the output.
 
-rukernel: 136 pass, 4 fail, 206 does not apply, 1 timeout, of 347 tests.
+rukernel: 137 pass, 3 fail, 206 does not apply, 1 timeout, of 347 tests.
 
 Linux 6.8.0-147-generic: 133 pass, 9 fail, 201 does not apply, 4 timeout. The Linux column has the result of each test on this kernel, the reference, with the same LTP programs and the same init script.
 
-Tests that pass on Linux and not on rukernel: 2: [cgroup](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/cgroup/cgroup_regression_test.sh) (fail (exit 1)) and [pids_9_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) (fail (exit 4)).
+Tests that pass on Linux and not on rukernel: 1: [cgroup](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/cgroup/cgroup_regression_test.sh) (fail (exit 1)).
 
 Tests that pass on rukernel and not on Linux: 5: [memcontrol02](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/memcg/memcontrol02.c), [cgroup_fj_stress_memory_2_9_one](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/cgroup_fj/cgroup_fj_stress.sh), [cgroup_fj_stress_memory_10_3_one](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/cgroup_fj/cgroup_fj_stress.sh), [cgroup_fj_stress_hugetlb_10_3_each](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/cgroup_fj/cgroup_fj_stress.sh) and [io_control01](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/io/io_control01.c).
 
@@ -324,42 +324,42 @@ Tests that pass on rukernel and not on Linux: 5: [memcontrol02](https://github.c
 | [cpuset_regression_test](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/cpuset/cpuset_regression_test.sh) | This is a regression test for commit: http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=bb2bc55 |  | does not apply | does not apply | 2026-11-14 | TCONF: cgroup v2 found, skipping test |
 | [cgroup_xattr](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/cgroup_xattr/cgroup_xattr.c) | Test checks following preconditions: since Linux kernel 3.7 it is possible to set extended attributes to cgroup files. |  | does not apply | does not apply | 2026-11-14 | The test needs a cgroup v1 hierarchy. rukernel has only cgroup v2 (TCONF). |
 | [io_control01](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/io/io_control01.c) | Perform some I/O on a file and check if at least some of it is recorded by the I/O controller. |  | pass | fail (exit 2) | 2026-11-14 |  |
-| [pids_1_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_1_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_1_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_1_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_1_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_2_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_2_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_2_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_2_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_2_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_3_0](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_3_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_3_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_3_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_3_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_4_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_4_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_4_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_4_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_4_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_5_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_6_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_6_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_6_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_6_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_6_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_7_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_7_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_7_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_7_500](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_7_1000](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_8_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_8_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_8_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_8_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_9_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_9_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | fail (exit 4) | pass | 2026-11-14 | At the end, the test sends SIGKILL to each process in child1 and runs rmdir at once. The child of pids_task1 is not a child of the shell, so wait does not wait for it, and rmdir gives EBUSY if that process has not yet run its exit. On Linux the woken process usually runs first, because a wakeup can preempt the shell. On rukernel it does not, so the result depends on timing: the test passed in the run on server2 and failed in the run on server1 (TBROK). A zombie does not keep a cgroup populated on rukernel, as on Linux: the thread leaves its cgroup in exit, not when its parent reaps it. |
-| [pids_9_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
-| [pids_9_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-14 |  |
+| [pids_1_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_1_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_1_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_1_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_1_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_2_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_2_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_2_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_2_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_2_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_3_0](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_3_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_3_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_3_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_3_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_4_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_4_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_4_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_4_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_4_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_5_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_6_1](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_6_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_6_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_6_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_6_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_7_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_7_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_7_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_7_500](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_7_1000](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_8_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_8_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_8_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_8_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_9_2](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_9_10](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 | At the end, the test sends SIGKILL to each process in child1 and runs rmdir at once. The child of pids_task1 is not a child of the shell, so wait does not wait for it, and rmdir gives EBUSY if that process has not yet run its exit. The process must run before the shell forks rmdir, so the wakeup of the SIGKILL must preempt the shell. On Linux the base slice on one CPU is 0.75 ms, and RUN_TO_PARITY keeps the shell on the CPU only for the slice that it had at its pick, so the wakeup preempts the shell. rukernel had a slice of 3 ms and kept the shell on the CPU for each new slice, so the test failed in about half of the runs (TBROK). With the slice and the RUN_TO_PARITY of Linux, the test passed 24 of 24 times on server1. A zombie does not keep a cgroup populated on rukernel, as on Linux: the thread leaves its cgroup in exit, not when its parent reaps it. |
+| [pids_9_50](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |
+| [pids_9_100](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/controllers/pids/pids.sh) |  |  | pass | pass | 2026-11-18 |  |

@@ -28,8 +28,17 @@ use tree::Tree;
 /// The weight of a task with nice 0.
 pub const NICE_0_WEIGHT: u64 = 1024;
 
-/// The base slice of a task in nanoseconds: `sysctl_sched_base_slice` of Linux.
-pub const BASE_SLICE: u64 = 3_000_000;
+/// The base slice of a task on one CPU in nanoseconds: `normalized_sysctl_sched_base_slice` of
+/// Linux.
+pub const BASE_SLICE: u64 = 750_000;
+
+/// The base slice of a task in nanoseconds on `cpus` CPUs: `sysctl_sched_base_slice` of Linux,
+/// with the default `SCHED_TUNABLESCALING_LOG` of `get_update_sysctl_factor`. The slice grows by
+/// `BASE_SLICE` for each doubling of the CPUs, up to 8 CPUs.
+pub fn base_slice(cpus: usize) -> u64 {
+    let factor = 1 + cpus.clamp(1, 8).ilog2();
+    BASE_SLICE * u64::from(factor)
+}
 
 /// The weight of a task with the `SCHED_IDLE` policy. Linux names it `WEIGHT_IDLEPRIO`.
 pub const WEIGHT_IDLE: u64 = 3;
@@ -60,11 +69,24 @@ pub struct Entity {
     /// The lag when the task went to sleep: the average virtual run time minus the virtual run
     /// time of the task.
     pub lag: i64,
+    /// The slice of the task in real time: `se->slice` of Linux, from `base_slice`.
+    pub slice: u64,
+    /// The deadline of the task when the CPU picked it. Linux keeps it in `se->vlag` while the
+    /// task runs, in `set_next_entity`. While the deadline is the same, the task did not get a
+    /// new slice since the pick, so `RUN_TO_PARITY` keeps it on the CPU.
+    pub picked: u64,
 }
 
 impl Default for Entity {
     fn default() -> Self {
-        Self { vruntime: 0, deadline: 0, weight: NICE_0_WEIGHT, lag: 0 }
+        Self {
+            vruntime: 0,
+            deadline: 0,
+            weight: NICE_0_WEIGHT,
+            lag: 0,
+            slice: BASE_SLICE,
+            picked: 0,
+        }
     }
 }
 
@@ -76,7 +98,7 @@ impl Entity {
 
     /// The slice of the task in virtual time.
     fn vslice(&self) -> u64 {
-        self.virt(BASE_SLICE)
+        self.virt(self.slice)
     }
 
     /// Adds `ns` of run time to the task. When the task used its slice, it gets a new deadline.
@@ -178,7 +200,7 @@ impl<T> Eevdf<T> {
     }
 
     /// Keeps the lag of `e`, a task that goes to sleep, as `update_entity_lag` of Linux. The lag
-    /// is at most the slice of the task, or one tick if that is more. `e` is not in the queue,
+    /// is at most two slices of the task, or one tick if that is more. `e` is not in the queue,
     /// but the average counts it, as in `dequeue_entity` of Linux. `place` makes the lag larger
     /// by the weight of `e`, so without `e` in the average a task that sleeps often gets more lag
     /// at each sleep, and its wakes stop the task that runs each time (#465).
@@ -205,15 +227,17 @@ impl<T> Eevdf<T> {
 
     /// Tells if `e`, a task that wakes or is new and is in the queue now, takes the CPU from
     /// `curr`, the task that runs, as `check_preempt_wakeup_fair` of Linux. With the
-    /// `RUN_TO_PARITY` of Linux, `curr` keeps the CPU while it is eligible and did not use its
-    /// slice, so that it runs to the average before a wake stops it. Then `e` takes the CPU if
-    /// it is eligible and `curr` is not eligible or has a later deadline.
+    /// `RUN_TO_PARITY` of Linux, `curr` keeps the CPU while it is eligible and did not use the
+    /// slice that it had when the CPU picked it, so that it runs to the average before a wake
+    /// stops it. After that slice, as in `pick_eevdf` of Linux, `curr` has no protection until
+    /// the CPU picks it again. Then `e` takes the CPU if it is eligible and `curr` is not
+    /// eligible or has a later deadline.
     pub fn wakeup_preempt(&self, curr: &Entity, e: &Entity) -> bool {
         let (key, load) = self.sums(Some(curr));
         // The test of `pick`, for a load that is not 0.
         let eligible = |v: u64| (i128::from(v) - i128::from(self.min_vruntime)) * load <= key;
         let curr_eligible = eligible(curr.vruntime);
-        if curr_eligible && curr.vruntime < curr.deadline {
+        if curr_eligible && curr.vruntime < curr.deadline && curr.deadline == curr.picked {
             return false;
         }
         eligible(e.vruntime) && (!curr_eligible || e.deadline < curr.deadline)
@@ -283,9 +307,9 @@ impl<T> Eevdf<T> {
 }
 
 /// The lag of `e` against the average `avg`, as `update_entity_lag` of Linux computes it. The lag
-/// is at most the slice of the task, or one tick if that is more.
+/// is at most two slices of the task, or one tick if that is more.
 fn lag_of(e: &Entity, avg: u64, tick_ns: u64) -> i64 {
-    let limit = i128::from(e.virt(BASE_SLICE.max(tick_ns)));
+    let limit = i128::from(e.virt((2 * e.slice).max(tick_ns)));
     let lag = i128::from(avg) - i128::from(e.vruntime);
     lag.clamp(-limit, limit) as i64
 }
@@ -299,7 +323,7 @@ impl<T> Default for Eevdf<T> {
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod glue {
     use super::balance::{self, BALANCE_INTERVAL, Load};
-    use super::{Eevdf, Entity, WEIGHT_IDLE, weight_of};
+    use super::{Eevdf, Entity, WEIGHT_IDLE, base_slice, weight_of};
     use alloc::boxed::Box;
     use alloc::sync::Arc;
     use core::any::Any;
@@ -332,6 +356,12 @@ mod glue {
         task.sched_data().downcast_ref::<TaskData>().expect("the data of the fair class")
     }
 
+    /// The base slice for the CPUs that run now. Linux sets `sysctl_sched_base_slice` again when a
+    /// CPU comes online.
+    fn slice() -> u64 {
+        base_slice(Fair::cpus())
+    }
+
     /// Adds the run time since the last charge to `task` and to its cgroup. Gives `true` if
     /// the task used its slice, and the entity after the charge.
     fn charge(task: &Task) -> (bool, Entity) {
@@ -352,8 +382,10 @@ mod glue {
         let weight =
             if group == 0 || group == rk_cgroup::ROOT { base } else { group_weight(base, group) };
         let mut e = d.entity.lock();
-        // The task runs, so it is not in a queue, and its weight can change.
+        // The task runs, so it is not in a queue, and its weight can change. A new deadline uses
+        // the slice for the CPUs that run now, as `update_deadline` of Linux.
         e.weight = weight;
+        e.slice = slice();
         (e.charge(ran), *e)
     }
 
@@ -477,6 +509,7 @@ mod glue {
             data(&task).cpu.store(cpu, Ordering::Relaxed);
             let mut rq = self.rqs[cpu].lock();
             if let Some(new) = place {
+                e.slice = slice();
                 // Without the run time since the last charge, the task that runs is behind its
                 // real place, and a task that wakes often gets more lag at each wake (#465).
                 let curr = rq.curr_except(task.id(), rk_frame::time::nanos());
@@ -636,7 +669,11 @@ mod glue {
             let d = data(task);
             *d.exec_start.lock() = rk_frame::time::nanos();
             d.cpu.store(this, Ordering::Relaxed);
-            let e = *d.entity.lock();
+            let e = {
+                let mut e = d.entity.lock();
+                e.picked = e.deadline;
+                *e
+            };
             let group = d.group.load(Ordering::Relaxed);
             let old = {
                 let mut rq = self.rqs[this].lock();

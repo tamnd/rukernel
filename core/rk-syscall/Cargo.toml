@@ -25,6 +25,7 @@ rk-net.workspace = true
 rk-net-inet.workspace = true
 rk-net-unix.workspace = true
 rk-proc.workspace = true
+rk-sched.workspace = true
 rk-vfs.workspace = true
 zerocopy.workspace = true
 
