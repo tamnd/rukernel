@@ -16952,7 +16952,8 @@ static void test_selinux(void)
 	struct statfs sfs;
 	struct stat st;
 	unsigned long ino_w = 0, ino_e = 0, ino_n = 0, ino_d = 0, ino_f = 0;
-	int n, fd, len, efd, xfd, cfd;
+	int n, fd, len, efd, xfd, cfd, rfd, wfd, afd;
+	struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
 
 	n = klogctl(3, buf, sizeof(buf) - 1);
 	buf[n > 0 ? n : 0] = 0;
@@ -17084,6 +17085,8 @@ static void test_selinux(void)
 	n = fd >= 0 && close(fd) == 0 ? getxattr("/tmp/rk-f", "security.selinux", buf, 256) : -1;
 	check("selinux: a new file gets the label of attr/fscreate", n == 27 && strcmp(buf, "system_u:object_r:bin_t:s0") == 0);
 	aa_write("/proc/self/attr/fscreate", "\n", 1, 0);
+	/* The policy allows the read of bin_t at the open. The change of the label below makes the next read check again. */
+	rfd = open("/tmp/rk-f", O_RDONLY);
 	n = setxattr("/tmp/rk-f", "security.selinux", "system_u:object_r:etc_t:s1", 27, 0) == 0 ? getxattr("/tmp/rk-f", "security.selinux", buf, 256) : -1;
 	check("selinux: a setxattr of security.selinux changes the label in permissive mode", n == 27 && strcmp(buf, "system_u:object_r:etc_t:s1") == 0);
 	check("selinux: a removexattr of security.selinux gives EACCES", removexattr("/tmp/rk-f", "security.selinux") < 0 && errno == EACCES);
@@ -17096,7 +17099,9 @@ static void test_selinux(void)
 	efd = open("/sys/fs/selinux/enforce", O_WRONLY);
 	xfd = open("/proc/self/attr/exec", O_WRONLY);
 	cfd = open("/sys/fs/selinux/checkreqprot", O_WRONLY);
-	check("selinux: an open for a write that the policy does not allow works in permissive mode", efd >= 0 && xfd >= 0 && cfd >= 0);
+	wfd = open("/tmp/rk-aa-w", O_WRONLY);
+	afd = open("/tmp/rk-aa-w", O_WRONLY | O_APPEND);
+	check("selinux: an open for a write that the policy does not allow works in permissive mode", efd >= 0 && xfd >= 0 && cfd >= 0 && wfd >= 0 && afd >= 0);
 	if (stat("/sys/fs/selinux/enforce", &st) == 0)
 		ino_e = st.st_ino;
 	check("selinux: a write of 1 to enforce works in permissive mode", aa_write("/sys/fs/selinux/enforce", "1", 1, O_TRUNC) == 0 && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "1") == 0);
@@ -17110,6 +17115,18 @@ static void test_selinux(void)
 	close(efd);
 	close(xfd);
 	close(cfd);
+	/*
+	 * The checks of an open file, as selinux_file_permission, selinux_file_lock and selinux_file_fcntl of Linux. The open checked
+	 * the permissions, so a write works until the label of the file or the policy changes. A lock and an fcntl that removes
+	 * O_APPEND need their permissions on each call.
+	 */
+	check("selinux: a write to a file that init opened in permissive mode works in enforcing mode", write(wfd, "x", 1) == 1);
+	check("selinux: a read after a change of the label of the open file gives EACCES in enforcing mode", rfd >= 0 && read(rfd, buf, 1) < 0 && errno == EACCES);
+	check("selinux: a flock and an fcntl lock give EACCES in enforcing mode", flock(wfd, LOCK_EX) < 0 && errno == EACCES && fcntl(wfd, F_SETLK, &fl) < 0 && errno == EACCES && (fcntl(wfd, F_GETFL) & O_ACCMODE) == O_WRONLY);
+	check("selinux: an F_SETFL that removes O_APPEND gives EACCES in enforcing mode", fcntl(afd, F_SETFL, 0) < 0 && errno == EACCES && fcntl(afd, F_SETFL, O_APPEND | O_NONBLOCK) == 0);
+	close(rfd);
+	close(wfd);
+	close(afd);
 	check("selinux: an open of enforce for a write gives EACCES in enforcing mode", aa_write("/sys/fs/selinux/enforce", "0", 1, 0) == EACCES);
 	check("selinux: a stat and an open for a read that the policy allows work in enforcing mode", stat("/tmp/rk-aa-w", &st) == 0 && (fd = open("/tmp/rk-aa-w", O_RDONLY)) >= 0 && close(fd) == 0);
 	check("selinux: access gives EACCES for a write that the policy does not allow", access("/tmp/rk-aa-w", R_OK) == 0 && access("/tmp/rk-aa-w", W_OK) < 0 && errno == EACCES);
@@ -17161,6 +17178,14 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the denial of the validatetrans rule", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "avc:  denied  { associate } for  pid=1 comm=\"init\" name=\"rk-f\" dev=\"tmpfs\" ino=%lu scontext=system_u:object_r:etc_t:s1 tcontext=system_u:object_r:tmpfs_t:s0 tclass=filesystem permissive=1", ino_f);
 	check("selinux: the kernel log has the denial of the associate of the new label", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { read } for  pid=1 comm=\"init\" path=\"/tmp/rk-f\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:etc_t:s1 tclass=file permissive=0", ino_f, kernel);
+	check("selinux: the kernel log has the denial of the read after the change of the label", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { lock } for  pid=1 comm=\"init\" path=\"/tmp/rk-aa-w\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0", ino_w, kernel);
+	check("selinux: the kernel log has the denial of the lock", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { write } for  pid=1 comm=\"init\" path=\"/tmp/rk-aa-w\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0", ino_w, kernel);
+	check("selinux: the kernel log has the denial of the F_SETFL", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "tcontext=%s tclass=fd permissive=1", kernel);
+	check("selinux: the kernel log has the denial of the use of the pipe of init by init_t", strstr(buf, "avc:  denied  { use } for  pid=") != NULL && strstr(buf, "scontext=system_u:system_r:init_t:s0 ") != NULL && strstr(buf, want) != NULL);
 	unlink("/tmp/rk-aa-w");
 	unlink("/tmp/rk-f");
 	unlink("/tmp/rk-sub");

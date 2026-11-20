@@ -262,6 +262,8 @@ pub mod file {
     pub const GETATTR: u32 = 1 << 4;
     /// `setattr`.
     pub const SETATTR: u32 = 1 << 5;
+    /// `lock`.
+    pub const LOCK: u32 = 1 << 6;
     /// `relabelfrom`.
     pub const RELABELFROM: u32 = 1 << 7;
     /// `relabelto`.
@@ -284,6 +286,12 @@ pub mod file {
     pub const EXECUTE_NO_TRANS: u32 = 1 << 26;
     /// `entrypoint`.
     pub const ENTRYPOINT: u32 = 1 << 27;
+}
+
+/// The permissions of the class `fd`, `FD__*` of Linux.
+pub mod fd {
+    /// `use`.
+    pub const USE: u32 = 1 << 0;
 }
 
 /// The permissions of the class `dir` that the other classes of files do not have, `DIR__*`

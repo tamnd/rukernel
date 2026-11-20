@@ -79,6 +79,13 @@ pub fn reset(seqno: u32) {
     cache.latest = cache.latest.max(seqno);
 }
 
+/// The number of the last policy load that the cache knows, as `avc_policy_seqno` of Linux.
+/// An open file keeps this number, and a change of it makes the next read or write of the
+/// file check the permissions again.
+pub fn policy_seqno() -> u32 {
+    CACHE.lock().latest
+}
+
 /// Checks the permissions `requested` of the class `tclass` of the kernel for the SID `ssid`
 /// on the SID `tsid`, without an audit record, as `avc_has_perm_noaudit` of Linux. It gives
 /// the decision and the result.

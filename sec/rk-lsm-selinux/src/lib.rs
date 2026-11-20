@@ -8,9 +8,9 @@
 //! with its table of SIDs ([`sidtab`]), the text of the contexts ([`context`]), the classes of
 //! the kernel ([`classmap`]), the access vector cache ([`avc`]), the SIDs of the tasks with
 //! their change at an exec and their attributes in `/proc/PID/attr` ([`task`]), the labels of
-//! the files ([`inode`]), the checks of the access to the files ([`file`]) and of the
-//! operations on the names of the directories ([`namei`]), and the labels of the new files
-//! and the changes of the labels ([`xattr`]).
+//! the files ([`inode`]), the checks of the access to the files and to the open files
+//! ([`file`]) and of the operations on the names of the directories ([`namei`]), and the
+//! labels of the new files and the changes of the labels ([`xattr`]).
 //!
 //! The module is active when the command line has `selinux=1`, when `lsm=` names it, or with
 //! `security=selinux`. With `selinux=0` it is not active. The module starts in permissive
@@ -109,8 +109,24 @@ impl SecurityHooks for SeLinux {
         file::inode_permission(cred, inode, at, mask)
     }
 
+    fn file_alloc_security(&self, f: &File) {
+        file::alloc_security(f);
+    }
+
     fn file_open(&self, f: &File, cred: &Cred, flags: u32) -> Result<()> {
         file::file_open(f, cred, flags)
+    }
+
+    fn file_permission(&self, f: &File, mask: u32) -> Result<()> {
+        file::file_permission(f, mask)
+    }
+
+    fn file_lock(&self, f: &File, _cmd: u32) -> Result<()> {
+        file::file_lock(f)
+    }
+
+    fn file_fcntl(&self, f: &File, cmd: u32, arg: u64) -> Result<()> {
+        file::file_fcntl(f, cmd, arg)
     }
 
     fn inode_getattr(&self, at: &Location) -> Result<()> {
@@ -226,7 +242,12 @@ pub static LSM: LsmInfo = LsmInfo {
     id: LsmId { name: "selinux", id: id::SELINUX },
     order: Order::Mutable,
     flags: FLAG_LEGACY_MAJOR | FLAG_EXCLUSIVE,
-    blobs: BlobSizes { cred: task::CRED_BLOB, inode: inode::INODE_BLOB, ..BlobSizes::NONE },
+    blobs: BlobSizes {
+        cred: task::CRED_BLOB,
+        file: file::FILE_BLOB,
+        inode: inode::INODE_BLOB,
+        ..BlobSizes::NONE
+    },
     hooks: &SeLinux,
 };
 
