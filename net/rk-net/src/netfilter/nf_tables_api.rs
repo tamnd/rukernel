@@ -48,6 +48,7 @@ use crate::netlink::nfnetlink::{
     nfnl_msg_type,
 };
 use crate::ns::PerNet;
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -659,6 +660,8 @@ struct NftSet {
     /// of them: the commit keeps the batch's change of these over the one of `dynset`.
     touched: BTreeSet<Vec<u8>>,
     flushed: bool,
+    /// The batch has removed the elements that had expired, at its first insert in the set.
+    collected: bool,
     /// The ID in the batch that made the set, for `NFTA_SET_ELEM_LIST_SET_ID`.
     txn_id: Option<u32>,
 }
@@ -699,14 +702,25 @@ impl NftSet {
             && (self.policy != NFT_SET_POL_MEMORY || self.size == 0)
     }
 
-    /// The number of elements that count for the size of the set.
+    /// The number of elements that count for the size of the set, as `set->nelems` of Linux:
+    /// an element that has expired counts until `gc` removes it. The catch-all elements come
+    /// last.
     fn nelems(&self) -> usize {
-        // The catch-all elements come last. Only a set with timeouts has elements that expire.
-        if self.flags & NFT_SET_TIMEOUT == 0 {
-            return self.elems.len() - self.elems.keys().rev().take_while(|k| k.catchall).count();
+        self.elems.len() - self.elems.keys().rev().take_while(|k| k.catchall).count()
+    }
+
+    /// Removes the elements that have expired, as the garbage collection of Linux, once in a
+    /// batch. Linux removes them in the work of the garbage collection and does not go
+    /// through the set on an insert, so an insert here does not either: the lookups, the
+    /// dumps and the checks of an insert do not see an element that has expired.
+    fn gc(&mut self, now: u64) {
+        if self.flags & NFT_SET_TIMEOUT == 0 || self.collected {
+            return;
         }
-        let now = nft_now_ns();
-        self.elems.iter().filter(|(k, e)| !k.catchall && !e.expired(now)).count()
+        #[cfg(test)]
+        work::add(&work::SCANNED, self.elems.len());
+        self.elems.retain(|_, e| !e.expired(now));
+        self.collected = true;
     }
 
     /// The elements that have not expired.
@@ -729,9 +743,45 @@ impl NftSet {
 
     /// The elements that have not expired with the ones of `dynset`, for the dumps.
     fn view(&self) -> BTreeMap<ElemKey, NftElem> {
-        let mut elems = self.live_elems().map(|(k, e)| (k.clone(), e.clone())).collect();
+        let mut elems: BTreeMap<_, _> =
+            self.live_elems().map(|(k, e)| (k.clone(), e.clone())).collect();
+        #[cfg(test)]
+        work::add(&work::COPIED, elems.len());
         nft_dyn_apply(&mut elems, &self.dynamic.0.lock(), &BTreeSet::new());
         elems
+    }
+
+    /// The elements in which `NFT_MSG_GETSETELEM` looks: the ones of the set, or a copy with
+    /// the ones of `dynset` if it changed some since the last commit.
+    fn get_view(&self) -> Cow<'_, BTreeMap<ElemKey, NftElem>> {
+        if self.dynamic.0.lock().elems.is_empty() {
+            Cow::Borrowed(&self.elems)
+        } else {
+            Cow::Owned(self.view())
+        }
+    }
+}
+
+/// The work of a batch in the tests: the elements that the removal of the expired elements
+/// looked at, and the elements that a copy of a set copied.
+#[cfg(test)]
+mod work {
+    extern crate std;
+    use core::cell::Cell;
+    use std::thread::LocalKey;
+
+    std::thread_local! {
+        pub(super) static SCANNED: Cell<usize> = const { Cell::new(0) };
+        pub(super) static COPIED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add(counter: &'static LocalKey<Cell<usize>>, n: usize) {
+        counter.with(|c| c.set(c.get() + n));
+    }
+
+    /// Gives the counts and sets them back to 0.
+    pub(super) fn take() -> (usize, usize) {
+        (SCANNED.with(|c| c.replace(0)), COPIED.with(|c| c.replace(0)))
     }
 }
 
@@ -763,24 +813,27 @@ fn nft_set_fields(set: &NftSet) -> Vec<usize> {
 /// backends of sets of Linux. In a set with `NFT_SET_INTERVAL`, a start that is not an element
 /// gives the start of the range that has it, and an end gives the end of the range that has
 /// it, as `__nft_rbtree_get`. An element with `NFTA_SET_ELEM_KEY_END` has the keys of its range
-/// in each field, as `nft_pipapo_get`.
+/// in each field, as `nft_pipapo_get`. The elements of `view` that have expired are not
+/// there at the time `now`, so `view` can be the elements of the set with no copy.
 fn nft_setelem_get<'a>(
     set: &NftSet,
     view: &'a BTreeMap<ElemKey, NftElem>,
     key: &ElemKey,
+    now: u64,
 ) -> Option<(ElemKey, &'a NftElem)> {
-    if let Some(e) = view.get(key) {
+    let live = |e: &&NftElem| !e.expired(now);
+    if let Some(e) = view.get(key).filter(live) {
         return Some((key.clone(), e));
     }
     if set.flags & NFT_SET_INTERVAL == 0 || key.catchall {
         return None;
     }
     let is_end = |k: &ElemKey, e: &NftElem| k.end || e.flags & NFT_SET_ELEM_INTERVAL_END != 0;
-    if view.values().any(|e| e.key_end.is_some()) {
+    if view.values().any(|e| e.key_end.is_some() && live(&e)) {
         let fields = nft_set_fields(set);
         return view
             .iter()
-            .filter(|(k, _)| !k.catchall)
+            .filter(|(k, e)| !k.catchall && live(e))
             .find(|(k, e)| {
                 e.key_end.as_ref().is_some_and(|end| nft_range_has(&fields, &k.key, end, &key.key))
             })
@@ -789,16 +842,16 @@ fn nft_setelem_get<'a>(
     let (k, e) = if key.end {
         // The first element after the key must be the end of its range.
         let after = (Excluded(key.clone()), Unbounded);
-        view.range(after).find(|(k, _)| !k.catchall).filter(|(k, e)| is_end(k, e))?
+        view.range(after).find(|(k, e)| !k.catchall && live(e)).filter(|(k, e)| is_end(k, e))?
     } else {
         // The key just after the end of a range is not in the range.
         let end = ElemKey { end: true, ..key.clone() };
-        if view.contains_key(&end) {
+        if view.get(&end).filter(live).is_some() {
             return None;
         }
         let start = ElemKey { catchall: false, key: Vec::new(), end: false };
         let before = (Included(start), Excluded(key.clone()));
-        view.range(before).next_back().filter(|(k, e)| !is_end(k, e))?
+        view.range(before).rev().find(|(_, e)| live(e)).filter(|(k, e)| !is_end(k, e))?
     };
     Some((k.clone(), e))
 }
@@ -1934,14 +1987,15 @@ fn nf_tables_getsetelem(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<()> {
         .map_err(|e| bad(info, nla, NFTA_SET_ELEM_LIST_SET, e))?;
     let set = &table.sets[s];
     let Some(list) = nla.get(NFTA_SET_ELEM_LIST_ELEMENTS) else { return Err(Errno::EINVAL) };
-    let view = set.view();
+    let now = nft_now_ns();
+    let view = set.get_view();
     let mut replies = Vec::new();
     for (_, attr) in msg::attrs(list) {
         let ea = Attrs::parse(attr, NFTA_SET_ELEM_MAX);
         let flags = nft_setelem_parse_flags(set, &ea)?;
         let key =
             nft_setelem_parse_elemkey(set, &ea, flags).inspect_err(|_| info.req.bad_attr(attr))?;
-        let Some((key, e)) = nft_setelem_get(set, &view, &key) else {
+        let Some((key, e)) = nft_setelem_get(set, &view, &key, now) else {
             info.req.bad_attr(attr);
             return Err(Errno::ENOENT);
         };
@@ -3068,6 +3122,7 @@ impl NftBatch {
             dynamic: DynElems::default(),
             touched: BTreeSet::new(),
             flushed: false,
+            collected: false,
             txn_id: Some(id),
         });
         let s = table.sets.len() - 1;
@@ -3129,6 +3184,7 @@ impl NftBatch {
 
     /// Adds one element, as `nft_add_set_elem` of Linux.
     fn nft_add_set_elem(&mut self, ctx: &NftCtx, t: usize, s: usize, attr: &[u8]) -> Result<()> {
+        self.tables[t].sets[s].gc(nft_now_ns());
         let table = &self.tables[t];
         let set = &table.sets[s];
         let ea = Attrs::parse(attr, NFTA_SET_ELEM_MAX);
@@ -3241,13 +3297,7 @@ impl NftBatch {
         }
         let seq = nft_elem_seq();
         let elem = NftElem { key_end, data, flags, udata, timeout, expires, exprs, seq };
-        // The elements that have expired go, as the garbage collection of Linux. Only a set
-        // with timeouts has them.
         let set = &mut self.tables[t].sets[s];
-        if set.flags & NFT_SET_TIMEOUT != 0 {
-            let now = nft_now_ns();
-            set.elems.retain(|_, e| !e.expired(now));
-        }
         set.elems.insert(key.clone(), elem);
         set.touched.insert(key.key.clone());
         self.notify_setelem(ctx, NFT_MSG_NEWSETELEM, t, s, &key);
@@ -3539,6 +3589,7 @@ impl NfnlBatch for NftBatch {
             s.merge_dynamic(g);
             s.touched.clear();
             s.flushed = false;
+            s.collected = false;
         }
         nft_sync_hooks(&mut self.net, &tables)?;
         for g in &mut dynamic {
@@ -3631,6 +3682,7 @@ mod tests {
             dynamic: DynElems::default(),
             touched: BTreeSet::new(),
             flushed: false,
+            collected: false,
             txn_id: None,
         }
     }
@@ -4122,7 +4174,8 @@ mod tests {
             s.elems.insert(k(key, end), elem(None));
         }
         let v = s.view();
-        let get = |key, end| nft_setelem_get(&s, &v, &k(key, end)).map(|(k, _)| (k.key[1], k.end));
+        let get =
+            |key, end| nft_setelem_get(&s, &v, &k(key, end), 0).map(|(k, _)| (k.key[1], k.end));
         assert_eq!(get(10, false), Some((10, false)));
         assert_eq!(get(22, false), Some((20, false)));
         assert_eq!(get(25, true), Some((31, true)));
@@ -4146,12 +4199,125 @@ mod tests {
         let v = c.view();
         let get = |a, p| {
             let k = ElemKey { catchall: false, key: key(a, p), end: false };
-            nft_setelem_get(&c, &v, &k).map(|(k, _)| k)
+            nft_setelem_get(&c, &v, &k, 0).map(|(k, _)| k)
         };
         assert_eq!(get(5, 50), Some(start.clone()));
         assert_eq!(get(5, 150), None);
         assert!(!nft_range_has(&nft_set_fields(&c), &key(0, 1), &key(255, 100), &key(5, 0)));
         assert!(nft_range_has(&[], &key(0, 1), &key(255, 100), &key(5, 0)));
+    }
+
+    #[test]
+    fn a_batch_removes_the_elements_that_expired_once_and_a_get_does_not_copy_the_set() {
+        // A set with timeouts and 20000 elements: the even ones expire at 1 s, the odd ones at
+        // 2 s.
+        let k = |i: u32| ElemKey { catchall: false, key: i.to_be_bytes().to_vec(), end: false };
+        let e = NftElem {
+            key_end: None,
+            data: None,
+            flags: 0,
+            udata: None,
+            timeout: 1000,
+            expires: 1_000_000_000,
+            exprs: Vec::new(),
+            seq: 0,
+        };
+        let mut s = set(b"t");
+        s.flags = NFT_SET_TIMEOUT;
+        for i in 0..20_000u32 {
+            let expires = if i % 2 == 0 { 1_000_000_000 } else { 2_000_000_000 };
+            s.elems.insert(k(i), NftElem { expires, ..e.clone() });
+        }
+        let get = |s: &NftSet, i, now| nft_setelem_get(s, &s.elems, &k(i), now).map(|(k, _)| k);
+        // A get on the elements of the set does not see one that expired, before the garbage
+        // collection too.
+        assert_eq!(get(&s, 2, 1_500_000_000), None);
+        assert_eq!(get(&s, 3, 1_500_000_000), Some(k(3)));
+        // An element that expired counts for the size until the collection, as in Linux.
+        assert_eq!(s.nelems(), 20_000);
+        s.gc(1_500_000_000);
+        assert_eq!(s.nelems(), 10_000);
+        // The batch collects once: the elements that expire later stay until the next batch.
+        s.gc(2_500_000_000);
+        assert_eq!(s.nelems(), 10_000);
+        assert_eq!(get(&s, 3, 2_500_000_000), None);
+        // The commit lets the next batch collect again.
+        s.collected = false;
+        s.gc(2_500_000_000);
+        assert_eq!(s.nelems(), 0);
+        // A set with no timeouts has nothing to collect.
+        let mut n = set(b"n");
+        n.elems.insert(k(1), e);
+        n.gc(u64::MAX);
+        assert_eq!(n.nelems(), 1);
+    }
+
+    #[test]
+    fn a_batch_of_400_inserts_in_a_set_of_10000_scans_it_once_and_a_get_copies_nothing() {
+        // The batch of `nft add element` of maps/vmap_timeout: 400 elements in a set with
+        // timeouts, which has 10000 elements already. The set has a size, so an insert checks
+        // the count of the elements.
+        let n = 10_000u32;
+        let key = |i: u32| ElemKey { catchall: false, key: i.to_be_bytes().to_vec(), end: false };
+        let e = NftElem {
+            key_end: None,
+            data: None,
+            flags: 0,
+            udata: None,
+            timeout: 0,
+            expires: 0,
+            exprs: Vec::new(),
+            seq: 0,
+        };
+        let mut s = NftSet { flags: NFT_SET_TIMEOUT, size: 65_536, ..set(b"m") };
+        for i in 0..n {
+            s.elems.insert(key(i), e.clone());
+        }
+        let mut t = table();
+        t.sets.push(s);
+        let mut batch = NftBatch {
+            net: NFT.get().lock(),
+            tables: alloc::vec![t],
+            table_handle: 1,
+            next_seq: 1,
+            notices: Vec::new(),
+            listen: false,
+            changed: false,
+            updated: Vec::new(),
+            added_devs: Vec::new(),
+            validate: false,
+        };
+        let ctx = NftCtx {
+            family: NFPROTO_IPV4,
+            portid: 0,
+            seq: 0,
+            flags: 0,
+            report: false,
+            ty: NFT_MSG_NEWSETELEM,
+        };
+        work::take();
+        for i in n..n + 400 {
+            let mut b = Builder::new(0, 0, 0, 0);
+            let k = b.nest(NFTA_SET_ELEM_KEY as u16 | NLA_F_NESTED as u16);
+            b.put(NFTA_DATA_VALUE as u16, &i.to_be_bytes());
+            b.end_nest(k);
+            batch.nft_add_set_elem(&ctx, 0, 0, &b.finish()[msg::HDRLEN..]).unwrap();
+        }
+        let set = &batch.tables[0].sets[0];
+        assert_eq!(set.nelems(), 10_400);
+        // The batch looked at each element of the set once for the ones that expired, and
+        // copied nothing.
+        assert_eq!(work::take(), (10_000, 0));
+        // A get looks in the elements of the set, with no copy.
+        let view = set.get_view();
+        assert!(matches!(view, Cow::Borrowed(_)));
+        assert_eq!(nft_setelem_get(set, &view, &key(5), 0).map(|(k, _)| k), Some(key(5)));
+        drop(view);
+        assert_eq!(work::take(), (0, 0));
+        // With a change of `dynset` that no commit took yet, a get copies the set.
+        set.dynamic.0.lock().elems.insert(key(n + 400).key, DynElem::Add(e));
+        assert_eq!(set.get_view().len(), 10_401);
+        assert_eq!(work::take(), (0, 10_400));
     }
 
     #[test]
