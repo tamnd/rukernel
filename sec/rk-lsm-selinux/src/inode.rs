@@ -44,6 +44,9 @@ pub const XATTR_NAME: &[u8] = b"security.selinux";
 /// [`crate::POLICYCAP_NAMES`].
 const POLICYCAP_GENFS_SECLABEL_SYMLINKS: u32 = 6;
 
+/// The number of the policy capability `cgroup_seclabel` in [`crate::POLICYCAP_NAMES`].
+const POLICYCAP_CGROUP_SECLABEL: u32 = 4;
+
 /// The type bits of a mode, `S_IFMT`.
 const S_IFMT: u32 = 0o170_000;
 
@@ -92,6 +95,23 @@ fn genfs_flags(fstype: &str) -> Genfs {
             Genfs { paths: true, xattr: true, ..Genfs::default() }
         }
         _ => Genfs::default(),
+    }
+}
+
+/// Tells if the files of the file system type `fstype` keep their labels, so a task can give
+/// the label of a new file, as `SBLABEL_MNT` from `selinux_is_sblabel_mnt` of Linux: the
+/// `fs_use_*` rules, and a few `genfscon` types with an attribute `security.selinux` in memory.
+pub fn sblabel(fstype: &str) -> bool {
+    match server::fs_use(fstype).0 {
+        fs_use::XATTR | fs_use::TRANS | fs_use::TASK => true,
+        fs_use::GENFS => match fstype {
+            "sysfs" | "pstore" | "debugfs" | "tracefs" | "rootfs" => true,
+            "cgroup" | "cgroup2" => {
+                crate::policy().is_some_and(|p| p.db.policycap(POLICYCAP_CGROUP_SECLABEL))
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 

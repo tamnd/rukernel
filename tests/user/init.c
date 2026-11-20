@@ -16680,7 +16680,8 @@ static int aa_write(const char *path, const char *data, size_t len, int flags)
  * with EACCES, chroot and sethostname with EPERM, because the rules allow no capability, and a
  * signal to the parent and a PTRACE_TRACEME of a child with EACCES. It gives 0 or the number of
  * the first check that failed. It does not read its
- * label, because the rules do not allow it. The names are in /etc, which has no rule.
+ * label, because the rules do not allow it. The names are in /etc, which has no rule. With the
+ * arguments "mkdir" and a path, it makes that directory.
  */
 static int aa_label_helper(int argc, char **argv)
 {
@@ -16741,6 +16742,8 @@ static int aa_label_helper(int argc, char **argv)
 	}
 	if (argc > 1 && strcmp(argv[1], "exec") == 0)
 		return n > 0 && aa_read("/proc/self/attr/exec", buf, sizeof(buf)) < 0 && errno == EINVAL ? 0 : 1;
+	if (argc > 2 && strcmp(argv[1], "mkdir") == 0)
+		return n > 0 && mkdir(argv[2], 0755) == 0 ? 0 : 1;
 	if (argc > 1 && strcmp(argv[1], "files") == 0) {
 		int w = open("/tmp/rk-aa-w", O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		int r = open("/etc/rk_test.aa", O_RDONLY);
@@ -16948,7 +16951,7 @@ static void test_selinux(void)
 	static char want[512];
 	struct statfs sfs;
 	struct stat st;
-	unsigned long ino_w = 0, ino_e = 0;
+	unsigned long ino_w = 0, ino_e = 0, ino_n = 0, ino_d = 0;
 	int n, fd, len, efd, xfd, cfd;
 
 	n = klogctl(3, buf, sizeof(buf) - 1);
@@ -17055,6 +17058,18 @@ static void test_selinux(void)
 		check("selinux: a chmod that the policy does not allow works in permissive mode", chmod("/tmp/rk-aa-w", 0644) == 0 && stat("/tmp/rk-aa-w", &st) == 0 && (st.st_mode & 07777) == 0644);
 		ino_w = st.st_ino;
 	}
+	{
+		char *named[] = { "rk-sub", "mkdir", "/tmp/named", NULL };
+
+		check("selinux: a mkdir that the policy does not allow works in permissive mode", aa_run_at("/tmp/rk-sub", init, named, buf, 256) > 0 && stat("/tmp/named", &st) == 0 && S_ISDIR(st.st_mode));
+	}
+	fd = open("/tmp/rk-n", O_WRONLY | O_CREAT, 0644);
+	if (fd >= 0 && fstat(fd, &st) == 0)
+		ino_n = st.st_ino;
+	check("selinux: a link, a rename and an unlink that the policy does not allow work in permissive mode", fd >= 0 && close(fd) == 0 && link("/tmp/rk-n", "/tmp/rk-l") == 0 && rename("/tmp/rk-l", "/tmp/rk-r") == 0 && unlink("/tmp/rk-r") == 0 && unlink("/tmp/rk-n") == 0 && access("/tmp/rk-n", F_OK) < 0);
+	if (mkdir("/tmp/rk-d", 0755) == 0 && stat("/tmp/rk-d", &st) == 0)
+		ino_d = st.st_ino;
+	check("selinux: a mkdir and an rmdir that the policy does not allow work in permissive mode", ino_d != 0 && rmdir("/tmp/rk-d") == 0);
 	n = aa_run_at("/tmp/rk-sub", init, sub, buf, 256);
 	check("selinux: an exec after a write to attr/exec runs with the new context", n == (int)sizeof(init) && strcmp(buf, init) == 0);
 	n = aa_run_at("/tmp/rk-sub", NULL, sub, buf, 256);
@@ -17105,6 +17120,22 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the denial of the chmod in enforcing mode", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "avc:  denied  { append } for  pid=1 comm=\"init\" name=\"rk-aa-w\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0", ino_w, kernel);
 	check("selinux: the kernel log has the denial of the open with O_APPEND", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { add_name } for  pid=1 comm=\"init\" name=\"rk-sub\" scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=dir permissive=1", kernel);
+	check("selinux: the kernel log has the denial of the new name with only the name", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { create } for  pid=1 comm=\"init\" name=\"rk-sub\" scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=file permissive=1", kernel);
+	check("selinux: the kernel log has the denial of the create", strstr(buf, want) != NULL);
+	check("selinux: the kernel log has the denial of the associate", strstr(buf, "avc:  denied  { associate } for  pid=1 comm=\"init\" name=\"rk-sub\" scontext=system_u:object_r:tmpfs_t:s0 tcontext=system_u:object_r:tmpfs_t:s0 tclass=filesystem permissive=1") != NULL);
+	check("selinux: the kernel log has the create of a directory with the type_transition rule for its name", strstr(buf, " comm=\"rk-sub\" name=\"named\" scontext=system_u:system_r:init_t:s0 tcontext=system_u:object_r:bin_t:s0 tclass=dir permissive=1") != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { link } for  pid=1 comm=\"init\" name=\"rk-n\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=file permissive=1", ino_n, kernel);
+	check("selinux: the kernel log has the denial of the link", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { remove_name } for  pid=1 comm=\"init\" name=\"rk-l\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=dir permissive=1", ino_n, kernel);
+	check("selinux: the kernel log has the denial of the removal of the old name", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { rename } for  pid=1 comm=\"init\" name=\"rk-l\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=file permissive=1", ino_n, kernel);
+	check("selinux: the kernel log has the denial of the rename", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { unlink } for  pid=1 comm=\"init\" name=\"rk-r\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=file permissive=1", ino_n, kernel);
+	check("selinux: the kernel log has the denial of the unlink", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { rmdir } for  pid=1 comm=\"init\" name=\"rk-d\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=dir permissive=1", ino_d, kernel);
+	check("selinux: the kernel log has the denial of the rmdir", strstr(buf, want) != NULL);
 	unlink("/tmp/rk-aa-w");
 	unlink("/tmp/rk-sub");
 	umount("/tmp");

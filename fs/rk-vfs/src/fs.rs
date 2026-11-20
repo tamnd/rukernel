@@ -306,6 +306,7 @@ impl FsContext {
                     crate::security::path_mknod(&parent.dir, &parent.name, new_mode, 0)?;
                     self.may_change(&parent.dir)?;
                     check_immutable(&**parent.dir.inode())?;
+                    crate::security::inode_create(&parent.dir, &parent.name, new_mode)?;
                     let dir = parent.dir.inode();
                     let perm = self.cred.strip_sgid(
                         &dir.metadata(),
@@ -593,18 +594,24 @@ impl FsContext {
         if absent(&r) { Ok(false) } else { r.map(|_| true) }
     }
 
-    /// Makes a new inode of the type `kind` for `mkdirat`, `mknodat` and `symlinkat`. `check` is
-    /// the LSM check, which gets the directory and the name. `f` gets the directory, the name and
-    /// the permission bits after the umask or the default ACL of the directory masks `perm`.
+    /// Makes a new inode of the type `kind` for `mkdirat`, `mknodat` and `symlinkat`. `checks`
+    /// are the LSM check `path_*` before the checks of the directory, and the checks of `vfs_*`
+    /// of Linux after them, with the LSM check `inode_*`. Each gets the directory and the name.
+    /// `f` gets the directory, the name and the permission bits after the umask or the default
+    /// ACL of the directory masks `perm`.
     fn make(
         &self,
         start: &Location,
         path: &[u8],
         kind: FileType,
         perm: u32,
-        check: impl FnOnce(&Location, &[u8]) -> Result<()>,
+        checks: (
+            impl FnOnce(&Location, &[u8]) -> Result<()>,
+            impl FnOnce(&Location, &[u8]) -> Result<()>,
+        ),
         f: impl FnOnce(&InodeRef, &[u8], u32) -> Result<InodeRef>,
     ) -> Result<Location> {
+        let (check, create_check) = checks;
         let parent = self.parent(start, path)?;
         // The check of the name and the create are one step, as `filename_create` of Linux
         // holds the lock of the directory.
@@ -621,6 +628,7 @@ impl FsContext {
         }
         self.may_change(&parent.dir)?;
         check_immutable(&**parent.dir.inode())?;
+        create_check(&parent.dir, &parent.name)?;
         let dir = parent.dir.inode();
         let perm = self.cred.strip_sgid(&dir.metadata(), kind, perm);
         let (perm, acls) = acl::create(&**dir, kind, perm, self.umask);
@@ -648,17 +656,21 @@ impl FsContext {
         perm: u32,
         f: impl FnOnce(&InodeRef, &[u8], u32) -> Result<InodeRef>,
     ) -> Result<Location> {
-        self.make(start, path, FileType::Regular, perm & mode::PERM_MASK, |_, _| Ok(()), f)
+        let perm = perm & mode::PERM_MASK;
+        let create_check = |dir: &Location, name: &[u8]| {
+            crate::security::inode_create(dir, name, mode::S_IFREG | perm)
+        };
+        self.make(start, path, FileType::Regular, perm, (|_, _| Ok(()), create_check), f)
     }
 
     /// `mkdirat`.
     pub fn mkdir(&self, start: &Location, path: &[u8], perm: u32) -> Result<Location> {
-        let check = |dir: &Location, name: &[u8]| {
-            crate::security::path_mkdir(dir, name, mode::S_IFDIR | (perm & 0o1777))
-        };
-        self.make(start, path, FileType::Directory, perm & 0o1777, check, |dir, name, perm| {
-            dir.create(name, FileType::Directory, perm, 0)
-        })
+        let full = mode::S_IFDIR | (perm & 0o1777);
+        let check = |dir: &Location, name: &[u8]| crate::security::path_mkdir(dir, name, full);
+        let create_check =
+            |dir: &Location, name: &[u8]| crate::security::inode_mkdir(dir, name, full);
+        let f = |dir: &InodeRef, name: &[u8], perm| dir.create(name, FileType::Directory, perm, 0);
+        self.make(start, path, FileType::Directory, perm & 0o1777, (check, create_check), f)
     }
 
     /// `mknodat`. A mode with no file type makes a regular file.
@@ -671,21 +683,21 @@ impl FsContext {
         if matches!(kind, FileType::Directory | FileType::Symlink) {
             return Err(Errno::EINVAL);
         }
-        let check = |dir: &Location, name: &[u8]| {
-            let full = kind.mode_bits() | (mode & mode::PERM_MASK);
-            crate::security::path_mknod(dir, name, full, rdev)
-        };
-        self.make(start, path, kind, mode & mode::PERM_MASK, check, |dir, name, perm| {
-            if matches!(kind, FileType::CharDevice | FileType::BlockDevice)
-                && !self.cred.capable(cap::MKNOD)
-            {
-                return Err(Errno::EPERM);
-            }
+        let full = kind.mode_bits() | (mode & mode::PERM_MASK);
+        let check =
+            |dir: &Location, name: &[u8]| crate::security::path_mknod(dir, name, full, rdev);
+        // `vfs_mknod` of Linux checks the capability and the device cgroup before the LSM.
+        let create_check = |dir: &Location, name: &[u8]| {
             if matches!(kind, FileType::CharDevice | FileType::BlockDevice) {
+                if !self.cred.capable(cap::MKNOD) {
+                    return Err(Errno::EPERM);
+                }
                 device::devcgroup_inode_mknod(kind == FileType::BlockDevice, rdev)?;
             }
-            dir.create(name, kind, perm, rdev)
-        })
+            crate::security::inode_mknod(dir, name, full, rdev)
+        };
+        let f = |dir: &InodeRef, name: &[u8], perm| dir.create(name, kind, perm, rdev);
+        self.make(start, path, kind, mode & mode::PERM_MASK, (check, create_check), f)
     }
 
     /// `symlinkat`.
@@ -694,7 +706,9 @@ impl FsContext {
             return Err(Errno::ENOENT);
         }
         let check = |dir: &Location, name: &[u8]| crate::security::path_symlink(dir, name, target);
-        self.make(start, path, FileType::Symlink, 0o777, check, |dir, name, _| {
+        let create_check =
+            |dir: &Location, name: &[u8]| crate::security::inode_symlink(dir, name, target);
+        self.make(start, path, FileType::Symlink, 0o777, (check, create_check), |dir, name, _| {
             dir.symlink(name, target)
         })
     }
@@ -724,6 +738,7 @@ impl FsContext {
         if meta.is_dir() {
             return Err(Errno::EPERM);
         }
+        crate::security::inode_link(old, &parent.dir, &parent.name)?;
         // A file without a link gets one only from `O_TMPFILE`, as `vfs_link` of Linux.
         if meta.nlink == 0 && !old.dentry.linkable() {
             return Err(Errno::ENOENT);
@@ -781,12 +796,14 @@ impl FsContext {
             // empty and the removal are one step. After it, no new name goes in the directory,
             // as `vfs_rmdir` in fs/namei.c of Linux sets `S_DEAD`.
             let _victim = at.dentry.lock();
+            crate::security::inode_rmdir(&parent.dir, &at)?;
             parent.dir.inode().rmdir(&parent.name)?;
             at.dentry.set_dead();
         } else {
             if is_dir {
                 return Err(Errno::EISDIR);
             }
+            crate::security::inode_unlink(&parent.dir, &at)?;
             parent.dir.inode().unlink(&parent.name)?;
         }
         parent.dir.dentry.forget_child(&parent.name);
@@ -882,6 +899,7 @@ impl FsContext {
         if from_dir && !Arc::ptr_eq(old.dir.inode(), new.dir.inode()) {
             self.permission(&from, may::WRITE)?;
         }
+        crate::security::inode_rename(&old.dir, &from, &new.dir, &new.name, to.as_ref(), false)?;
         for at in [Some(&from), to.as_ref()].into_iter().flatten() {
             if at.is_mount_root() || self.ns.mounted_on(at).is_some() {
                 return Err(Errno::EBUSY);
@@ -963,6 +981,7 @@ impl FsContext {
                 self.permission(&to, may::WRITE)?;
             }
         }
+        crate::security::inode_rename(&old.dir, from, &new.dir, &new.name, Some(&to), true)?;
         old.dir.inode().exchange(&old.name, new.dir.inode(), &new.name)?;
         old.dir.dentry.exchange_child(&old.name, &new.dir.dentry, &new.name);
         // As `vfs_rename` of Linux, each file of an exchange moves.

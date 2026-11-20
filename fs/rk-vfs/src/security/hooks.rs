@@ -508,6 +508,62 @@ pub trait SecurityHooks: Sync {
         Ok(())
     }
 
+    /// `inode_create`: a new regular file `name` in `dir` with the mode `mode` for an open
+    /// with `O_CREAT`, after the permission checks of the directory.
+    fn inode_create(&self, dir: &Location, name: &[u8], mode: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// `inode_mkdir`: a new directory `name` in `dir`, after the permission checks of `dir`.
+    fn inode_mkdir(&self, dir: &Location, name: &[u8], mode: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// `inode_mknod`: a new file `name` in `dir` with the mode `mode`, with the file type, and
+    /// the device `dev`, after the permission checks of `dir`.
+    fn inode_mknod(&self, dir: &Location, name: &[u8], mode: u32, dev: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// `inode_symlink`: a new link `name` in `dir` to `target`, after the permission checks of
+    /// `dir`.
+    fn inode_symlink(&self, dir: &Location, name: &[u8], target: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    /// `inode_link`: the new name `name` in `dir` for the file `old`, after the permission
+    /// checks of `dir`.
+    fn inode_link(&self, old: &Location, dir: &Location, name: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    /// `inode_unlink`: the removal of the file `at` from `dir`, after the permission checks of
+    /// `dir`.
+    fn inode_unlink(&self, dir: &Location, at: &Location) -> Result<()> {
+        Ok(())
+    }
+
+    /// `inode_rmdir`: the removal of the directory `at` from `dir`, after the permission
+    /// checks of `dir`.
+    fn inode_rmdir(&self, dir: &Location, at: &Location) -> Result<()> {
+        Ok(())
+    }
+
+    /// `inode_rename`: the move of the file `old` from `old_dir` to the name `name` in
+    /// `new_dir`, after the permission checks of the directories. `new` is the file that has
+    /// the name now, if there is one. An exchange calls the hook a second time with the two
+    /// files swapped.
+    fn inode_rename(
+        &self,
+        old_dir: &Location,
+        old: &Location,
+        new_dir: &Location,
+        name: &[u8],
+        new: Option<&Location>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// `inode_getsecurity`: the value of the attribute `security.NAME` of `inode` for
     /// `getxattr`, where `name` is the part after `security.`. `at` is the path of the inode, if
     /// the caller has one. `None` lets the file system give the value, as `-EOPNOTSUPP` of

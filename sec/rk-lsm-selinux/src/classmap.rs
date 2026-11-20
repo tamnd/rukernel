@@ -256,12 +256,20 @@ pub mod file {
     pub const READ: u32 = 1 << 1;
     /// `write`.
     pub const WRITE: u32 = 1 << 2;
+    /// `create`.
+    pub const CREATE: u32 = 1 << 3;
     /// `getattr`.
     pub const GETATTR: u32 = 1 << 4;
     /// `setattr`.
     pub const SETATTR: u32 = 1 << 5;
     /// `append`.
     pub const APPEND: u32 = 1 << 9;
+    /// `unlink`.
+    pub const UNLINK: u32 = 1 << 11;
+    /// `link`.
+    pub const LINK: u32 = 1 << 12;
+    /// `rename`.
+    pub const RENAME: u32 = 1 << 13;
     /// `execute`.
     pub const EXECUTE: u32 = 1 << 14;
     /// `audit_access`.
@@ -277,8 +285,22 @@ pub mod file {
 /// The permissions of the class `dir` that the other classes of files do not have, `DIR__*`
 /// of Linux.
 pub mod dir {
+    /// `add_name`.
+    pub const ADD_NAME: u32 = 1 << 26;
+    /// `remove_name`.
+    pub const REMOVE_NAME: u32 = 1 << 27;
+    /// `reparent`.
+    pub const REPARENT: u32 = 1 << 28;
     /// `search`.
     pub const SEARCH: u32 = 1 << 29;
+    /// `rmdir`.
+    pub const RMDIR: u32 = 1 << 30;
+}
+
+/// The permissions of the class `filesystem`, `FILESYSTEM__*` of Linux.
+pub mod filesystem {
+    /// `associate`.
+    pub const ASSOCIATE: u32 = 1 << 6;
 }
 
 /// The permissions of the class `key`, `KEY__*` of Linux.
@@ -385,9 +407,13 @@ mod tests {
             ("ioctl", file::IOCTL),
             ("read", file::READ),
             ("write", file::WRITE),
+            ("create", file::CREATE),
             ("getattr", file::GETATTR),
             ("setattr", file::SETATTR),
             ("append", file::APPEND),
+            ("unlink", file::UNLINK),
+            ("link", file::LINK),
+            ("rename", file::RENAME),
             ("execute", file::EXECUTE),
             ("audit_access", file::AUDIT_ACCESS),
             ("open", file::OPEN),
@@ -396,7 +422,16 @@ mod tests {
             assert_eq!(bit(class::DIR, perm), v, "{perm}");
             assert_eq!(bit(class::CHR_FILE, perm), v, "{perm}");
         }
-        assert_eq!(bit(class::DIR, "search"), dir::SEARCH);
+        for (perm, v) in [
+            ("add_name", dir::ADD_NAME),
+            ("remove_name", dir::REMOVE_NAME),
+            ("reparent", dir::REPARENT),
+            ("search", dir::SEARCH),
+            ("rmdir", dir::RMDIR),
+        ] {
+            assert_eq!(bit(class::DIR, perm), v, "{perm}");
+        }
+        assert_eq!(bit(class::FILESYSTEM, "associate"), filesystem::ASSOCIATE);
         assert_eq!(bit(class::KEY, "create"), key::CREATE);
     }
 }

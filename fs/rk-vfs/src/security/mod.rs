@@ -608,6 +608,59 @@ pub fn inode_getattr(at: &Location) -> Result<()> {
     call_int_hook!(inode_getattr, at)
 }
 
+/// `security_inode_create`.
+pub fn inode_create(dir: &Location, name: &[u8], mode: u32) -> Result<()> {
+    call_int_hook!(inode_create, dir, name, mode)
+}
+
+/// `security_inode_mkdir`.
+pub fn inode_mkdir(dir: &Location, name: &[u8], mode: u32) -> Result<()> {
+    call_int_hook!(inode_mkdir, dir, name, mode)
+}
+
+/// `security_inode_mknod`.
+pub fn inode_mknod(dir: &Location, name: &[u8], mode: u32, dev: u64) -> Result<()> {
+    call_int_hook!(inode_mknod, dir, name, mode, dev)
+}
+
+/// `security_inode_symlink`.
+pub fn inode_symlink(dir: &Location, name: &[u8], target: &[u8]) -> Result<()> {
+    call_int_hook!(inode_symlink, dir, name, target)
+}
+
+/// `security_inode_link`.
+pub fn inode_link(old: &Location, dir: &Location, name: &[u8]) -> Result<()> {
+    call_int_hook!(inode_link, old, dir, name)
+}
+
+/// `security_inode_unlink`.
+pub fn inode_unlink(dir: &Location, at: &Location) -> Result<()> {
+    call_int_hook!(inode_unlink, dir, at)
+}
+
+/// `security_inode_rmdir`.
+pub fn inode_rmdir(dir: &Location, at: &Location) -> Result<()> {
+    call_int_hook!(inode_rmdir, dir, at)
+}
+
+/// `security_inode_rename`: the move of `old` from `old_dir` to `name` in `new_dir`, where
+/// `new` is now. For an exchange, which `exchange` tells, the move of `new` to the name of
+/// `old` is checked first, as `security_inode_rename` of Linux.
+pub fn inode_rename(
+    old_dir: &Location,
+    old: &Location,
+    new_dir: &Location,
+    name: &[u8],
+    new: Option<&Location>,
+    exchange: bool,
+) -> Result<()> {
+    if exchange && let Some(new) = new {
+        let old_name = old.dentry.name();
+        call_int_hook!(inode_rename, new_dir, new, old_dir, &old_name, Some(old))?;
+    }
+    call_int_hook!(inode_rename, old_dir, old, new_dir, name, new)
+}
+
 /// `security_inode_getsecurity`: the value of the attribute `security.NAME` of `inode` from
 /// the first module that has it, or `None` if the file system gives it, as `xattr_getsecurity`
 /// of Linux.
