@@ -901,7 +901,7 @@ fn create6(req: &Request<'_>, c: &Config, info: &mut Info) -> Result<()> {
             if c.flags & RTNH_F_ONLINK != 0 {
                 // `ip6_route_check_nh_onlink`: a route to the gateway other than the default
                 // route must go through the device.
-                if let Ok((_, Some(r))) = t.lookup_route(&gw, 0)
+                if let Ok((_, Some(r))) = t.lookup_gateway(&gw, 0)
                     && r.prefix != 0
                     && (u32::from(r.kind) != rk_abi::native::rtnetlink::RTN_UNICAST
                         || r.ifindex != oif)
@@ -910,7 +910,7 @@ fn create6(req: &Request<'_>, c: &Config, info: &mut Info) -> Result<()> {
                 }
             } else {
                 // `ip6_route_check_nh`: the gateway must be on the link of the device.
-                match t.lookup_route(&gw, oif) {
+                match t.lookup_gateway(&gw, oif) {
                     Ok((n, r)) if n.ifindex == oif && r.is_none_or(|r| r.gateway.is_none()) => {}
                     _ => return Err(Errno::EHOSTUNREACH),
                 }

@@ -776,7 +776,7 @@ fn check_route(r: &mut Route6) -> Result<()> {
             if ipv6::is_link_local(&gw) {
                 return Err(Errno::EINVAL);
             }
-            let (next, route) = t.lookup_route(&gw, 0).map_err(|_| Errno::EHOSTUNREACH)?;
+            let (next, route) = t.lookup_gateway(&gw, 0).map_err(|_| Errno::EHOSTUNREACH)?;
             if route.is_some_and(|x| x.gateway.is_some()) {
                 return Err(Errno::EHOSTUNREACH);
             }

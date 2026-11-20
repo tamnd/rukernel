@@ -1687,6 +1687,24 @@ fn optimistic_addresses_are_sources_after_the_preferred_ones() {
 }
 
 #[test]
+fn a_gateway_on_the_link_of_a_tentative_address_is_good() {
+    use crate::route6::{Addr6, Table6};
+    use rk_abi::native::if_addr::IFA_F_TENTATIVE;
+    let mut t = Table6::new();
+    let gw = v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 2]);
+    let mut a = Addr6::new(2, v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]), 120);
+    a.flags |= IFA_F_TENTATIVE;
+    t.insert_addr(a).unwrap();
+    // A packet to the gateway has no source address before DAD is done.
+    assert_eq!(t.lookup_route(&gw, 2).err(), Some(Errno::EADDRNOTAVAIL));
+    // But the gateway of a route or a nexthop is on the link, as `ip6_route_check_nh`.
+    let (next, route) = t.lookup_gateway(&gw, 2).unwrap();
+    assert_eq!((next.ifindex, next.hop, next.local), (2, gw, false));
+    assert!(route.is_some_and(|r| r.prefix == 120 && r.gateway.is_none()));
+    assert_eq!(t.lookup_gateway(&gw, 3).err(), Some(Errno::ENETUNREACH));
+}
+
+#[test]
 fn reassembly_in_order_and_out_of_order() {
     use crate::frag::{Add, Reasm};
     let data: Vec<u8> = (0..40u8).collect();

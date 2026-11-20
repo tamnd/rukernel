@@ -16,6 +16,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `getsockopt` of `IP_PKTOPTIONS` and `IPV6_2292PKTOPTIONS` on a TCP socket gives the control messages of `IP_PKTINFO`, `IP_TTL`, `IPV6_PKTINFO`, `IPV6_HOPLIMIT` and `IPV6_TCLASS` with the interface and the TTL of the SYN, as Linux. Before, it gave `ENOPROTOOPT`, and systemd-resolved closed each TCP connection to its stub resolver before the reply, so `dig +tcp` and `dig AXFR` to 127.0.0.53 got "connection reset" and TEST-75-RESOLVED stopped (#538).
 - `RTM_SETLINK` takes `IFLA_INET6_ADDR_GEN_MODE` in `IFLA_AF_SPEC`, and each link has the attributes of `AF_INET6` in `IFLA_AF_SPEC`, as `inet6_validate_link_af`, `inet6_set_link_af` and `inet6_fill_link_af` of Linux. A family in `IFLA_AF_SPEC` that the kernel does not have gives `EAFNOSUPPORT`, and a family without changes gives `EOPNOTSUPP`, before any change. A device with `addr_gen_mode` 1, `IN6_ADDR_GEN_MODE_NONE`, gets no link local address when it goes up, and a write of another mode to `net.ipv6.conf.DEV.addr_gen_mode` makes the address when the device is up. The mode 2 needs `stable_secret`, so a device does not take it. Before, systemd-networkd did not see the mode of a link and the link had no link local address after a change of its `.network` file (#538).
 
+### Fixed
+
+- An IPv6 gateway of a new route or nexthop is on the link while each address of the interface is tentative, as `ip6_route_check_nh` of Linux. Before, the check looked for a source address too, so `ip -6 nexthop add id 2 via 2001:1234:5:8f63::2 dev veth99` right after the address `2001:1234:5:8f63::1/120` gave `EHOSTUNREACH`, and systemd-networkd failed the link in `test_nexthop` (#538).
+
 ## [0.5.37] - 2026-11-20
 
 ### Added
