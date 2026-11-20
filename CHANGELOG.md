@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.37] - 2026-11-20
+
 ### Added
 
 - `swapoff` of an area with used pages reads the pages back into the processes that have them, as `try_to_unuse` of Linux. Before, it gave `EBUSY`. No new page goes to the area while it reads. `swapoff` gives `ENOMEM` if the pages do not fit in the free memory, and the area then stays active. (#752)
@@ -1792,6 +1794,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.37]: https://github.com/tamnd/rukernel/compare/v0.5.36...v0.5.37
 [0.5.36]: https://github.com/tamnd/rukernel/compare/v0.5.35...v0.5.36
 [0.5.35]: https://github.com/tamnd/rukernel/compare/v0.5.34...v0.5.35
 [0.5.34]: https://github.com/tamnd/rukernel/compare/v0.5.33...v0.5.34
