@@ -815,7 +815,112 @@ pub fn mntns_delete(ns: &MountNamespace) {
     }
 }
 
+/// The flag of a mark that does not hold its inode, `FSNOTIFY_MARK_FLAG_NO_IREF` of Linux. Only
+/// the evictable marks of fanotify have it.
+pub const MARK_NO_IREF: u32 = 1;
+
+/// Removes the marks of each inode that only marks with `MARK_NO_IREF` hold, as the eviction of
+/// the unused inodes by `drop_caches` in Linux. Gives the number of marks that went.
+///
+/// In Linux, an evictable mark does not hold its inode. When reclaim evicts the inode,
+/// `fsnotify_inode_delete` removes the marks. Here each mark holds its inode, so an inode that
+/// has only evictable marks and no other user is free for reclaim, and its marks go.
+pub fn evict_unused_inodes() -> usize {
+    if none() {
+        return 0;
+    }
+    let mut dead = Vec::new();
+    {
+        let marks = MARKS.lock();
+        for (&(kind, _), list) in marks.iter() {
+            if kind != 0 || list.iter().any(|m| m.flags() & MARK_NO_IREF == 0) {
+                continue;
+            }
+            // Each mark of the list holds the inode once. The other references are users.
+            let Some(inode) = list.first().and_then(|m| m.inode()) else { continue };
+            if Arc::strong_count(inode) == list.len() {
+                dead.extend(list.iter().cloned());
+            }
+        }
+    }
+    for mark in &dead {
+        destroy_mark(mark);
+    }
+    dead.len()
+}
+
 /// The number of marks on all inodes.
 pub fn mark_count() -> usize {
     COUNT.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inode::{Inode, Metadata};
+    use rk_abi::Errno;
+
+    /// An inode with only its attributes.
+    struct File;
+
+    impl Inode for File {
+        fn metadata(&self) -> Metadata {
+            Metadata::default()
+        }
+
+        fn set_attr(&self, _attr: &SetAttr) -> Result<()> {
+            Err(Errno::EPERM)
+        }
+    }
+
+    /// A group that counts the marks that went.
+    struct Counter(AtomicUsize);
+
+    impl Group for Counter {
+        fn handle_event(&self, _mark: &Arc<Mark>, _mask: u32, _name: Option<&[u8]>, _cookie: u32) {}
+
+        fn freeing_mark(&self, _mark: &Arc<Mark>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn reclaim_removes_the_evictable_marks_of_unused_inodes_only() {
+        let group = Arc::new(Counter(AtomicUsize::new(0)));
+        let inode = |evictable: &[bool]| {
+            let inode: InodeRef = Arc::new(File);
+            let marks: Vec<_> = evictable
+                .iter()
+                .map(|&e| {
+                    let mark = add_mark(group.clone(), &inode, mask::ACCESS, 0);
+                    if e {
+                        mark.set_flags(MARK_NO_IREF);
+                    }
+                    mark
+                })
+                .collect();
+            (inode, marks)
+        };
+        // Two evictable marks on an inode that only the marks hold go.
+        let (unused, gone) = inode(&[true, true]);
+        let weak = Arc::downgrade(&unused);
+        drop(unused);
+        // An inode in use keeps its evictable mark.
+        let (used, kept) = inode(&[true]);
+        // A mark that is not evictable holds the inode, as in Linux.
+        let (held, mixed) = inode(&[true, false]);
+        drop(held);
+        evict_unused_inodes();
+        assert!(gone.iter().all(|m| !m.alive()));
+        drop(gone);
+        assert_eq!(weak.strong_count(), 0, "the inode is free after the marks went");
+        assert!(kept[0].alive() && mixed.iter().all(|m| m.alive()));
+        assert_eq!(group.0.load(Ordering::Relaxed), 2);
+        drop(used);
+        evict_unused_inodes();
+        assert!(!kept[0].alive());
+        for mark in &mixed {
+            destroy_mark(mark);
+        }
+    }
 }

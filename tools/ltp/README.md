@@ -31,6 +31,8 @@ The boot tests download the static BusyBox to `target/x86_64-unknown-none/debug/
 
 `--arch aarch64` runs the tests on the arm64 kernel, on the `virt` machine of `qemu-system-aarch64` with a GICv3 and TCG. `run.py` makes the arm64 `Image` from the ELF file of the kernel, and the console is `ttyAMA0`. `build.sh --arch aarch64` builds LTP for arm64 in an arm64 Alpine container. The host must run arm64 programs through qemu-user-static with binfmt, and the build is about 10 times slower than the x86-64 build. `LTP_TESTDIRS` sets the directories of the tests that the full build builds, so `LTP_TESTDIRS=testcases/kernel/syscalls` builds only the syscalls group. The arm64 BusyBox comes from `tools/busybox/build.sh` on the same host.
 
+For a focused test of a few tests, build a small tree with one test directory, for example `LTP_TESTDIRS=testcases/kernel/syscalls/fanotify tools/ltp/build.sh --full --arch aarch64 ~/rkltp-fan`. This arm64 build took about 70 min and gives a tree of about 20 MB. `run.py` uses only `ltp/testcases/bin`, `ltp/runtest` and `ltp/Version`, so you can delete the other files of the tree after the build.
+
 ```sh
 LTP_TESTDIRS=testcases/kernel/syscalls tools/ltp/build.sh --full --arch aarch64 ~/rkltp-arm64
 tools/busybox/build.sh ~/rkltp-arm64/busybox
