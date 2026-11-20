@@ -236,6 +236,47 @@ pub(crate) fn dir(
     new_node(path, perm, kind)
 }
 
+/// The entries that a directory with a fixed table of names makes: all of them for a list, or
+/// only the entry `want` for a lookup.
+pub(crate) struct Entries<'a> {
+    want: Option<&'a [u8]>,
+    out: Vec<(Vec<u8>, InodeRef)>,
+}
+
+impl<'a> Entries<'a> {
+    pub(crate) fn new(want: Option<&'a [u8]>) -> Self {
+        Self { want, out: Vec::new() }
+    }
+
+    /// Adds the entry `name`. `make` makes its inode only if the entry is in the result.
+    pub(crate) fn add(&mut self, name: &[u8], make: impl FnOnce() -> InodeRef) {
+        if self.want.is_none_or(|want| want == name) {
+            self.out.push((name.to_vec(), make()));
+        }
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<(Vec<u8>, InodeRef)> {
+        self.out
+    }
+}
+
+/// Makes a directory with a fixed table of names, as the directories of a process in Linux.
+/// `make(None)` gives all entries, for the list. A lookup calls `make(Some(name))`, which makes
+/// only the inode of `name`, as `proc_pident_lookup` in fs/proc/base.c of Linux.
+pub(crate) fn table_dir(
+    path: &[u8],
+    parent: &[u8],
+    perm: u32,
+    make: impl Fn(Option<&[u8]>) -> Result<Vec<(Vec<u8>, InodeRef)>> + Send + Sync + 'static,
+) -> InodeRef {
+    let make = Arc::new(make);
+    let one = make.clone();
+    let find: FindFn = Box::new(move |name: &[u8]| {
+        one(Some(name))?.into_iter().find(|(n, _)| n == name).map(|(_, i)| i).ok_or(Errno::ENOENT)
+    });
+    dir(path, parent, perm, move || make(None), Some(find))
+}
+
 /// Gives `node` the owner and the group that `owner` gives at each `stat`, as the files of a
 /// process in Linux have the effective ids of the process. The owner of a node is set one time.
 pub(crate) fn set_owner(node: &InodeRef, owner: impl Fn() -> (u32, u32) + Send + Sync + 'static) {
@@ -650,5 +691,35 @@ mod tests {
         let node = jump_link(b"/fd/5", 0o700, || Ok(b"pipe:[2]".to_vec()), || Err(Errno::ENOENT));
         assert_eq!(node.read_link().unwrap(), b"pipe:[2]");
         assert_eq!(node.magic_link().map(|j| j.err()), Some(Some(Errno::ENOENT)));
+    }
+
+    #[test]
+    fn a_lookup_in_a_table_makes_only_the_entry_of_the_name() {
+        use core::sync::atomic::AtomicUsize;
+        let made = Arc::new(AtomicUsize::new(0));
+        let m = made.clone();
+        let node = table_dir(b"/7", b"/", 0o555, move |want| {
+            let mut out = Entries::new(want);
+            for name in [&b"stat"[..], b"status", b"fd"] {
+                out.add(name, || {
+                    m.fetch_add(1, Ordering::Relaxed);
+                    file(&join(b"/7", name), || Ok(Vec::new()))
+                });
+            }
+            Ok(out.into_vec())
+        });
+        let status = node.lookup(b"status").unwrap();
+        assert_eq!(status.metadata().ino, ino(b"/7/status"));
+        assert_eq!(made.load(Ordering::Relaxed), 1);
+        assert_eq!(node.lookup(b"environ").err(), Some(Errno::ENOENT));
+        assert_eq!(made.load(Ordering::Relaxed), 1);
+        // The list still has all of the entries, in the order of the table.
+        let mut names = Vec::new();
+        let mut pos = 2;
+        while let Some((entry, next)) = node.read_dir(pos).unwrap() {
+            names.push(entry.name);
+            pos = next;
+        }
+        assert_eq!(names, [&b"stat"[..], b"status", b"fd"]);
     }
 }
