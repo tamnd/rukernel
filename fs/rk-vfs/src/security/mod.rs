@@ -22,7 +22,7 @@ pub use hooks::{HOOK_COUNT, HOOK_NAMES, SecurityHooks, hook_index};
 use crate::cred::{Cred, IpcOwner};
 use crate::dentry::Location;
 use crate::file::File;
-use crate::inode::{Inode, Result, SetAttr};
+use crate::inode::{Inode, InodeRef, Result, SetAttr};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -659,6 +659,67 @@ pub fn inode_rename(
         call_int_hook!(inode_rename, new_dir, new, old_dir, &old_name, Some(old))?;
     }
     call_int_hook!(inode_rename, old_dir, old, new_dir, name, new)
+}
+
+/// `security_inode_init_security`: the modules label the new file `inode` with the name `name`
+/// in `dir`, and the attributes of their labels go to the file, as the `initxattrs` of the file
+/// systems of Linux. The inode gets its blob first. A file system without attributes, which
+/// gives `EOPNOTSUPP`, keeps the labels only in the blob.
+///
+/// # Errors
+///
+/// The errors of the hooks and of the write of an attribute.
+pub fn inode_init_security(inode: &InodeRef, dir: &Location, name: Option<&[u8]>) -> Result<()> {
+    blob::inode_attach(inode);
+    let mut xattrs = Vec::new();
+    call_int_hook!(inode_init_security, &**inode, dir, name, &mut xattrs)?;
+    for (name, value) in xattrs {
+        match inode.set_xattr(&name, &value, 0) {
+            Ok(()) | Err(Errno::EOPNOTSUPP) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// `security_inode_setxattr`.
+pub fn inode_setxattr(
+    inode: &dyn Inode,
+    at: Option<&Location>,
+    name: &[u8],
+    value: &[u8],
+    flags: u32,
+) -> Result<()> {
+    call_int_hook!(inode_setxattr, inode, at, name, value, flags)
+}
+
+/// `security_inode_post_setxattr`.
+pub fn inode_post_setxattr(inode: &dyn Inode, name: &[u8], value: &[u8], flags: u32) {
+    call_void_hook!(inode_post_setxattr, inode, name, value, flags);
+}
+
+/// `security_inode_setsecurity`: the first module that has the attribute `security.NAME`
+/// changes it, else `EOPNOTSUPP`.
+///
+/// # Errors
+///
+/// `EOPNOTSUPP` if no module has the attribute, or the error of the module.
+pub fn inode_setsecurity(
+    inode: &dyn Inode,
+    at: Option<&Location>,
+    name: &[u8],
+    value: &[u8],
+    flags: u32,
+) -> Result<()> {
+    modules()
+        .iter()
+        .find_map(|m| m.info.hooks.inode_setsecurity(inode, at, name, value, flags))
+        .unwrap_or(Err(Errno::EOPNOTSUPP))
+}
+
+/// `security_inode_removexattr`.
+pub fn inode_removexattr(inode: &dyn Inode, at: Option<&Location>, name: &[u8]) -> Result<()> {
+    call_int_hook!(inode_removexattr, inode, at, name)
 }
 
 /// `security_inode_getsecurity`: the value of the attribute `security.NAME` of `inode` from

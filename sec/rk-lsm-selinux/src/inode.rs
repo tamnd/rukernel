@@ -4,9 +4,9 @@
 //!
 //! Linux labels an inode when a dentry gets it, or at the policy load for the inodes that came
 //! before. Here a file gets its label at its first use after the policy load, with the mount
-//! and the dentry of the use, and the label stays in the blob of the inode. The new files of
-//! a task get the label of the rules of their file system as the other files, and a write of
-//! `security.selinux` does not change the label yet.
+//! and the dentry of the use, and the label stays in the blob of the inode. A new file gets
+//! its label when the VFS makes it, and a write of `security.selinux` changes the label, in
+//! [`crate::xattr`].
 
 use crate::classmap::class;
 use crate::policydb::fs_use;
@@ -207,11 +207,26 @@ pub fn inode_label(inode: &dyn Inode, at: Option<&Location>) -> (u32, u16) {
         return unlabeled();
     };
     if let Some((off, blob)) = &part {
-        blob.store(off + slot::SID, u64::from(sid));
-        blob.store(off + slot::SCLASS, u64::from(sclass));
-        blob.store(off + slot::STATE, 1);
+        store(blob, *off, sid, sclass);
     }
     (sid, sclass)
+}
+
+/// Writes the label `sid` and `sclass` to the part of SELinux at `off` in the inode blob
+/// `blob`. The state comes last, so a reader that sees it also sees the label.
+fn store(blob: &Blob, off: usize, sid: u32, sclass: u16) {
+    blob.store(off + slot::SID, u64::from(sid));
+    blob.store(off + slot::SCLASS, u64::from(sclass));
+    blob.store(off + slot::STATE, 1);
+}
+
+/// Gives `inode` the SID `sid` and the class of its mode, as the change of `isec` in
+/// `selinux_inode_init_security` and `selinux_inode_post_setxattr` of Linux. An inode without
+/// a blob keeps no label.
+pub fn set_label(inode: &dyn Inode, sid: u32) {
+    if let Some((off, blob)) = inode_offset().zip(rk_vfs::security::blob::inode_blob(inode)) {
+        store(&blob, off, sid, mode_to_class(inode.metadata().mode));
+    }
 }
 
 /// The value of the attribute `security.` + `name` of `inode`, as `selinux_inode_getsecurity`

@@ -174,7 +174,7 @@ pub fn inode_getattr(at: &Location) -> Result<()> {
 
 /// Checks the permissions `av` of the current task on `inode` at `at`, as `dentry_has_perm`
 /// of Linux.
-fn inode_has_perm(inode: &dyn Inode, at: Option<&Location>, av: u32) -> Result<()> {
+pub(crate) fn inode_has_perm(inode: &dyn Inode, at: Option<&Location>, av: u32) -> Result<()> {
     if !crate::initialized() {
         return Ok(());
     }

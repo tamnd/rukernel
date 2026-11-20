@@ -319,6 +319,7 @@ impl FsContext {
                     if let Some(acls) = acls {
                         acls.apply(&*inode)?;
                     }
+                    crate::security::inode_init_security(&inode, &parent.dir, Some(&parent.name))?;
                     created = true;
                     let dentry = parent.dir.dentry.add_child(&parent.name, inode);
                     crate::notify::create(parent.dir.inode(), &dentry);
@@ -377,6 +378,7 @@ impl FsContext {
         if let Some(acls) = acls {
             acls.apply(&*inode)?;
         }
+        crate::security::inode_init_security(&inode, &dir, None)?;
         let dentry = dir.dentry.tmp_child(inode, flags & o::O_EXCL == 0);
         let at = Location { mount: dir.mount.clone(), dentry };
         let flags = flags & !(o::O_TMPFILE | o::O_EXCL);
@@ -637,6 +639,7 @@ impl FsContext {
         if let Some(acls) = acls {
             acls.apply(&*inode)?;
         }
+        crate::security::inode_init_security(&inode, &parent.dir, Some(&parent.name))?;
         let dentry = parent.dir.dentry.add_child(&parent.name, inode);
         crate::notify::create(parent.dir.inode(), &dentry);
         Ok(Location { mount: parent.dir.mount, dentry })

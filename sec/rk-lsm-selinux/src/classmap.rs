@@ -262,6 +262,10 @@ pub mod file {
     pub const GETATTR: u32 = 1 << 4;
     /// `setattr`.
     pub const SETATTR: u32 = 1 << 5;
+    /// `relabelfrom`.
+    pub const RELABELFROM: u32 = 1 << 7;
+    /// `relabelto`.
+    pub const RELABELTO: u32 = 1 << 8;
     /// `append`.
     pub const APPEND: u32 = 1 << 9;
     /// `unlink`.
@@ -410,6 +414,8 @@ mod tests {
             ("create", file::CREATE),
             ("getattr", file::GETATTR),
             ("setattr", file::SETATTR),
+            ("relabelfrom", file::RELABELFROM),
+            ("relabelto", file::RELABELTO),
             ("append", file::APPEND),
             ("unlink", file::UNLINK),
             ("link", file::LINK),

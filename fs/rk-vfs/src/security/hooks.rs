@@ -564,6 +564,63 @@ pub trait SecurityHooks: Sync {
         Ok(())
     }
 
+    /// `inode_init_security`: the label of the new file `inode` with the name `name` in `dir`,
+    /// after the file system made the file and before a dentry has it. `name` is `None` for a
+    /// file of `O_TMPFILE`. A module that keeps its label in an attribute of the file adds the
+    /// name and the value of the attribute to `xattrs`, and the VFS writes them to the file.
+    fn inode_init_security(
+        &self,
+        inode: &dyn Inode,
+        dir: &Location,
+        name: Option<&[u8]>,
+        xattrs: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// `inode_setxattr`: `setxattr` of the attribute `name` of `inode` to `value`, after the
+    /// checks of the VFS and before the change. `at` is the path of the inode, if the caller
+    /// has one. The attributes of the ACLs do not come here.
+    fn inode_setxattr(
+        &self,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// `inode_post_setxattr`: the file system changed the attribute `name` of `inode` to
+    /// `value`.
+    fn inode_post_setxattr(&self, inode: &dyn Inode, name: &[u8], value: &[u8], flags: u32) {}
+
+    /// `inode_setsecurity`: the change of the attribute `security.NAME` of `inode` to `value`
+    /// for a file system that does not keep the attribute, where `name` is the part after
+    /// `security.`. `None` lets the next module have it, as `-EOPNOTSUPP` of Linux.
+    fn inode_setsecurity(
+        &self,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+    ) -> Option<Result<()>> {
+        None
+    }
+
+    /// `inode_removexattr`: `removexattr` of the attribute `name` of `inode`, after the checks
+    /// of the VFS and before the change. The attributes of the ACLs do not come here.
+    fn inode_removexattr(
+        &self,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        name: &[u8],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// `inode_getsecurity`: the value of the attribute `security.NAME` of `inode` for
     /// `getxattr`, where `name` is the part after `security.`. `at` is the path of the inode, if
     /// the caller has one. `None` lets the file system give the value, as `-EOPNOTSUPP` of

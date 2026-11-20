@@ -29,7 +29,7 @@ fn at_fields(at: &Location) -> impl FnOnce(&mut String) + '_ {
 /// `selinux_determine_inode_label` of Linux. `ssid` is the SID of the task and `create_sid`
 /// its SID for new files from `/proc/self/attr/fscreate`, or 0. A file system that keeps the
 /// labels takes `create_sid`. Else the new file gets the type transition from the task to the
-/// directory for the name.
+/// directory for the name. A file of `O_TMPFILE` has no name.
 ///
 /// # Errors
 ///
@@ -38,14 +38,14 @@ pub fn new_file_sid(
     ssid: u32,
     create_sid: u32,
     dir: &Location,
-    name: &[u8],
+    name: Option<&[u8]>,
     tclass: u16,
 ) -> Result<u32> {
     if create_sid != 0 && sblabel(dir.mount.fstype()) {
         return Ok(create_sid);
     }
     let (dsid, _) = inode_label(&**dir.inode(), Some(dir));
-    server::transition_sid(ssid, dsid, tclass, Some(name))
+    server::transition_sid(ssid, dsid, tclass, name)
 }
 
 /// Checks that the current task can make the file `name` of the class `tclass` in `dir`, as
@@ -66,7 +66,7 @@ pub fn may_create(dir: &Location, name: &[u8], tclass: u16) -> Result<()> {
     let av = dir::ADD_NAME | dir::SEARCH;
     avc::has_perm(ssid, dsid, class::DIR, av, name_fields(name))?;
     let create_sid = task::load(&cred, task::slot::CREATE);
-    let new = new_file_sid(ssid, create_sid, dir, name, tclass)?;
+    let new = new_file_sid(ssid, create_sid, dir, Some(name), tclass)?;
     avc::has_perm(ssid, new, tclass, file::CREATE, name_fields(name))?;
     let (_, fs_sid) = server::fs_use(dir.mount.fstype());
     avc::has_perm(new, fs_sid, class::FILESYSTEM, filesystem::ASSOCIATE, name_fields(name))
@@ -202,14 +202,15 @@ mod tests {
         // The SID `init` has the context of `kernel` without the capability
         // `userspace_initial_context`, so the test takes a SID of init_t.
         let init = server::context_to_sid(b"system_u:system_r:init_t:s0", 0, false).unwrap();
-        let new = |create, name: &[u8], tclass| new_file_sid(init, create, &tmp, name, tclass);
+        let new =
+            |create, name: &[u8], tclass| new_file_sid(init, create, &tmp, Some(name), tclass);
         assert_eq!(context(new(0, b"named", class::DIR).unwrap()), "system_u:object_r:bin_t:s0");
         assert_eq!(context(new(0, b"other", class::DIR).unwrap()), "system_u:object_r:tmpfs_t:s0");
         assert_eq!(context(new(0, b"named", class::FILE).unwrap()), "system_u:object_r:etc_t:s0");
         // tmpfs keeps the labels, so the SID of fscreate is the label. selinuxfs does not.
         assert_eq!(new(sid::DEVNULL, b"named", class::DIR), Ok(sid::DEVNULL));
         let (sel, _) = mount("selinuxfs", b"x", 0o100_644);
-        let label = new_file_sid(init, sid::DEVNULL, &sel, b"x", class::FILE).unwrap();
+        let label = new_file_sid(init, sid::DEVNULL, &sel, Some(b"x"), class::FILE).unwrap();
         assert_eq!(context(label), "system_u:object_r:security_t:s0");
     }
 

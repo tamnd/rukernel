@@ -8,8 +8,9 @@
 //! with its table of SIDs ([`sidtab`]), the text of the contexts ([`context`]), the classes of
 //! the kernel ([`classmap`]), the access vector cache ([`avc`]), the SIDs of the tasks with
 //! their change at an exec and their attributes in `/proc/PID/attr` ([`task`]), the labels of
-//! the files ([`inode`]), and the checks of the access to the files ([`file`]) and of the
-//! operations on the names of the directories ([`namei`]).
+//! the files ([`inode`]), the checks of the access to the files ([`file`]) and of the
+//! operations on the names of the directories ([`namei`]), and the labels of the new files
+//! and the changes of the labels ([`xattr`]).
 //!
 //! The module is active when the command line has `selinux=1`, when `lsm=` names it, or with
 //! `security=selinux`. With `selinux=0` it is not active. The module starts in permissive
@@ -37,6 +38,7 @@ pub mod server;
 pub mod services;
 pub mod sidtab;
 pub mod task;
+pub mod xattr;
 
 use crate::classmap::class;
 use crate::namei::Link;
@@ -169,6 +171,51 @@ impl SecurityHooks for SeLinux {
         new: Option<&Location>,
     ) -> Result<()> {
         namei::may_rename(old_dir, old, new_dir, name, new)
+    }
+
+    fn inode_init_security(
+        &self,
+        inode: &dyn Inode,
+        dir: &Location,
+        name: Option<&[u8]>,
+        xattrs: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        xattr::init_security(inode, dir, name, xattrs)
+    }
+
+    fn inode_setxattr(
+        &self,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        name: &[u8],
+        value: &[u8],
+        _flags: u32,
+    ) -> Result<()> {
+        xattr::setxattr(inode, at, name, value)
+    }
+
+    fn inode_post_setxattr(&self, inode: &dyn Inode, name: &[u8], value: &[u8], _flags: u32) {
+        xattr::post_setxattr(inode, name, value);
+    }
+
+    fn inode_setsecurity(
+        &self,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        name: &[u8],
+        value: &[u8],
+        _flags: u32,
+    ) -> Option<Result<()>> {
+        xattr::setsecurity(inode, at, name, value)
+    }
+
+    fn inode_removexattr(
+        &self,
+        inode: &dyn Inode,
+        at: Option<&Location>,
+        name: &[u8],
+    ) -> Result<()> {
+        xattr::removexattr(inode, at, name)
     }
 }
 
