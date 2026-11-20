@@ -734,6 +734,83 @@ fn loopback_sockets() {
     ipv4_groups();
     bind_no_port();
     resolved_options();
+    tcp_pktoptions();
+}
+
+/// `IP_PKTOPTIONS` and `IPV6_2292PKTOPTIONS` of a TCP connection give the interface and the TTL
+/// of its SYN, as Linux. systemd-resolved takes the interface of a TCP query from them, and it
+/// closes the connection when they give an error. The `loopback_sockets` test calls this.
+fn tcp_pktoptions() {
+    use crate::Stream;
+    use rk_abi::native::in6::{
+        IPV6_2292PKTOPTIONS, IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVPKTINFO,
+        IPV6_UNICAST_HOPS,
+    };
+    use rk_abi::native::inet::{
+        IP_PKTINFO, IP_PKTOPTIONS, IP_RECVTTL, IP_TTL, IPPROTO_IP, IPPROTO_IPV6,
+    };
+    use rk_net::consts::AF_INET6;
+    let lo = ipv4::LOOPBACK;
+    let int = |v: i32| v.to_ne_bytes().to_vec();
+    // A control message: `struct cmsghdr`, the data, and the padding to 8 bytes.
+    let cmsg = |level: u32, kind: u32, data: &[u8]| {
+        let mut m = ((16 + data.len()) as u64).to_ne_bytes().to_vec();
+        m.extend_from_slice(&level.to_ne_bytes());
+        m.extend_from_slice(&kind.to_ne_bytes());
+        m.extend_from_slice(data);
+        m.resize(m.len().next_multiple_of(8), 0);
+        m
+    };
+    let pktinfo = |i: u32, a: Addr| [&i.to_ne_bytes()[..], &a, &a].concat();
+
+    let l = Stream::new();
+    l.bind(&NoPaths, &sockaddr::make(lo, 0)).unwrap();
+    let port = sockaddr::parse_bind(&l.name()).unwrap().1;
+    // Without the flags there is no message.
+    assert_eq!(l.get_option(IPPROTO_IP, IP_PKTOPTIONS), Ok(Vec::new()));
+    for name in [IP_PKTINFO, IP_RECVTTL] {
+        l.set_option(IPPROTO_IP, name, &int(1)).unwrap();
+    }
+    l.listen(4).unwrap();
+    let c = Stream::new();
+    let _ = c.connect(&NoPaths, &sockaddr::make(lo, port), true);
+    let a = l.accept(true).unwrap();
+    // The connection has the flags of the listening socket. Its SYN came on the loopback
+    // device, which has 127.0.0.1, with the TTL of the client.
+    let ttl = c.get_option(IPPROTO_IP, IP_TTL).unwrap();
+    let want = [cmsg(IPPROTO_IP, IP_PKTINFO, &pktinfo(1, lo)), cmsg(IPPROTO_IP, IP_TTL, &ttl)];
+    assert_eq!(a.get_option(IPPROTO_IP, IP_PKTOPTIONS), Ok(want.concat()));
+    // A socket from `connect` has no interface and the TTL 1, as Linux.
+    for name in [IP_PKTINFO, IP_RECVTTL] {
+        c.set_option(IPPROTO_IP, name, &int(1)).unwrap();
+    }
+    let want = [cmsg(IPPROTO_IP, IP_PKTINFO, &pktinfo(0, lo)), cmsg(IPPROTO_IP, IP_TTL, &int(1))];
+    assert_eq!(c.get_option(IPPROTO_IP, IP_PKTOPTIONS), Ok(want.concat()));
+    a.release();
+    c.release();
+    l.release();
+
+    let lo6 = ip::LOOPBACK;
+    let make = |a: &Ip, p| sockaddr::make_in(AF_INET6, a, p, 0);
+    let l = Stream::new6();
+    l.bind(&NoPaths, &make(&lo6, 0)).unwrap();
+    let port = sockaddr::parse_bind_in(AF_INET6, &l.name()).unwrap().1;
+    for name in [IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT] {
+        l.set_option(IPPROTO_IPV6, name, &int(1)).unwrap();
+    }
+    l.listen(4).unwrap();
+    let c = Stream::new6();
+    let _ = c.connect(&NoPaths, &make(&lo6, port), true);
+    let a = l.accept(true).unwrap();
+    // As Linux, the address of `IPV6_PKTINFO` is the address of the peer.
+    let info = [&lo6[..], &1u32.to_ne_bytes()].concat();
+    let hops = c.get_option(IPPROTO_IPV6, IPV6_UNICAST_HOPS).unwrap();
+    let want = [cmsg(IPPROTO_IPV6, IPV6_PKTINFO, &info), cmsg(IPPROTO_IPV6, IPV6_HOPLIMIT, &hops)];
+    assert_eq!(a.get_option(IPPROTO_IPV6, IPV6_2292PKTOPTIONS), Ok(want.concat()));
+    assert_eq!(c.get_option(IPPROTO_IPV6, IPV6_2292PKTOPTIONS), Ok(Vec::new()));
+    a.release();
+    c.release();
+    l.release();
 }
 
 /// The options that systemd-resolved sets on its sockets: `IP_UNICAST_IF` on UDP and TCP, and
