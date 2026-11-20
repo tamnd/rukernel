@@ -46,10 +46,10 @@ use rk_abi::native::rtnetlink::{
     RT_SCOPE_UNIVERSE, RT_TABLE_COMPAT, RT_TABLE_MAIN, RTA_CACHEINFO, RTA_DEL_REASON, RTA_DPORT,
     RTA_DST, RTA_ENCAP, RTA_EXPIRES, RTA_GATEWAY, RTA_IIF, RTA_IP_PROTO, RTA_MARK, RTA_METRICS,
     RTA_MULTIPATH, RTA_NH_ID, RTA_OIF, RTA_PREF, RTA_PREFSRC, RTA_PRIORITY, RTA_SPORT, RTA_SRC,
-    RTA_TABLE, RTA_UID, RTM_DELADDR, RTM_DELROUTE, RTM_F_CLONED, RTM_F_FIB_MATCH, RTM_F_NOTIFY,
-    RTM_F_PREFIX, RTM_GETADDR, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWROUTE, RTN_BLACKHOLE, RTN_LOCAL,
-    RTN_PROHIBIT, RTN_UNICAST, RTN_UNREACHABLE, RTNLGRP_IPV6_IFADDR, RTNLGRP_IPV6_ROUTE,
-    RTPROT_BOOT,
+    RTA_TABLE, RTA_UID, RTA_VIA, RTM_DELADDR, RTM_DELROUTE, RTM_F_CLONED, RTM_F_FIB_MATCH,
+    RTM_F_NOTIFY, RTM_F_PREFIX, RTM_GETADDR, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWROUTE,
+    RTN_BLACKHOLE, RTN_LOCAL, RTN_PROHIBIT, RTN_UNICAST, RTN_UNREACHABLE, RTNLGRP_IPV6_IFADDR,
+    RTNLGRP_IPV6_ROUTE, RTPROT_BOOT,
 };
 use rk_frame::sync::SpinLock;
 use rk_net::consts::{AF_INET6, IFF_NOARP};
@@ -702,6 +702,9 @@ fn dump_addrs(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
 /// A route of a request, as `rtm_to_fib6_config` of Linux.
 fn to_route(req: &Request<'_>) -> Result<Route6> {
     let (h, a) = req.parse(RTMSG_LEN, RTA_MAX)?;
+    if a.has(RTA_VIA) {
+        return Err(req.error("IPv6 does not support RTA_VIA attribute", Errno::EINVAL));
+    }
     for ty in [RTA_DST, RTA_SRC, RTA_GATEWAY, RTA_PREFSRC] {
         a.addr6(ty)?;
     }
@@ -794,6 +797,70 @@ fn check_route(r: &mut Route6) -> Result<()> {
         return Err(Errno::ENETDOWN);
     }
     Ok(())
+}
+
+/// Checks the IPv6 gateway of an IPv4 route and gives the interface of the route, as
+/// `fib_check_nh_v6_gw`, `fib6_nh_init` and `ip6_validate_gw` of Linux. `ifindex` is the
+/// interface of the route, or 0, and `flags` are the flags of its next hop.
+///
+/// # Errors
+///
+/// Gives `ENODEV` for an interface that is not there, `ENETDOWN` for an interface that is down,
+/// `EHOSTUNREACH` for a gateway that is not on a link of the interface, and `EINVAL` for a
+/// gateway that is local, not unicast, or link local without an interface.
+pub(crate) fn check_gateway(gw: &Ip, ifindex: u32, flags: u32) -> Result<u32> {
+    let onlink = flags & rk_abi::native::rtnetlink::RTNH_F_ONLINK != 0;
+    if ifindex != 0 {
+        let d = dev::by_index(ifindex).ok_or(Errno::ENODEV)?;
+        if onlink && !d.is_up() {
+            return Err(Errno::ENETDOWN);
+        }
+    } else if onlink {
+        return Err(Errno::EINVAL);
+    }
+    let mut oif = ifindex;
+    {
+        let t = ROUTES6.lock();
+        if *gw == [0; 16] || ipv6::is_multicast(gw) || t.is_local_gateway(gw, oif) {
+            return Err(Errno::EINVAL);
+        }
+        if !ipv6::is_link_local(gw) {
+            if onlink {
+                // `ip6_route_check_nh_onlink`: a route to the gateway other than the default
+                // route must go through the device.
+                if let Ok((_, Some(r))) = t.lookup_gateway(gw, 0)
+                    && r.prefix != 0
+                    && (u32::from(r.kind) != RTN_UNICAST || r.ifindex != oif)
+                {
+                    return Err(Errno::EINVAL);
+                }
+            } else {
+                // `ip6_route_check_nh`: the gateway must be on a link, of the device if the
+                // route has one.
+                match t.lookup_gateway(gw, oif) {
+                    Ok((n, r))
+                        if (oif == 0 || n.ifindex == oif)
+                            && r.is_none_or(|r| r.gateway.is_none()) =>
+                    {
+                        oif = n.ifindex;
+                    }
+                    _ => return Err(Errno::EHOSTUNREACH),
+                }
+            }
+        }
+        // A gateway that was not checked against an interface is checked now.
+        if ifindex == 0 && t.is_local_gateway(gw, oif) {
+            return Err(Errno::EINVAL);
+        }
+    }
+    let d = dev::by_index(oif).ok_or(Errno::EINVAL)?;
+    if d.kind() == LinkKind::Loopback {
+        return Err(Errno::EINVAL);
+    }
+    if !d.is_up() {
+        return Err(Errno::ENETDOWN);
+    }
+    Ok(oif)
 }
 
 /// `RTM_NEWROUTE`, as `inet6_rtm_newroute` of Linux.

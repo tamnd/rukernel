@@ -37,7 +37,7 @@ use rk_abi::native::icmpv6::{
     ICMPV6_PORT_UNREACH, ICMPV6_REJECT_ROUTE, ICMPV6_TIME_EXCEED, ICMPV6_UNK_NEXTHDR,
 };
 use rk_abi::native::if_addr::{IFA_F_OPTIMISTIC, IFA_F_TENTATIVE};
-use rk_abi::native::if_ether::ETH_P_IPV6;
+use rk_abi::native::if_ether::{ETH_P_IP, ETH_P_IPV6};
 use rk_abi::native::inet::{IPPROTO_IPIP, IPPROTO_IPV6};
 use rk_abi::native::rtnetlink::RTPROT_RA;
 use rk_frame::sync::SpinLock;
@@ -325,7 +325,7 @@ pub(crate) fn neigh_add(
     };
     neigh_notify();
     for mut packet in waiting {
-        ether(dev, mac).push(&mut packet);
+        ether_of(dev, mac, &packet).push(&mut packet);
         let _ = dev.transmit(packet);
     }
     Ok(())
@@ -652,6 +652,16 @@ fn ether(dev: &NetDevice, dst: MacAddr) -> EthHeader {
     EthHeader { dst, src: dev.mac(), ethertype: ETH_P_IPV6 as u16 }
 }
 
+/// The link header of a packet that waited for a neighbour. An IPv4 packet through an IPv6
+/// gateway waits for the neighbour of IPv6 too, and keeps the type of IPv4.
+fn ether_of(dev: &NetDevice, dst: MacAddr, packet: &NetBuf) -> EthHeader {
+    let mut h = ether(dev, dst);
+    if packet.data().first().is_some_and(|b| b >> 4 == 4) {
+        h.ethertype = ETH_P_IP as u16;
+    }
+    h
+}
+
 /// Gives a packet to the link: the loopback device, a multicast group, or a neighbour.
 pub(crate) fn transmit(dev: &NetDevice, next: &Next6, mut buf: NetBuf) -> Result<()> {
     count(&COUNTERS6.out_transmits);
@@ -669,19 +679,31 @@ pub(crate) fn transmit(dev: &NetDevice, next: &Next6, mut buf: NetBuf) -> Result
         ether(dev, ipv6::multicast_mac(&dst)).push(&mut buf);
         return dev.transmit(buf);
     }
-    let key = (dev.ifindex(), next.hop);
+    resolve(dev, &next.hop, buf)
+}
+
+/// Gives an IPv4 packet to its IPv6 gateway on the device, as `ip_neigh_gw6` and
+/// `neigh_output` of Linux. The neighbour discovery finds the link address of the gateway.
+pub(crate) fn transmit_v4(dev: &NetDevice, gw: &Ip, buf: NetBuf) -> Result<()> {
+    resolve(dev, gw, buf)
+}
+
+/// Gives a packet to the neighbour `hop` on the device, or keeps it until the neighbour
+/// discovery finds the link address.
+fn resolve(dev: &NetDevice, hop: &Ip, buf: NetBuf) -> Result<()> {
+    let key = (dev.ifindex(), *hop);
     let r = NEIGH6.lock().resolve(key, now_ms(), buf);
     match r {
         neigh::Resolve::Send { mut packet, mac, probe } => {
             if probe {
-                solicit(dev, &next.hop);
+                solicit(dev, hop);
             }
-            ether(dev, mac).push(&mut packet);
+            ether_of(dev, mac, &packet).push(&mut packet);
             dev.transmit(packet)
         }
         neigh::Resolve::Wait { probe } => {
             if probe {
-                solicit(dev, &next.hop);
+                solicit(dev, hop);
             }
             Ok(())
         }
@@ -853,7 +875,7 @@ fn learn(dev: &NetDevice, addr: &Ip, mac: MacAddr, create: bool) {
     let waiting = NEIGH6.lock().update((dev.ifindex(), *addr), mac, now_ms(), create);
     neigh_notify();
     for mut packet in waiting {
-        ether(dev, mac).push(&mut packet);
+        ether_of(dev, mac, &packet).push(&mut packet);
         let _ = dev.transmit(packet);
     }
 }

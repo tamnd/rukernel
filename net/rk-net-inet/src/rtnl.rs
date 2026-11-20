@@ -253,6 +253,23 @@ pub(crate) fn to_metrics(b: &[u8]) -> Result<Metrics> {
     Ok(m)
 }
 
+/// The gateway of an `RTA_VIA` attribute, a `struct rtvia`, as `fib_gw_from_via` of Linux.
+/// Gives the message of Linux for an attribute that is not valid.
+fn via(v: &[u8]) -> core::result::Result<nexthop::Gateway, &'static str> {
+    let Some((family, addr)) = v.split_first_chunk::<2>() else {
+        return Err("Invalid attribute length for RTA_VIA");
+    };
+    match u32::from(u16::from_ne_bytes(*family)) {
+        AF_INET => {
+            addr.try_into().map(nexthop::Gateway::V4).map_err(|_| "Invalid IPv4 address in RTA_VIA")
+        }
+        AF_INET6 => {
+            addr.try_into().map(nexthop::Gateway::V6).map_err(|_| "Invalid IPv6 address in RTA_VIA")
+        }
+        _ => Err("Unsupported address family in RTA_VIA"),
+    }
+}
+
 /// A route of a request, as `rtm_to_fib_config` of Linux. Gives the route with its table.
 fn to_route(req: &Request<'_>) -> Result<Route> {
     let (h, a) = req.parse(RTMSG_LEN, RTA_MAX)?;
@@ -281,6 +298,21 @@ fn to_route(req: &Request<'_>) -> Result<Route> {
     if prefix > 32 || ipv4::prefix(dst, prefix) != dst {
         return Err(Errno::EINVAL);
     }
+    let mut gateway = a.addr4(RTA_GATEWAY)?.filter(|g| *g != ipv4::ANY);
+    let mut via6 = None;
+    if let Some(v) = a.get(RTA_VIA) {
+        if a.has(RTA_GATEWAY) {
+            return Err(req.error(
+                "Nexthop configuration can not contain both GATEWAY and VIA",
+                Errno::EINVAL,
+            ));
+        }
+        match via(v).map_err(|m| req.error(m, Errno::EINVAL))? {
+            nexthop::Gateway::V4(g) => gateway = Some(g).filter(|g| *g != ipv4::ANY),
+            nexthop::Gateway::V6(g) => via6 = Some(g),
+            nexthop::Gateway::None => {}
+        }
+    }
     Ok(Route {
         table,
         dst,
@@ -291,7 +323,8 @@ fn to_route(req: &Request<'_>) -> Result<Route> {
         scope: h[6],
         protocol: h[5],
         prefsrc: a.addr4(RTA_PREFSRC)?.filter(|s| *s != ipv4::ANY),
-        gateway: a.addr4(RTA_GATEWAY)?.filter(|g| *g != ipv4::ANY),
+        gateway,
+        via6,
         ifindex: a.u32(RTA_OIF)?.unwrap_or(0),
         flags: u32_at(h, 8),
         metrics: a.get(RTA_METRICS).map_or(Ok([0; RTAX_MAX as usize]), to_metrics)?,
@@ -330,6 +363,7 @@ fn delroute(req: &Request<'_>) -> Result<()> {
         protocol: nonzero(r.protocol),
         prefsrc: r.prefsrc,
         gateway: r.gateway,
+        via6: r.via6,
         ifindex: (r.ifindex != 0).then_some(r.ifindex),
         priority: (r.priority != 0).then_some(r.priority),
         nhid: (r.nhid != 0).then_some(r.nhid),
@@ -446,7 +480,9 @@ fn getroute(req: &Request<'_>) -> Result<()> {
     if prefsrc != src {
         b.put(RTA_PREFSRC as u16, &prefsrc);
     }
-    if !next.local && next.hop != to {
+    if let Some(gw) = next.via6 {
+        nexthop::put_via6(&mut b, &gw);
+    } else if !next.local && next.hop != to {
         b.put(RTA_GATEWAY as u16, &next.hop);
     }
     if let Some(r) = route {
@@ -781,5 +817,39 @@ mod tests {
         let with = fib::fill_route(&r, RTM_NEWROUTE, 0, 0, 0);
         // The attribute has a header of 4 bytes and one metric of 8 bytes.
         assert_eq!(with.len(), plain.len() + 12);
+    }
+
+    const GW6: Ip = [0x20, 0x01, 0x12, 0x34, 0, 5, 0x8f, 0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0, 0xff];
+
+    /// `RTA_VIA` is a `struct rtvia`: the family and the address, as `fib_gw_from_via` of
+    /// Linux.
+    #[test]
+    fn via_has_the_checks_of_linux() {
+        let v = |family: u32, addr: &[u8]| {
+            let mut b = Vec::from((family as u16).to_ne_bytes());
+            b.extend_from_slice(addr);
+            via(&b)
+        };
+        assert_eq!(v(AF_INET, &[10, 0, 2, 2]), Ok(nexthop::Gateway::V4([10, 0, 2, 2])));
+        assert_eq!(v(AF_INET6, &GW6), Ok(nexthop::Gateway::V6(GW6)));
+        assert_eq!(v(AF_INET6, &[10, 0, 2, 2]), Err("Invalid IPv6 address in RTA_VIA"));
+        assert_eq!(v(AF_INET, &GW6), Err("Invalid IPv4 address in RTA_VIA"));
+        assert_eq!(v(17, &[1, 2, 3, 4]), Err("Unsupported address family in RTA_VIA"));
+        assert_eq!(via(&[2]), Err("Invalid attribute length for RTA_VIA"));
+    }
+
+    /// A route through an IPv6 gateway shows it as an `RTA_VIA` with the family `AF_INET6`,
+    /// and `ip route` prints `via inet6`. The route has no `RTA_GATEWAY`.
+    #[test]
+    fn a_route_through_an_ipv6_gateway_has_rta_via() {
+        let r = Route { via6: Some(GW6), ..Route::new([149, 10, 124, 66], 32, None, 2) };
+        let m = fib::fill_route(&r, RTM_NEWROUTE, 0, 0, 0);
+        let got: Vec<(u16, Vec<u8>)> =
+            attrs(&m[16 + RTMSG_LEN..]).map(|(t, d)| (t, d.to_vec())).collect();
+        let mut via = Vec::from((AF_INET6 as u16).to_ne_bytes());
+        via.extend_from_slice(&GW6);
+        assert!(got.contains(&(RTA_VIA as u16, via)));
+        assert!(got.contains(&(RTA_OIF as u16, 2u32.to_ne_bytes().to_vec())));
+        assert!(!got.iter().any(|(t, _)| *t == RTA_GATEWAY as u16));
     }
 }

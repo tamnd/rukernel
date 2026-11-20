@@ -425,6 +425,43 @@ fn a_secondary_address_takes_the_place_of_a_removed_primary_address() {
     assert_eq!(t.remove_addr(at, true).1, None);
 }
 
+/// An IPv4 route through an IPv6 gateway, the `RTA_VIA` of Linux 5.2. The lookup gives the
+/// destination as the next hop, and the IPv6 gateway for the neighbour. A delete with another
+/// IPv6 gateway does not match the route.
+#[test]
+fn a_route_through_an_ipv6_gateway() {
+    let mut t = qemu_table();
+    let gw6: Ip = [0x20, 0x01, 0x12, 0x34, 0, 5, 0x8f, 0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0, 0xff];
+    let r = Route {
+        scope: RT_SCOPE_UNIVERSE as u8,
+        via6: Some(gw6),
+        ..Route::new([149, 10, 124, 66], 32, None, 2)
+    };
+    let up = |_| Some(true);
+    assert_eq!(
+        t.check_nexthop(&Route { scope: RT_SCOPE_HOST as u8, ..r.clone() }, up),
+        Err(Errno::EINVAL)
+    );
+    t.insert_route(r.clone(), NLM_F_CREATE).unwrap();
+    let n = t.lookup([149, 10, 124, 66]).unwrap();
+    assert_eq!(
+        (n.ifindex, n.hop, n.via6, n.src),
+        (2, [149, 10, 124, 66], Some(gw6), [10, 0, 2, 15])
+    );
+    let n = t.lookup([149, 10, 124, 67]).unwrap();
+    assert_eq!((n.hop, n.via6), ([10, 0, 2, 2], None));
+    let mut m = Match {
+        table: RT_TABLE_MAIN,
+        dst: [149, 10, 124, 66],
+        prefix: 32,
+        via6: Some([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        ..Match::default()
+    };
+    assert_eq!(t.delete_route(&m), Err(Errno::ESRCH));
+    m.via6 = Some(gw6);
+    assert_eq!(t.delete_route(&m).unwrap(), r);
+}
+
 #[test]
 fn insert_and_delete_routes() {
     let mut t = qemu_table();

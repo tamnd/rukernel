@@ -5,6 +5,7 @@
 //! Each change takes the lock of the route table for a short time. The notifications go out
 //! after the lock is free, because a socket that gets a message takes its own lock.
 
+use crate::addrconf;
 use crate::ipv4::{self, Addr};
 use crate::nexthop;
 use crate::route::{Changes, IfAddr, Link, Match, Metrics, Route};
@@ -151,6 +152,9 @@ pub fn fill_route(r: &Route, ty: u32, portid: u32, seq: u32, flags: u32) -> Vec<
         None => {
             if let Some(gw) = r.gateway {
                 b.put(RTA_GATEWAY as u16, &gw);
+            }
+            if let Some(gw) = r.via6 {
+                nexthop::put_via6(&mut b, &gw);
             }
             if r.ifindex != 0 {
                 b.u32(RTA_OIF as u16, r.ifindex);
@@ -338,17 +342,16 @@ fn min_scope(kind: u32) -> u32 {
 ///
 /// Gives `EINVAL` for a type or a scope that is not valid, for a gateway or a device on a route
 /// without a next hop, and for a preferred source that is not local. Gives the errors of
-/// `route::Table::check_nexthop` too.
+/// `route::Table::check_nexthop` and `addrconf::check_gateway` too.
 pub fn check_route(r: &mut Route) -> Result<()> {
     let kind = u32::from(r.kind);
     // `RTN_XRESOLVE` is the last type, `RTN_MAX` of Linux.
     if kind > RTN_XRESOLVE || min_scope(kind) > u32::from(r.scope) {
         return Err(Errno::EINVAL);
     }
-    let t = ROUTES.lock();
     if matches!(kind, RTN_UNREACHABLE | RTN_PROHIBIT | RTN_BLACKHOLE | RTN_THROW) {
         // A route without a next hop takes no gateway and no device.
-        if r.gateway.is_some() || r.ifindex != 0 {
+        if r.gateway.is_some() || r.via6.is_some() || r.ifindex != 0 {
             return Err(Errno::EINVAL);
         }
     } else {
@@ -357,11 +360,18 @@ pub fn check_route(r: &mut Route) -> Result<()> {
         {
             return Err(Errno::EINVAL);
         }
-        // `nexthop::check_route4` checks a nexthop object.
+        // `nexthop::check_route4` checks a nexthop object. An IPv6 gateway is a neighbour of
+        // IPv6, as `fib_check_nh_v6_gw`: the table of the IPv6 routes checks it, without the
+        // lock of the IPv4 routes.
         if r.nhid == 0 {
-            r.ifindex = t.check_nexthop(r, |i| dev::by_index(i).map(|d| d.is_up()))?;
+            r.ifindex = match r.via6 {
+                Some(_) if r.scope == RT_SCOPE_HOST as u8 => return Err(Errno::EINVAL),
+                Some(gw) => addrconf::check_gateway(&gw, r.ifindex, r.flags)?,
+                None => ROUTES.lock().check_nexthop(r, |i| dev::by_index(i).map(|d| d.is_up()))?,
+            };
         }
     }
+    let t = ROUTES.lock();
     if let Some(src) = r.prefsrc {
         // `fib_valid_prefsrc`: a `local` route to its own address is valid before the address.
         let own = kind == RTN_LOCAL && r.dst != ipv4::ANY && r.dst == src;
