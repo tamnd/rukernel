@@ -1159,13 +1159,24 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
         }
         return Ok(());
     }
-    // A write to `drop_caches` removes the clean pages of the block devices. The value stays 0.
+    // A write to `drop_caches` is a value from 1 to 4, and the value stays 0, as
+    // `drop_caches_sysctl_handler` of Linux. Bit 1 removes the clean pages of the block devices.
+    // Bit 2 removes the unused inodes, so the evictable fanotify marks of these inodes go.
     // The kernel does not move pages, so a write to `compact_memory` has no work.
     if name == "vm/compact_memory" {
         return Ok(());
     }
     if name == "vm/drop_caches" {
-        rk_vfs::blockdev::drop_clean_all();
+        let value = parse_int(data)?;
+        if !(1..=4).contains(&value) {
+            return Err(Errno::EINVAL);
+        }
+        if value & 1 != 0 {
+            rk_vfs::blockdev::drop_clean_all();
+        }
+        if value & 2 != 0 {
+            rk_vfs::notify::evict_unused_inodes();
+        }
         return Ok(());
     }
     let mut value = data.to_vec();

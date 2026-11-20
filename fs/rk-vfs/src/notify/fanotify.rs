@@ -99,7 +99,7 @@ const MAX_MERGE: usize = 128;
 /// The flags of a mark, as `FSNOTIFY_MARK_FLAG_*` of Linux.
 mod mark_flags {
     /// The mark does not hold its inode, `FSNOTIFY_MARK_FLAG_NO_IREF`.
-    pub(super) const NO_IREF: u32 = 1;
+    pub(super) const NO_IREF: u32 = super::super::MARK_NO_IREF;
     /// The ignore mask has its own event flags, `FSNOTIFY_MARK_FLAG_HAS_IGNORE_FLAGS`.
     pub(super) const HAS_IGNORE_FLAGS: u32 = 2;
     /// A modification does not clear the ignore mask, `FSNOTIFY_MARK_FLAG_IGNORED_SURV_MODIFY`.
