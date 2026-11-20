@@ -129,6 +129,10 @@ impl SecurityHooks for SeLinux {
         file::file_fcntl(f, cmd, arg)
     }
 
+    fn file_ioctl(&self, f: &File, cmd: u32, _arg: u64) -> Result<()> {
+        file::file_ioctl(f, cmd)
+    }
+
     fn inode_getattr(&self, at: &Location) -> Result<()> {
         file::inode_getattr(at)
     }

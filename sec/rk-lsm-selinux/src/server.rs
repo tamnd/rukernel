@@ -3,7 +3,9 @@
 //! kernel.
 
 use crate::policydb::{Context, Policydb, fs_use};
-use crate::services::{self, AvDecision, Mapping, NEVERAUDIT, PERMISSIVE, set_mapping};
+use crate::services::{
+    self, AvDecision, ExtendedPerms, Mapping, NEVERAUDIT, PERMISSIVE, XpermsDecision, set_mapping,
+};
 use crate::sidtab::{Entry, INITIAL_NAMES, NUM_INITIAL, Sidtab, sid};
 use crate::{POLICY, POLICY_MUTEX, POLICYCAP_NAMES, POLICYLOAD, SEQUENCE};
 use crate::{avc, classmap, enforcing, policy};
@@ -44,11 +46,23 @@ fn search(p: &Policy, sid: u32, force: bool, func: &str) -> Option<Entry> {
 /// The decision for the SIDs `ssid` and `tsid` and the class `tclass` of the kernel, as
 /// `security_compute_av` of Linux. Before the first policy load, all is allowed.
 pub fn compute_av(ssid: u32, tsid: u32, tclass: u16) -> AvDecision {
+    compute_av_xperms(ssid, tsid, tclass, None)
+}
+
+/// The decision as [`compute_av`], and the drivers of the rules of extended permissions in
+/// `xp`, as `security_compute_av` of Linux with `xperms`.
+pub fn compute_av_xperms(
+    ssid: u32,
+    tsid: u32,
+    tclass: u16,
+    xp: Option<&mut ExtendedPerms>,
+) -> AvDecision {
     let Some(p) = policy() else { return AvDecision { allowed: u32::MAX, ..AvDecision::new(0) } };
     let mut avd = AvDecision::new(p.seqno);
     let class = services::unmap_class(&p.map, tclass);
     let unknown = tclass != 0 && class == 0;
-    if let Some(d) = decide(&p, ssid, tsid, class, unknown, &mut avd, "security_compute_av") {
+    let func = "security_compute_av";
+    if let Some(d) = decide(&p, ssid, tsid, class, unknown, &mut avd, xp, func) {
         avd.allowed = d.allowed;
         avd.auditallow = d.auditallow;
         avd.auditdeny = d.auditdeny;
@@ -63,7 +77,8 @@ pub fn compute_av_user(ssid: u32, tsid: u32, tclass: u32) -> AvDecision {
     let Some(p) = policy() else { return AvDecision { allowed: u32::MAX, ..AvDecision::new(0) } };
     let mut avd = AvDecision::new(p.seqno);
     let unknown = tclass == 0;
-    if let Some(d) = decide(&p, ssid, tsid, tclass, unknown, &mut avd, "security_compute_av_user") {
+    let func = "security_compute_av_user";
+    if let Some(d) = decide(&p, ssid, tsid, tclass, unknown, &mut avd, None, func) {
         avd.allowed = d.allowed;
         avd.auditallow = d.auditallow;
         avd.auditdeny = d.auditdeny;
@@ -71,8 +86,9 @@ pub fn compute_av_user(ssid: u32, tsid: u32, tclass: u32) -> AvDecision {
     finish(avd)
 }
 
-/// The common part of [`compute_av`] and [`compute_av_user`]. It sets the flags of `avd`, and
-/// gives the decision of the rules, or `None` if `avd` is the decision.
+/// The common part of [`compute_av_xperms`] and [`compute_av_user`]. It sets the flags of
+/// `avd`, and gives the decision of the rules, or `None` if `avd` is the decision.
+#[allow(clippy::too_many_arguments)]
 fn decide(
     p: &Policy,
     ssid: u32,
@@ -80,6 +96,7 @@ fn decide(
     tclass: u32,
     unknown: bool,
     avd: &mut AvDecision,
+    xp: Option<&mut ExtendedPerms>,
     func: &str,
 ) -> Option<AvDecision> {
     let s = search(p, ssid, false, func)?.context;
@@ -100,7 +117,40 @@ fn decide(
         }
         return None;
     }
-    Some(p.db.context_compute_av(&s, &t, tclass))
+    Some(p.db.context_compute_av_xperms(&s, &t, tclass, xp))
+}
+
+/// The extended permissions of `driver` for the base permission `base_perm` (a bit of
+/// [`services::ext`]), for the SIDs `ssid` and `tsid` and the class `tclass` of the kernel, as
+/// `security_compute_xperms_decision` of Linux. Before the first policy load, all is allowed.
+pub fn compute_xperms_decision(
+    ssid: u32,
+    tsid: u32,
+    tclass: u16,
+    driver: u8,
+    base_perm: u8,
+) -> XpermsDecision {
+    let mut xpd = XpermsDecision::new(driver, base_perm);
+    let Some(p) = policy() else {
+        xpd.allowed = [u32::MAX; 8];
+        return xpd;
+    };
+    let func = "security_compute_xperms_decision";
+    let Some(s) = search(&p, ssid, false, func) else { return xpd };
+    let Some(t) = search(&p, tsid, false, func) else { return xpd };
+    let class = services::unmap_class(&p.map, tclass);
+    if tclass != 0 && class == 0 {
+        if p.db.allow_unknown {
+            xpd.allowed = [u32::MAX; 8];
+        }
+        return xpd;
+    }
+    if p.db.class(class).is_none() {
+        rk_frame::println!("SELinux:  Invalid class {class}");
+        return xpd;
+    }
+    p.db.context_compute_xperms(&s.context, &t.context, class, &mut xpd);
+    xpd
 }
 
 /// A domain that makes no audit records has no audit bits.
