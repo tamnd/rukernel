@@ -284,6 +284,9 @@ pub struct File {
     /// The file gives no events, as `FMODE_NONOTIFY` of Linux. fanotify opens its event files
     /// so, and a file that a permission event denied closes so.
     nonotify: AtomicBool,
+    /// The file gets the pre-content events, as `FMODE_FSNOTIFY_HSM` of Linux. The open sets it
+    /// if a group watches the file for them.
+    hsm: AtomicBool,
     /// The process that gets the signals of the file, as `f_owner` of Linux. A negative value is
     /// a process group, and 0 is no owner.
     owner: AtomicI32,
@@ -332,7 +335,7 @@ pub fn check_write_access(inode: &dyn crate::inode::Inode) -> Result<()> {
 /// The denial of a write of the file of a running program, as `exe_file_deny_write_access` of
 /// Linux (fs/exec.c). The denial ends when the last value drops. A clone is the denial of one more
 /// process, as `dup_mm_exe_file` in kernel/fork.c of Linux.
-pub struct DenyWrite(InodeRef);
+pub struct DenyWrite(Option<InodeRef>);
 
 impl DenyWrite {
     /// Denies a write of `inode`.
@@ -349,21 +352,33 @@ impl DenyWrite {
         }
         *INODE_DENIED.lock().entry(key).or_insert(0) += 1;
         drop(writers);
-        Ok(Self(inode.clone()))
+        Ok(Self(Some(inode.clone())))
+    }
+
+    /// No denial, for a program that a group watches for the pre-content events, as
+    /// `exe_file_deny_write_access` of Linux with `FMODE_FSNOTIFY_HSM`. Such a group must be able
+    /// to write the file while it runs.
+    pub fn none() -> Self {
+        Self(None)
     }
 }
 
 impl Clone for DenyWrite {
     fn clone(&self) -> Self {
-        *INODE_DENIED.lock().entry(inode_key(&self.0)).or_insert(0) += 1;
+        if let Some(inode) = &self.0 {
+            *INODE_DENIED.lock().entry(inode_key(inode)).or_insert(0) += 1;
+        }
         Self(self.0.clone())
     }
 }
 
 impl Drop for DenyWrite {
     fn drop(&mut self) {
+        let Some(inode) = &self.0 else {
+            return;
+        };
         let mut denied = INODE_DENIED.lock();
-        let key = inode_key(&self.0);
+        let key = inode_key(inode);
         if let Some(count) = denied.get_mut(&key) {
             *count -= 1;
             if *count == 0 {
@@ -1158,6 +1173,7 @@ impl File {
             locked: AtomicBool::new(false),
             writer,
             nonotify: AtomicBool::new(false),
+            hsm: AtomicBool::new(false),
             owner: AtomicI32::new(0),
             signum: AtomicU32::new(0),
             owner_tid: AtomicBool::new(false),
@@ -1215,6 +1231,30 @@ impl File {
     /// Stops the events of the file, as `FMODE_NONOTIFY` of Linux.
     pub fn set_nonotify(&self) {
         self.nonotify.store(true, Ordering::Relaxed);
+    }
+
+    /// Tells if the file gets the pre-content events.
+    pub fn hsm(&self) -> bool {
+        self.hsm.load(Ordering::Relaxed)
+    }
+
+    /// Makes the file get the pre-content events, as `FMODE_FSNOTIFY_HSM` of Linux.
+    pub fn set_hsm(&self) {
+        self.hsm.store(true, Ordering::Relaxed);
+    }
+
+    /// The pre-content event before an access of the data of the file, as
+    /// `fsnotify_file_area_perm` and `fsnotify_mmap_perm` of Linux. `range` is the offset and the
+    /// length of the access. Only a file that the open marked gets the event.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EPERM` or the error of the answer if a group denies the access.
+    pub fn pre_access(&self, range: Option<(u64, u64)>) -> Result<()> {
+        match &self.location {
+            Some(at) if self.hsm() && !self.nonotify() => crate::notify::pre_access(at, range),
+            _ => Ok(()),
+        }
     }
 
     /// The owner of the file for the signals: a process ID, a negative process group ID, or 0.
@@ -1300,16 +1340,18 @@ impl File {
         if !self.flags().readable() {
             return Err(Errno::EBADF);
         }
-        self.access_perm()?;
+        self.access_perm(Some((self.pos(), buf.len() as u64)))?;
         let n = self.ops.read(self, buf)?;
         self.notify_access(n);
         Ok(n)
     }
 
     /// The checks before a read, as `security_file_permission` and `fsnotify_file_area_perm` in
-    /// `rw_verify_area` of Linux.
-    fn access_perm(&self) -> Result<()> {
+    /// `rw_verify_area` of Linux. `range` is the offset and the length of the read. The
+    /// pre-content event comes before the access event.
+    fn access_perm(&self, range: Option<(u64, u64)>) -> Result<()> {
         crate::security::file_permission(self, crate::cred::may::READ)?;
+        self.pre_access(range)?;
         match &self.location {
             Some(at) if !self.nonotify() => crate::notify::access_perm(at),
             _ => Ok(()),
@@ -1352,6 +1394,7 @@ impl File {
             return Err(Errno::EBADF);
         }
         crate::security::file_permission(self, crate::cred::may::WRITE)?;
+        self.pre_access(Some((self.pos(), buf.len() as u64)))?;
         self.remove_privs()?;
         let n = self.ops.write(self, buf)?;
         self.notify_modify(n);
@@ -1363,7 +1406,7 @@ impl File {
         if !self.flags().readable() {
             return Err(Errno::EBADF);
         }
-        self.access_perm()?;
+        self.access_perm(Some((offset, buf.len() as u64)))?;
         let n = self.ops.read_at(self, offset, buf)?;
         self.notify_access(n);
         Ok(n)
@@ -1375,6 +1418,7 @@ impl File {
             return Err(Errno::EBADF);
         }
         crate::security::file_permission(self, crate::cred::may::WRITE)?;
+        self.pre_access(Some((offset, buf.len() as u64)))?;
         self.remove_privs()?;
         let n = self.ops.write_at(self, offset, buf)?;
         self.notify_modify(n);
@@ -1550,8 +1594,12 @@ impl File {
         let mode = crate::cred::current().write_kill(&inode.metadata());
         let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };
         check_set_attr(&**inode, &attr)?;
-        // The LSM check comes before the truncate, as `do_ftruncate` of Linux.
+        // The LSM check and the pre-content event come before the truncate, as `do_ftruncate` of
+        // Linux.
         crate::security::file_truncate(self)?;
+        if let Some(at) = &self.location {
+            crate::notify::truncate_perm(at, size)?;
+        }
         crate::mapped::extend(inode, size);
         inode.set_attr(&attr)?;
         crate::mapped::changed(inode, size, u64::MAX);
@@ -1573,6 +1621,8 @@ impl File {
         }
         match inode.metadata().file_type() {
             Some(FileType::Regular) => {
+                // As `fsnotify_file_area_perm` in `vfs_fallocate` of Linux.
+                self.pre_access(Some((offset, len)))?;
                 self.remove_privs()?;
                 if mode & crate::inode::falloc::KEEP_SIZE == 0 {
                     crate::mapped::extend(inode, offset.saturating_add(len));
@@ -1624,7 +1674,7 @@ impl File {
         if self.flags().is_path() {
             return Err(Errno::EBADF);
         }
-        self.access_perm()?;
+        self.access_perm(None)?;
         // A directory that `rmdir` or a rename removed gives `ENOENT`, as `IS_DEADDIR` in
         // `iterate_dir` of Linux.
         if self.location.as_ref().is_some_and(|at| at.dentry.unlinked())

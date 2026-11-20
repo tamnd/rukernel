@@ -1904,6 +1904,7 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
     let _access = rk_vfs::file::WriteAccess::new(at.inode())?;
     rk_vfs::lease::break_lease(at.inode(), rk_abi::native::open::O_WRONLY)?;
     rk_vfs::security::path_truncate(&at)?;
+    rk_vfs::notify::truncate_perm(&at, size)?;
     fsize_check(cx, &at.inode().metadata(), size)?;
     let mode = fs.cred().write_kill(&at.inode().metadata());
     let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };

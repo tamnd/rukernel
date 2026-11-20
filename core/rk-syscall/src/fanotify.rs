@@ -22,6 +22,7 @@ use rk_abi::native::fanotify::{
 use rk_abi::native::open as o;
 use rk_vfs::cred::{cap, may};
 use rk_vfs::file::File;
+use rk_vfs::inode::FileType;
 use rk_vfs::notify::Object;
 use rk_vfs::notify::fanotify::{
     EVENT_FLAGS, FD_EVENTS, FID_BITS, Fanotify, FanotifyFile, Kind, PATH_EVENTS, PERM_EVENTS,
@@ -313,9 +314,15 @@ pub(crate) fn fanotify_mark(
     };
     let is_dir = at.inode().metadata().is_dir();
     if cmd == FAN_MARK_ADD {
-        // As `fanotify_events_supported` of Linux. No file system allows the pre-content events.
+        // As `fanotify_events_supported` of Linux: the file system must allow the pre-content
+        // events, as `SB_I_ALLOW_HSM`, and the file must be a directory or a regular file.
         if mask & FAN_PRE_ACCESS != 0 {
-            return Err(Errno::EOPNOTSUPP);
+            if !at.inode().fs_allows_pre_content() {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            if !is_dir && at.inode().metadata().file_type() != Some(FileType::Regular) {
+                return Err(Errno::EINVAL);
+            }
         }
         let strict = g.init_flags() & FAN_REPORT_TARGET_FID != 0
             || flags & FAN_MARK_IGNORE != 0

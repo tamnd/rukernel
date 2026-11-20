@@ -62,8 +62,8 @@ pub const EXT4_MAGIC: u64 = 0xef53;
 
 /// The file system types for `mount -t ext4`, `ext3` and `ext2`. One driver reads all three.
 pub const FS_TYPES: [FsType; 3] = [
-    FsType { name: "ext4", nodev: false, make: mount },
-    FsType { name: "ext3", nodev: false, make: mount },
+    FsType { name: "ext4", nodev: false, make: mount_ext4 },
+    FsType { name: "ext3", nodev: false, make: mount_ext4 },
     FsType { name: "ext2", nodev: false, make: mount },
 ];
 
@@ -149,7 +149,18 @@ impl Disk for rk_vfs::blockdev::MountedDisk {
     }
 }
 
-/// Mounts the ext4 file system on the block device of `args`.
+/// Mounts a file system of the type ext4 or ext3. As the ext4 driver of Linux, the mount allows
+/// the pre-content events of fanotify.
+///
+/// # Errors
+///
+/// Gives the errors of [`mount`].
+pub fn mount_ext4(args: &MountArgs<'_>) -> Result<InodeRef> {
+    mount_with(args, true)
+}
+
+/// Mounts the ext4 file system on the block device of `args`, for the type ext2. The mount does
+/// not allow the pre-content events of fanotify, as the ext2 driver of Linux.
 ///
 /// # Errors
 ///
@@ -159,6 +170,11 @@ impl Disk for rk_vfs::blockdev::MountedDisk {
 /// device. Gives `EINVAL` for `norecovery` with a journal to replay and a read and write mount,
 /// and `EBUSY` if a file has the device open with `O_EXCL`.
 pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
+    mount_with(args, false)
+}
+
+/// Mounts the file system, with the pre-content events of fanotify if `pre_content` is true.
+fn mount_with(args: &MountArgs<'_>, pre_content: bool) -> Result<InodeRef> {
     let dev = args.dev.ok_or(Errno::ENOTBLK)?;
     let cache = rk_vfs::blockdev::mount_block(dev)?;
     // As Linux, `norecovery` and `noload` leave the journal as it is, and a read only device
@@ -174,6 +190,7 @@ pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
     let fs = Fs::open_with(dev, alloc::boxed::Box::new(cache), args.read_only, replay)?;
     // As Linux, a mount has the delayed allocation unless `nodelalloc` turns it off.
     fs.set_delalloc(true);
+    fs.pre_content.store(pre_content, Ordering::Relaxed);
     // The last of `minixdf` and `bsddf` sets how `statfs` counts the blocks. As Linux, a mount
     // has POSIX ACLs unless `noacl` turns them off.
     for option in args.data.split(|&c| c == b',') {
@@ -290,6 +307,9 @@ pub struct Fs {
     /// The mount option `minixdf`: `statfs` counts the blocks of the metadata in the count of
     /// blocks.
     minix_df: AtomicBool,
+    /// The mount allows the pre-content events of fanotify, as `SB_I_ALLOW_HSM` of Linux. ext4
+    /// and ext3 allow them, and ext2 does not, as the ext2 driver of Linux.
+    pre_content: AtomicBool,
     /// The file system has POSIX ACLs, as the mount option `acl`. The mount option `noacl`
     /// turns them off.
     pub(crate) posix_acl: AtomicBool,
@@ -437,6 +457,7 @@ impl Fs {
             delalloc: AtomicBool::new(false),
             delayed: SpinLock::new(delalloc::Delayed::default()),
             minix_df: AtomicBool::new(false),
+            pre_content: AtomicBool::new(false),
             posix_acl: AtomicBool::new(true),
             shut: AtomicBool::new(false),
             frozen: AtomicBool::new(false),

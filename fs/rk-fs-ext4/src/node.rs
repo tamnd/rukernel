@@ -1858,6 +1858,10 @@ impl Inode for Node {
         EXT4_MAGIC
     }
 
+    fn fs_allows_pre_content(&self) -> bool {
+        self.fs.pre_content.load(Ordering::Relaxed)
+    }
+
     fn fs_stat(&self) -> Option<rk_vfs::inode::FsStat> {
         Some(self.fs.stat())
     }
