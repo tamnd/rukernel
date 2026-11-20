@@ -43,7 +43,7 @@ use rk_frame::sync::{Once, SpinLock};
 use rk_vfs::cred::{Cred, cap, may};
 use rk_vfs::file::{File, FileOps};
 use rk_vfs::fstype::{FsType, MountArgs};
-use rk_vfs::inode::mode;
+use rk_vfs::inode::{fileid, mode};
 use rk_vfs::wait::{PollTable, WaitQueue};
 use rk_vfs::xattr::Xattrs;
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, now};
@@ -284,6 +284,24 @@ impl Node {
     /// The inode number of the cgroup `id`, or of its file `file`.
     fn ino(id: CgId, file: Option<&str>) -> u64 {
         u64::from(id) << INO_SHIFT | file.map_or(0, file_index)
+    }
+
+    /// The cgroup and the file of a file handle of [`fileid::KERNFS`]. A handle of another type,
+    /// of a cgroup that was removed or of a file that does not exist gives `ESTALE`.
+    fn from_handle(ty: i32, fid: &[u32]) -> Result<(CgId, Option<&'static str>)> {
+        let &[low, high, ..] = fid else { return Err(Errno::ESTALE) };
+        if ty != fileid::KERNFS {
+            return Err(Errno::ESTALE);
+        }
+        let ino = u64::from(high) << 32 | u64::from(low);
+        let id = CgId::try_from(ino >> INO_SHIFT).map_err(|_| Errno::ESTALE)?;
+        if !rk_cgroup::with(|h| h.exists(id)) {
+            return Err(Errno::ESTALE);
+        }
+        match ino & ((1 << INO_SHIFT) - 1) {
+            0 => Ok((id, None)),
+            i => Ok((id, Some(FILES.get(i as usize - 1).ok_or(Errno::ESTALE)?.name))),
+        }
     }
 
     /// Gives an error if the cgroup was removed. A file that is open after `rmdir` gives
@@ -610,6 +628,40 @@ impl Inode for Node {
     fn open_file(&self, _flags: u32) -> Option<Result<Arc<dyn FileOps>>> {
         self.file?;
         Some(Ok(Arc::new(OpenFile::new(*self))))
+    }
+
+    /// The handle is the inode number in 8 bytes, as `kernfs_encode_fh` of Linux: for a
+    /// directory it is the ID of the cgroup that `PIDFD_GET_INFO` and bpf give. systemd reads
+    /// it with `name_to_handle_at` for `NFTSet=cgroup:`, and nft for a `cgroupsv2` element.
+    fn file_handle(&self) -> Option<(i32, Vec<u32>)> {
+        let ino = Self::ino(self.id, self.file);
+        Some((fileid::KERNFS, alloc::vec![ino as u32, (ino >> 32) as u32]))
+    }
+
+    /// Finds the directory of a cgroup or one of its files from the inode number, as
+    /// `kernfs_fh_to_dentry` of Linux. A cgroup that was removed gives `ESTALE`.
+    fn inode_by_handle(&self, ty: i32, fid: &[u32]) -> Result<InodeRef> {
+        let (id, file) = Self::from_handle(ty, fid)?;
+        let dir = Node { id, file: None };
+        match file {
+            None => Ok(Arc::new(dir)),
+            Some(f) => dir.lookup(f.as_bytes()).map_err(|_| Errno::ESTALE),
+        }
+    }
+
+    /// The names from the root of the mount down to the cgroup or the file of the handle, as
+    /// the names of kernfs give them to `reconnect_path` of Linux. A cgroup that is not below
+    /// the root of the mount, as in a cgroup namespace, gives `ESTALE`, as the check
+    /// `is_subdir` in `vfs_dentry_acceptable` of Linux.
+    fn handle_path(&self, ty: i32, fid: &[u32]) -> Result<Vec<Vec<u8>>> {
+        let (id, file) = Self::from_handle(ty, fid)?;
+        let path =
+            rk_cgroup::with(|h| h.is_descendant(id, self.id).then(|| h.path_from(id, self.id)))
+                .ok_or(Errno::ESTALE)?;
+        let mut names: Vec<Vec<u8>> =
+            path.split(|&c| c == b'/').filter(|n| !n.is_empty()).map(<[u8]>::to_vec).collect();
+        names.extend(file.map(|f| f.as_bytes().to_vec()));
+        Ok(names)
     }
 }
 

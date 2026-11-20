@@ -116,6 +116,7 @@ dependencies = [
  "rk-bpf",
  "rk-cgroup",
  "rk-frame",
+ "rk-fs-tmpfs",
  "rk-proc",
  "rk-vfs",
 ]
@@ -302,6 +303,7 @@ dependencies = [
  "rk-net-inet",
  "rk-net-unix",
  "rk-proc",
+ "rk-sched",
  "rk-vfs",
  "zerocopy",
 ]

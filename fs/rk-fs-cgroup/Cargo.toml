@@ -17,5 +17,8 @@ rk-frame.workspace = true
 rk-proc.workspace = true
 rk-vfs.workspace = true
 
+[dev-dependencies]
+rk-fs-tmpfs.workspace = true
+
 [lints]
 workspace = true
