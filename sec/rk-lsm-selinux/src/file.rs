@@ -1,10 +1,11 @@
 //! The checks of the access to files, the inode and file hooks of security/selinux/hooks.c of
 //! Linux: the permissions of a path walk and of `access`, of an open, of a `stat`, of a change
-//! of the attributes or of the size, and of a read, a write, a lock or an `fcntl` of an open
-//! file.
+//! of the attributes or of the size, and of a read, a write, a lock, an `fcntl` or an `ioctl`
+//! of an open file, with the extended permissions of the `ioctl` commands.
 
 use crate::classmap::{class, dir, fd, file};
 use crate::inode::inode_label;
+use crate::services::ext;
 use crate::sidtab::sid;
 use crate::{avc, task};
 use alloc::string::String;
@@ -13,6 +14,7 @@ use rk_abi::native::fcntl::{
     F_GETFL, F_GETLK, F_GETOWN, F_GETOWNER_UIDS, F_GETSIG, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW,
     F_SETFL, F_SETLK, F_SETLKW, F_SETOWN, F_SETSIG,
 };
+use rk_abi::native::ioctls::{FIOASYNC, FIOCLEX, FIONBIO, FIONCLEX, FIONREAD};
 use rk_abi::native::open::{O_ACCMODE, O_APPEND, O_RDONLY, O_RDWR, O_WRONLY};
 use rk_vfs::cred::{Cred, may};
 use rk_vfs::dentry::Location;
@@ -37,6 +39,22 @@ pub mod slot {
 
 /// The number of the policy capability `open_perms` in [`crate::POLICYCAP_NAMES`].
 const POLICYCAP_OPEN_PERMS: u32 = 1;
+/// The number of the policy capability `ioctl_skip_cloexec` in [`crate::POLICYCAP_NAMES`].
+const POLICYCAP_IOCTL_SKIP_CLOEXEC: u32 = 7;
+
+/// The `ioctl` commands that [`file_ioctl`] checks as Linux does, from `<linux/fs.h>` and
+/// `<linux/kd.h>`: the block of a file, `FIBMAP`, the block size, `FIGETBSZ`, the flags and
+/// the version of an inode, and the entries of the keyboard map, `KDSKBENT` and `KDSKBSENT`.
+const FIBMAP: u32 = 1;
+const FIGETBSZ: u32 = 2;
+const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+const FS_IOC_GETVERSION: u32 = 0x8008_7601;
+const FS_IOC_SETVERSION: u32 = 0x4008_7602;
+const KDSKBENT: u32 = 0x4B47;
+const KDSKBSENT: u32 = 0x4B49;
+/// The capability `CAP_SYS_TTY_CONFIG`, for a change of the keyboard map.
+const CAP_SYS_TTY_CONFIG: u32 = 26;
 
 /// The type bits of a mode, `S_IFMT`, and the type of a directory, `S_IFDIR`.
 const S_IFMT: u32 = 0o170_000;
@@ -377,6 +395,63 @@ pub fn file_fcntl(f: &File, cmd: u32, arg: u64) -> Result<()> {
     }
 }
 
+/// Checks the `ioctl` command `cmd` on the open file `f` with the permission `requested`
+/// and the extended permission of the command, as `ioctl_has_perm` of Linux: first `use` of
+/// the class `fd` if another SID made the file, then `requested` on the inode with the
+/// number `cmd & 0xff` of the driver `cmd >> 8`. A file without an inode has only the check of
+/// `use`. The record has the fields of the file and ` ioctlcmd=0x5401`.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies a permission in enforcing mode.
+fn ioctl_has_perm(f: &File, requested: u32, cmd: u16) -> Result<()> {
+    if !crate::initialized() {
+        return Ok(());
+    }
+    let ssid = crate::current_sid();
+    let fsid = file_sid(f);
+    let fields = |s: &mut String| {
+        file_fields(f)(s);
+        let _ = write!(s, " ioctlcmd={cmd:#x}");
+    };
+    if ssid != fsid {
+        avc::has_perm(ssid, fsid, class::FD, fd::USE, fields)?;
+    }
+    let Some(inode) = f.inode() else { return Ok(()) };
+    let (isid, sclass) = inode_label(&**inode, f.location());
+    let [driver, xperm] = cmd.to_be_bytes();
+    avc::has_extended_perms(ssid, isid, sclass, requested, driver, ext::IOCTL, xperm, fields)
+}
+
+/// Checks the `ioctl` command `cmd` on the open file `f`, as `selinux_file_ioctl` of Linux.
+/// A command that reads the attributes of the inode needs `getattr`, and a command that
+/// changes them needs `setattr`. `FIONBIO` and `FIOASYNC` need only `use` of the descriptor,
+/// and a change of the keyboard map needs the capability `sys_tty_config`. `FIOCLEX` and
+/// `FIONCLEX` need nothing if the policy has the capability `ioctl_skip_cloexec`. The other
+/// commands need `ioctl` and the extended permission of the command.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies a permission in enforcing mode.
+pub fn file_ioctl(f: &File, cmd: u32) -> Result<()> {
+    match cmd {
+        FIONREAD | FIBMAP | FIGETBSZ | FS_IOC_GETFLAGS | FS_IOC_GETVERSION => {
+            file_has_perm(f, file::GETATTR)
+        }
+        FS_IOC_SETFLAGS | FS_IOC_SETVERSION => file_has_perm(f, file::SETATTR),
+        FIONBIO | FIOASYNC => file_has_perm(f, 0),
+        KDSKBENT | KDSKBSENT => {
+            task::cred_has_capability(&rk_vfs::cred::current(), CAP_SYS_TTY_CONFIG, true)
+        }
+        FIOCLEX | FIONCLEX
+            if crate::policy().is_some_and(|p| p.db.policycap(POLICYCAP_IOCTL_SKIP_CLOEXEC)) =>
+        {
+            Ok(())
+        }
+        _ => ioctl_has_perm(f, file::IOCTL, cmd as u16),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +578,48 @@ mod tests {
         crate::set_enforcing(false);
         assert_eq!(file_lock(&f), Ok(()));
         assert_eq!(file_fcntl(&g, F_SETFL as u32, 0), Ok(()));
+    }
+
+    #[test]
+    fn an_ioctl_needs_the_extended_permission_of_the_command() {
+        let _guard = setup();
+        let (dir, at) = selinuxfs();
+        let f = File::open_inode(at, O_RDONLY);
+        crate::set_enforcing(true);
+        // kernel_t has ioctl on security_t with the command 0x5401 and the driver 0x12, and
+        // the rule of domain gives 0x8910 and 0x8912 to 0x8920. Only the low 16 bits count.
+        for cmd in [0x5401, 0x8008_5401, 0x1200, 0x1234, 0x12ff, 0x8910, 0x8920] {
+            assert_eq!(file_ioctl(&f, cmd), Ok(()), "{cmd:#x}");
+        }
+        // 0x5402 is not in the rule of the driver 0x54, and the driver 0x43 has no rules.
+        for cmd in [0x5402, 0x4321, 0x8911, 0x8921, 0x1300, FIOCLEX, FIONCLEX] {
+            assert_eq!(file_ioctl(&f, cmd), Err(Errno::EACCES), "{cmd:#x}");
+        }
+        // The commands of the attributes need getattr or setattr, FIONBIO and FIOASYNC need
+        // only use, and a change of the keyboard map needs sys_tty_config.
+        for cmd in
+            [FIONREAD, FIBMAP, FIGETBSZ, FS_IOC_GETFLAGS, FS_IOC_GETVERSION, FIONBIO, FIOASYNC]
+        {
+            assert_eq!(file_ioctl(&f, cmd), Ok(()), "{cmd:#x}");
+        }
+        for cmd in [FS_IOC_SETFLAGS, FS_IOC_SETVERSION, KDSKBENT, KDSKBSENT] {
+            assert_eq!(file_ioctl(&f, cmd), Err(Errno::EACCES), "{cmd:#x}");
+        }
+        // The policy has no rules of extended permissions for chr_file, so ioctl is enough.
+        let dev: InodeRef = Arc::new(Node(0o020_666));
+        let null =
+            Location { mount: dir.mount.clone(), dentry: dir.dentry.add_child(b"null", dev) };
+        let g = File::open_inode(null, O_RDWR);
+        assert_eq!(file_ioctl(&g, 0x5402), Ok(()));
+        assert_eq!(file_ioctl(&g, 0x4321), Ok(()));
+        // A file of init_t needs use of the class fd first.
+        let init = crate::server::context_to_sid(b"system_u:system_r:init_t:s0", 0, false).unwrap();
+        store(&f, slot::SID, init);
+        assert_eq!(file_ioctl(&f, 0x5401), Err(Errno::EACCES));
+        assert_eq!(file_ioctl(&f, FIONBIO), Err(Errno::EACCES));
+        crate::set_enforcing(false);
+        assert_eq!(file_ioctl(&f, 0x4321), Ok(()));
+        assert_eq!(file_ioctl(&f, KDSKBENT), Ok(()));
     }
 
     #[test]

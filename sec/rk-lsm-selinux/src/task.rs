@@ -7,6 +7,7 @@ use crate::sidtab::sid;
 use crate::{avc, server, services};
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write;
 use rk_abi::Errno;
 use rk_abi::native::mount::MS_NOSUID;
 use rk_vfs::cred::{Cred, cap};
@@ -63,6 +64,32 @@ pub fn store(cred: &Cred, slot: usize, sid: u32) {
 /// The SID of the task with the credentials `cred`, as `cred_sid` of Linux.
 pub fn cred_sid(cred: &Cred) -> u32 {
     load(cred, slot::SID)
+}
+
+/// Checks the capability `cap` of the task with `cred`, as `cred_has_capability` of Linux:
+/// the permission of the capability in the class `capability` or `capability2` on the task
+/// itself, or in `cap_userns` or `cap2_userns` if the capability is not for the first user
+/// namespace (`initns` false). The record has ` capability=N `.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies the permission in enforcing mode, and `EINVAL` for a
+/// capability after the last one.
+pub fn cred_has_capability(cred: &Cred, cap: u32, initns: bool) -> Result<()> {
+    let sclass = match (cap / 32, initns) {
+        (0, true) => class::CAPABILITY,
+        (0, false) => class::CAP_USERNS,
+        (1, true) => class::CAPABILITY2,
+        (1, false) => class::CAP2_USERNS,
+        _ => {
+            rk_frame::println!("SELinux:  out of range capability {cap}");
+            return Err(Errno::EINVAL);
+        }
+    };
+    let sid = cred_sid(cred);
+    avc::has_perm(sid, sid, sclass, 1 << (cap % 32), |s| {
+        let _ = write!(s, " capability={cap} ");
+    })
 }
 
 /// The SID of the file `at`, from [`crate::inode::inode_sid`].

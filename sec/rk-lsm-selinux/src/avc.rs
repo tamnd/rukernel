@@ -4,14 +4,20 @@
 //! class of the kernel. A check of permissions looks in the cache first. A denial in
 //! permissive mode, or for a permissive domain, adds the permissions to the decision in the
 //! cache, so that the next check of the same permissions makes no record. A denial makes an
-//! audit record of the type `AVC`, as on Linux.
+//! audit record of the type `AVC`, as on Linux. For the extended permissions, as the commands
+//! of `ioctl`, the cache also keeps the drivers that have rules and the decision of each
+//! driver that a check used.
 
 use crate::classmap::{self, CLASSES};
 use crate::server;
-use crate::services::{AvDecision, NEVERAUDIT, PERMISSIVE};
+use crate::services::{
+    AvDecision, ExtendedPerms, NEVERAUDIT, PERMISSIVE, XpermsDecision, used, xperm_set, xperm_test,
+};
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, Ordering};
 use rk_abi::Errno;
@@ -23,10 +29,34 @@ const CACHE_SLOTS: u32 = 512;
 /// The number of decisions that a full cache removes, `AVC_CACHE_RECLAIM` of Linux.
 const CACHE_RECLAIM: usize = 16;
 
+/// A decision in the cache, `struct avc_entry` of Linux.
+struct Node {
+    /// The decision.
+    avd: AvDecision,
+    /// The extended permissions, if the policy has rules of them for the SIDs and the class.
+    xp: Option<Box<XpNode>>,
+}
+
+/// The extended permissions in the cache, `struct avc_xperms_node` of Linux.
+struct XpNode {
+    /// The drivers that have rules.
+    xp: ExtendedPerms,
+    /// The decisions of the drivers that a check used.
+    decisions: Vec<XpermsDecision>,
+}
+
+impl XpNode {
+    /// The decision of `driver` for the base permission `base_perm`, as
+    /// `avc_xperms_decision_lookup` of Linux.
+    fn decision(&mut self, driver: u8, base_perm: u8) -> Option<&mut XpermsDecision> {
+        self.decisions.iter_mut().find(|d| d.driver == driver && d.base_perm == base_perm)
+    }
+}
+
 /// The cache.
 struct Cache {
     /// The decisions for a source SID, a target SID and a class.
-    nodes: BTreeMap<(u32, u32, u16), AvDecision>,
+    nodes: BTreeMap<(u32, u32, u16), Node>,
     /// The number of the last policy load that the cache knows, `avc_cache.latest_notif`.
     latest: u32,
 }
@@ -44,21 +74,37 @@ fn count(i: usize, n: u32) {
 }
 
 /// Gets the decision for `(ssid, tsid, tclass)` from the cache, or from the security server
-/// if the cache does not have it, as `avc_lookup` and `avc_compute_av` of Linux.
-fn lookup(ssid: u32, tsid: u32, tclass: u16) -> AvDecision {
+/// if the cache does not have it, as `avc_lookup` and `avc_compute_av` of Linux. It gives the
+/// decision, and for a check of the extended permissions of `ext` (the driver and the base
+/// permission), the drivers and the decision of the driver in the cache.
+fn lookup(
+    ssid: u32,
+    tsid: u32,
+    tclass: u16,
+    ext: Option<(u8, u8)>,
+) -> (AvDecision, Option<(ExtendedPerms, Option<XpermsDecision>)>) {
+    let get = |n: &mut Node| {
+        let xp = n.xp.as_deref_mut().map(|x| {
+            let d = ext.and_then(|(driver, base)| x.decision(driver, base).copied());
+            (x.xp, d)
+        });
+        (n.avd, xp)
+    };
     count(0, 1);
-    if let Some(&avd) = CACHE.lock().nodes.get(&(ssid, tsid, tclass)) {
-        return avd;
+    if let Some(node) = CACHE.lock().nodes.get_mut(&(ssid, tsid, tclass)) {
+        return get(node);
     }
     count(1, 1);
-    let avd = server::compute_av(ssid, tsid, tclass);
+    let mut xp = ExtendedPerms::default();
+    let avd = server::compute_av_xperms(ssid, tsid, tclass, Some(&mut xp));
+    let mut node = Node { avd, xp: xp.any.then(|| Box::new(XpNode { xp, decisions: Vec::new() })) };
     let mut cache = CACHE.lock();
     if avd.seqno < cache.latest {
         rk_frame::println!("SELinux: avc:  seqno {} < latest_notif {}", avd.seqno, cache.latest);
-        return avd;
+        return get(&mut node);
     }
     if cache.nodes.len() >= THRESHOLD.load(Ordering::Relaxed) as usize {
-        let old: alloc::vec::Vec<_> = cache.nodes.keys().take(CACHE_RECLAIM).copied().collect();
+        let old: Vec<_> = cache.nodes.keys().take(CACHE_RECLAIM).copied().collect();
         for k in &old {
             cache.nodes.remove(k);
         }
@@ -66,8 +112,52 @@ fn lookup(ssid: u32, tsid: u32, tclass: u16) -> AvDecision {
         count(4, old.len() as u32);
     }
     count(2, 1);
-    cache.nodes.insert((ssid, tsid, tclass), avd);
-    avd
+    let r = get(&mut node);
+    cache.nodes.insert((ssid, tsid, tclass), node);
+    r
+}
+
+/// Changes the decision in the cache for `(ssid, tsid, tclass)` if it is from the policy load
+/// `seqno`, as `avc_update_node` of Linux. A change makes a new node on Linux, so it counts
+/// an allocation and a free.
+fn update(ssid: u32, tsid: u32, tclass: u16, seqno: u32, f: impl FnOnce(&mut Node)) {
+    if let Some(node) = CACHE.lock().nodes.get_mut(&(ssid, tsid, tclass))
+        && node.avd.seqno == seqno
+    {
+        f(node);
+        count(2, 1);
+        count(4, 1);
+    }
+}
+
+/// The result of a denial of `requested`, as `avc_denied` of Linux: `EACCES` in enforcing
+/// mode, except for a permissive domain. Otherwise the cache allows the permissions for the
+/// next checks, as `avc_update_node(AVC_CALLBACK_GRANT)`, and for a check of an extended
+/// permission, the permission `xperm` of the driver too, as `avc_xperms_allow_perm`.
+fn deny(
+    ssid: u32,
+    tsid: u32,
+    tclass: u16,
+    requested: u32,
+    ext: Option<(u8, u8, u8)>,
+    avd: &AvDecision,
+) -> Result<(), Errno> {
+    if crate::enforcing() && avd.flags & PERMISSIVE == 0 {
+        return Err(Errno::EACCES);
+    }
+    update(ssid, tsid, tclass, avd.seqno, |node| {
+        node.avd.allowed |= requested;
+        if let (Some(x), Some((driver, base, xperm))) = (node.xp.as_deref_mut(), ext) {
+            xperm_set(&mut x.xp.drivers, driver);
+            x.xp.base_perms |= base;
+            if let Some(d) = x.decision(driver, base)
+                && d.used & used::ALLOWED != 0
+            {
+                xperm_set(&mut d.allowed, xperm);
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Removes all the decisions after a policy load or a change of a boolean, as
@@ -95,23 +185,11 @@ pub fn has_perm_noaudit(
     tclass: u16,
     requested: u32,
 ) -> (AvDecision, Result<(), Errno>) {
-    let avd = lookup(ssid, tsid, tclass);
+    let (avd, _) = lookup(ssid, tsid, tclass, None);
     if requested & !avd.allowed == 0 {
         return (avd, Ok(()));
     }
-    if crate::enforcing() && avd.flags & PERMISSIVE == 0 {
-        return (avd, Err(Errno::EACCES));
-    }
-    // A denial in permissive mode allows the permissions for the next checks, as
-    // `avc_update_node(AVC_CALLBACK_GRANT)` of Linux.
-    if let Some(node) = CACHE.lock().nodes.get_mut(&(ssid, tsid, tclass))
-        && node.seqno == avd.seqno
-    {
-        node.allowed |= requested;
-        count(2, 1);
-        count(4, 1);
-    }
-    (avd, Ok(()))
+    (avd, deny(ssid, tsid, tclass, requested, None, &avd))
 }
 
 /// Checks the permissions `requested` and makes an audit record if the policy wants one, as
@@ -131,6 +209,95 @@ pub fn has_perm(
     let (avd, rc) = has_perm_noaudit(ssid, tsid, tclass, requested);
     audit(ssid, tsid, tclass, requested, &avd, rc, 0, extra);
     rc
+}
+
+/// Checks the permissions `requested` and the extended permission `xperm` of `driver` for the
+/// base permission `base_perm` (a bit of [`crate::services::ext`]), and makes an audit record
+/// if the policy wants one, as `avc_has_extended_perms` of Linux. If the policy has no rules
+/// of extended permissions for the SIDs and the class, only `requested` counts. Otherwise a
+/// driver without rules denies `requested`, and a driver with rules denies it if `xperm` is
+/// not allowed. `extra` is as in [`has_perm`].
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies a permission in enforcing mode.
+#[allow(clippy::too_many_arguments)]
+pub fn has_extended_perms(
+    ssid: u32,
+    tsid: u32,
+    tclass: u16,
+    requested: u32,
+    driver: u8,
+    base_perm: u8,
+    xperm: u8,
+    extra: impl FnOnce(&mut String),
+) -> Result<(), Errno> {
+    let (mut avd, xp) = lookup(ssid, tsid, tclass, Some((driver, base_perm)));
+    let mut xpd = None;
+    if let Some((drivers, cached)) = xp {
+        let d = match cached {
+            Some(d) => Some(d),
+            None if !xperm_test(&drivers.drivers, driver)
+                || drivers.base_perms & base_perm == 0 =>
+            {
+                None
+            }
+            None => {
+                let d = server::compute_xperms_decision(ssid, tsid, tclass, driver, base_perm);
+                // As `avc_update_node(AVC_CALLBACK_ADD_XPERMS)` of Linux.
+                update(ssid, tsid, tclass, avd.seqno, |node| {
+                    if let Some(x) = node.xp.as_deref_mut()
+                        && x.decision(driver, base_perm).is_none()
+                    {
+                        x.decisions.push(d);
+                    }
+                });
+                Some(d)
+            }
+        };
+        if !d.is_some_and(|d| d.has(xperm, used::ALLOWED)) {
+            avd.allowed &= !requested;
+        }
+        xpd = d;
+    }
+    let rc = if requested & !avd.allowed != 0 {
+        deny(ssid, tsid, tclass, requested, Some((driver, base_perm, xperm)), &avd)
+    } else {
+        Ok(())
+    };
+    let (audited, denied) =
+        xperms_audit_required(requested, &avd, xpd.as_ref(), xperm, rc.is_err());
+    record(ssid, tsid, tclass, audited, denied, rc, extra);
+    rc
+}
+
+/// The permissions that make an audit record and the denied permissions for a check of an
+/// extended permission, as `avc_xperms_audit_required` of Linux. A `dontauditxperm` rule for
+/// `perm` stops the record of a denial, and an allowed permission makes a record only with an
+/// `auditallowxperm` rule for `perm`.
+fn xperms_audit_required(
+    requested: u32,
+    avd: &AvDecision,
+    xpd: Option<&XpermsDecision>,
+    perm: u8,
+    failed: bool,
+) -> (u32, u32) {
+    let denied = requested & !avd.allowed;
+    if denied != 0 {
+        let audited = denied & avd.auditdeny;
+        if audited != 0 && xpd.is_some_and(|d| d.has(perm, used::DONTAUDIT)) {
+            return (0, denied);
+        }
+        (audited, denied)
+    } else if failed {
+        (requested, requested)
+    } else {
+        let audited = requested & avd.auditallow;
+        if audited != 0 && xpd.is_some_and(|d| !d.has(perm, used::AUDITALLOW)) {
+            return (0, 0);
+        }
+        (audited, 0)
+    }
 }
 
 /// The permissions that make an audit record and the denied permissions, as
@@ -167,6 +334,20 @@ pub fn audit(
     extra: impl FnOnce(&mut String),
 ) {
     let (audited, denied) = audit_required(requested, avd, rc.is_err(), auditdeny);
+    record(ssid, tsid, tclass, audited, denied, rc, extra);
+}
+
+/// Makes the record of the permissions `audited`, of which `denied` are denied, as
+/// `slow_avc_audit` of Linux.
+fn record(
+    ssid: u32,
+    tsid: u32,
+    tclass: u16,
+    audited: u32,
+    denied: u32,
+    rc: Result<(), Errno>,
+    extra: impl FnOnce(&mut String),
+) {
     if audited == 0 || tclass == 0 || usize::from(tclass) > CLASSES.len() {
         return;
     }
@@ -293,5 +474,30 @@ mod tests {
         let mut s = String::new();
         untrusted(&mut s, b"a b");
         assert_eq!(s, "612062");
+    }
+
+    #[test]
+    fn an_extended_permission_makes_a_record_as_linux() {
+        let mut avd = AvDecision::new(1);
+        avd.allowed = 1;
+        avd.auditallow = 1;
+        let mut xpd = XpermsDecision::new(0x54, crate::services::ext::IOCTL);
+        xpd.used = used::AUDITALLOW | used::DONTAUDIT;
+        xperm_set(&mut xpd.auditallow, 1);
+        xperm_set(&mut xpd.dontaudit, 2);
+        // A denial makes a record without a dontauditxperm rule for the function.
+        assert_eq!(xperms_audit_required(2, &avd, Some(&xpd), 3, true), (2, 2));
+        assert_eq!(xperms_audit_required(2, &avd, Some(&xpd), 2, true), (0, 2));
+        assert_eq!(xperms_audit_required(2, &avd, None, 2, true), (2, 2));
+        // An allowed permission of auditallow makes a record only with an auditallowxperm
+        // rule for the function.
+        assert_eq!(xperms_audit_required(1, &avd, Some(&xpd), 1, false), (1, 0));
+        assert_eq!(xperms_audit_required(1, &avd, Some(&xpd), 2, false), (0, 0));
+        assert_eq!(xperms_audit_required(1, &avd, None, 2, false), (1, 0));
+        assert_eq!(xperms_audit_required(1, &avd, Some(&xpd), 1, true), (1, 1));
+        // A kind of rule that the policy does not use has no functions.
+        xpd.used = 0;
+        assert_eq!(xperms_audit_required(2, &avd, Some(&xpd), 2, true), (2, 2));
+        assert_eq!(xperms_audit_required(1, &avd, Some(&xpd), 1, false), (0, 0));
     }
 }

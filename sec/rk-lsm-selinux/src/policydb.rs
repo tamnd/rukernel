@@ -1664,9 +1664,9 @@ mod tests {
         let rule = p.te.find(t("init_t"), t("proc_t"), file as u16, spec::AUDITDENY);
         assert_eq!(rule.map(|e| e.data), Some(!p.perm_bit(file, "write").unwrap()));
         // checkpolicy can keep the attributes of the rule or give a rule for each type.
-        let xperms = p.te.entries().find(|e| e.specified() & spec::XPERMS_ALLOWED != 0);
-        let x = xperms.unwrap().xperms.as_ref().unwrap();
-        assert_eq!(x.driver, 0x89);
+        let x = p.te.entries().filter(|e| e.specified() & spec::XPERMS_ALLOWED != 0);
+        let x = x.filter_map(|e| e.xperms.as_ref()).find(|x| x.driver == 0x89).unwrap();
+        assert_eq!(x.specified, crate::avtab::xperms::IOCTLFUNCTION);
         let n = |b: u32| x.perms[b as usize / 32] & (1 << (b % 32)) != 0;
         assert!(n(0x10) && !n(0x11) && n(0x12) && n(0x20) && !n(0x21));
         // allow_exec is true and secure_mode is false: both blocks are on.

@@ -16954,6 +16954,11 @@ static void test_selinux(void)
 	unsigned long ino_w = 0, ino_e = 0, ino_n = 0, ino_d = 0, ino_f = 0;
 	int n, fd, len, efd, xfd, cfd, rfd, wfd, afd;
 	struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+	struct termios tios;
+	struct winsize ws;
+	struct fsxattr fsx;
+	unsigned long long size64;
+	int bsz, zero = 0;
 
 	n = klogctl(3, buf, sizeof(buf) - 1);
 	buf[n > 0 ? n : 0] = 0;
@@ -17124,6 +17129,15 @@ static void test_selinux(void)
 	check("selinux: a read after a change of the label of the open file gives EACCES in enforcing mode", rfd >= 0 && read(rfd, buf, 1) < 0 && errno == EACCES);
 	check("selinux: a flock and an fcntl lock give EACCES in enforcing mode", flock(wfd, LOCK_EX) < 0 && errno == EACCES && fcntl(wfd, F_SETLK, &fl) < 0 && errno == EACCES && (fcntl(wfd, F_GETFL) & O_ACCMODE) == O_WRONLY);
 	check("selinux: an F_SETFL that removes O_APPEND gives EACCES in enforcing mode", fcntl(afd, F_SETFL, 0) < 0 && errno == EACCES && fcntl(afd, F_SETFL, O_APPEND | O_NONBLOCK) == 0);
+	/*
+	 * The checks of an ioctl, as selinux_file_ioctl of Linux. The policy gives kernel_t the command TCGETS and all the commands of the driver 0x12 on etc_t,
+	 * so the file gives ENOTTY for TCGETS and BLKGETSIZE64. TIOCGWINSZ of the same driver as TCGETS, FS_IOC_FSGETXATTR of a driver without rules and FIOCLEX
+	 * without the policy capability ioctl_skip_cloexec give EACCES. FIGETBSZ needs getattr, FS_IOC_SETFLAGS needs setattr and FIONBIO needs only the use of
+	 * the descriptor.
+	 */
+	check("selinux: an ioctl command that the extended permissions allow goes to the file in enforcing mode", ioctl(wfd, TCGETS, &tios) < 0 && errno == ENOTTY && ioctl(wfd, BLKGETSIZE64, &size64) < 0 && errno == ENOTTY);
+	check("selinux: an ioctl command that the extended permissions do not allow gives EACCES in enforcing mode", ioctl(wfd, TIOCGWINSZ, &ws) < 0 && errno == EACCES && ioctl(wfd, FS_IOC_FSGETXATTR, &fsx) < 0 && errno == EACCES && ioctl(wfd, FIOCLEX) < 0 && errno == EACCES);
+	check("selinux: FIGETBSZ and FIONBIO work and FS_IOC_SETFLAGS gives EACCES in enforcing mode", ioctl(wfd, FIGETBSZ, &bsz) == 0 && bsz > 0 && ioctl(wfd, FIONBIO, &zero) == 0 && ioctl(wfd, FS_IOC_SETFLAGS, &zero) < 0 && errno == EACCES);
 	close(rfd);
 	close(wfd);
 	close(afd);
@@ -17184,6 +17198,8 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the denial of the lock", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "avc:  denied  { write } for  pid=1 comm=\"init\" path=\"/tmp/rk-aa-w\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0", ino_w, kernel);
 	check("selinux: the kernel log has the denial of the F_SETFL", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { ioctl } for  pid=1 comm=\"init\" path=\"/tmp/rk-aa-w\" dev=\"tmpfs\" ino=%lu ioctlcmd=0x5413 scontext=%s tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0", ino_w, kernel);
+	check("selinux: the kernel log has the denial of the ioctl command with its number", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "tcontext=%s tclass=fd permissive=1", kernel);
 	check("selinux: the kernel log has the denial of the use of the pipe of init by init_t", strstr(buf, "avc:  denied  { use } for  pid=") != NULL && strstr(buf, "scontext=system_u:system_r:init_t:s0 ") != NULL && strstr(buf, want) != NULL);
 	unlink("/tmp/rk-aa-w");

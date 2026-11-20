@@ -5,7 +5,7 @@
 //! of a process after an exec. The kernel uses its own values for the classes and the
 //! permissions, and a map from each load of a policy turns them into the values of the policy.
 
-use crate::avtab::spec;
+use crate::avtab::{Entry, Xperms, spec, xperms};
 use crate::classmap::{self, CLASSES};
 use crate::policydb::{
     ConstraintExpr, Context, Level, OBJECT_R_VAL, Policydb, Range, cexpr, default,
@@ -39,6 +39,140 @@ impl AvDecision {
     /// A decision that allows nothing and audits each denial, as `avd_init` of Linux.
     pub const fn new(seqno: u32) -> Self {
         Self { allowed: 0, auditallow: 0, auditdeny: u32::MAX, seqno, flags: 0 }
+    }
+}
+
+/// The base permissions of the extended permissions, `AVC_EXT_*` of Linux.
+pub mod ext {
+    /// `ioctl`: the driver is the high byte of the command, and the permission its low byte.
+    pub const IOCTL: u8 = 1 << 0;
+    /// The types of the messages of a netlink socket.
+    pub const NLMSG: u8 = 1 << 1;
+}
+
+/// The kinds of the rules in an [`XpermsDecision`], `XPERMS_*` of Linux.
+pub mod used {
+    /// `allowxperm`.
+    pub const ALLOWED: u8 = 1;
+    /// `auditallowxperm`.
+    pub const AUDITALLOW: u8 = 2;
+    /// `dontauditxperm`.
+    pub const DONTAUDIT: u8 = 4;
+}
+
+/// Tells if the bit `perm` of the 256 bits `p` is set, as `security_xperm_test` of Linux.
+pub fn xperm_test(p: &[u32; 8], perm: u8) -> bool {
+    p[usize::from(perm >> 5)] & (1 << (perm & 0x1f)) != 0
+}
+
+/// Sets the bit `perm` of the 256 bits `p`, as `security_xperm_set` of Linux.
+pub fn xperm_set(p: &mut [u32; 8], perm: u8) {
+    p[usize::from(perm >> 5)] |= 1 << (perm & 0x1f);
+}
+
+/// The drivers that have rules of extended permissions for two contexts and a class, as
+/// `struct extended_perms` of Linux. A check of an extended permission on a driver that is not
+/// in `drivers` is a denial.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtendedPerms {
+    /// The base permissions of the rules, the bits of [`ext`].
+    pub base_perms: u8,
+    /// True if a rule of extended permissions is there, `len` of Linux.
+    pub any: bool,
+    /// The drivers, one bit for each.
+    pub drivers: [u32; 8],
+}
+
+/// The extended permissions of one driver for two contexts and a class, as
+/// `struct extended_perms_decision` of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XpermsDecision {
+    /// The driver.
+    pub driver: u8,
+    /// The base permission, a bit of [`ext`].
+    pub base_perm: u8,
+    /// The kinds of the rules that the policy has for the driver, the bits of [`used`].
+    pub used: u8,
+    /// The allowed permissions.
+    pub allowed: [u32; 8],
+    /// The permissions that make an audit record when they are allowed.
+    pub auditallow: [u32; 8],
+    /// The permissions that make no audit record when they are denied.
+    pub dontaudit: [u32; 8],
+}
+
+impl XpermsDecision {
+    /// A decision for `driver` without rules.
+    pub const fn new(driver: u8, base_perm: u8) -> Self {
+        Self { driver, base_perm, used: 0, allowed: [0; 8], auditallow: [0; 8], dontaudit: [0; 8] }
+    }
+
+    /// Tells if the policy has a rule of the kind `which` for the permission `perm`, as
+    /// `avc_xperms_has_perm` of Linux.
+    pub fn has(&self, perm: u8, which: u8) -> bool {
+        let bits = match which {
+            used::ALLOWED => &self.allowed,
+            used::AUDITALLOW => &self.auditallow,
+            _ => &self.dontaudit,
+        };
+        self.used & which != 0 && xperm_test(bits, perm)
+    }
+}
+
+/// Adds the driver of the rule `x` of extended permissions to `xp`, as
+/// `services_compute_xperms_drivers` of Linux.
+fn compute_xperms_drivers(xp: &mut ExtendedPerms, x: &Xperms) {
+    match x.specified {
+        xperms::IOCTLDRIVER => {
+            xp.base_perms |= ext::IOCTL;
+            for (d, p) in xp.drivers.iter_mut().zip(x.perms) {
+                *d |= p;
+            }
+        }
+        xperms::IOCTLFUNCTION => {
+            xp.base_perms |= ext::IOCTL;
+            xperm_set(&mut xp.drivers, x.driver);
+        }
+        xperms::NLMSG => {
+            xp.base_perms |= ext::NLMSG;
+            xperm_set(&mut xp.drivers, x.driver);
+        }
+        _ => {}
+    }
+    xp.any = true;
+}
+
+/// Adds the rule `e` of extended permissions to `xpd` if it is for the driver and the base
+/// permission of `xpd`, as `services_compute_xperms_decision` of Linux.
+fn compute_xperms_decision(xpd: &mut XpermsDecision, e: &Entry) {
+    let Some(x) = e.xperms.as_deref() else { return };
+    let base = match x.specified {
+        xperms::IOCTLFUNCTION => ext::IOCTL,
+        xperms::NLMSG => ext::NLMSG,
+        xperms::IOCTLDRIVER => {
+            if xpd.base_perm != ext::IOCTL || !xperm_test(&x.perms, xpd.driver) {
+                return;
+            }
+            ext::IOCTL
+        }
+        _ => return,
+    };
+    if xpd.base_perm != base || (x.specified != xperms::IOCTLDRIVER && xpd.driver != x.driver) {
+        return;
+    }
+    let (which, bits) = match e.specified() & spec::XPERMS {
+        spec::XPERMS_ALLOWED => (used::ALLOWED, &mut xpd.allowed),
+        spec::XPERMS_AUDITALLOW => (used::AUDITALLOW, &mut xpd.auditallow),
+        spec::XPERMS_DONTAUDIT => (used::DONTAUDIT, &mut xpd.dontaudit),
+        _ => return,
+    };
+    xpd.used |= which;
+    if x.specified == xperms::IOCTLDRIVER {
+        *bits = [u32::MAX; 8];
+    } else {
+        for (b, p) in bits.iter_mut().zip(x.perms) {
+            *b |= p;
+        }
     }
 }
 
@@ -175,7 +309,20 @@ impl Policydb {
     /// Computes the decision of the policy for the contexts `s` and `t` and the class `tclass`
     /// of the policy, as `context_struct_compute_av` of Linux.
     pub fn context_compute_av(&self, s: &Context, t: &Context, tclass: u32) -> AvDecision {
+        self.context_compute_av_xperms(s, t, tclass, None)
+    }
+
+    /// Computes the decision as [`Self::context_compute_av`], and adds the drivers of the rules
+    /// of extended permissions to `xp`, as `context_struct_compute_av` of Linux with `xperms`.
+    pub fn context_compute_av_xperms(
+        &self,
+        s: &Context,
+        t: &Context,
+        tclass: u32,
+        mut xp: Option<&mut ExtendedPerms>,
+    ) -> AvDecision {
         let mut avd = AvDecision::new(0);
+        let mask = if xp.is_some() { spec::AV | spec::XPERMS } else { spec::AV };
         let (Some(class), Ok(c)) = (self.class(tclass), u16::try_from(tclass)) else {
             rk_frame::println!("SELinux:  Invalid class {tclass}");
             return avd;
@@ -187,17 +334,20 @@ impl Policydb {
                 let (Ok(si), Ok(tj)) = (u16::try_from(i + 1), u16::try_from(j + 1)) else {
                     continue;
                 };
-                for e in self.te.search(si, tj, c, spec::AV) {
+                for e in self.te.search(si, tj, c, mask) {
                     match e.specified() {
                         spec::ALLOWED => avd.allowed |= e.data,
                         spec::AUDITALLOW => avd.auditallow |= e.data,
                         spec::AUDITDENY => avd.auditdeny &= e.data,
-                        _ => {}
+                        _ => {
+                            if let (Some(xp), Some(x)) = (xp.as_deref_mut(), e.xperms.as_deref()) {
+                                compute_xperms_drivers(xp, x);
+                            }
+                        }
                     }
                 }
-                let active =
-                    |e: &&crate::avtab::Entry| self.cond_active(e.cond_node(), e.cond_list());
-                for e in self.te_cond.search(si, tj, c, spec::AV).filter(active) {
+                let active = |e: &&Entry| self.cond_active(e.cond_node(), e.cond_list());
+                for e in self.te_cond.search(si, tj, c, mask).filter(active) {
                     if e.specified() & spec::ALLOWED != 0 {
                         avd.allowed |= e.data;
                     }
@@ -206,6 +356,9 @@ impl Policydb {
                     }
                     if e.specified() & spec::AUDITALLOW != 0 {
                         avd.auditallow |= e.data;
+                    }
+                    if let (Some(xp), Some(x)) = (xp.as_deref_mut(), e.xperms.as_deref()) {
+                        compute_xperms_drivers(xp, x);
                     }
                 }
             }
@@ -224,6 +377,35 @@ impl Policydb {
         }
         self.bounds_av(s, t, tclass, &mut avd);
         avd
+    }
+
+    /// Computes the extended permissions of the driver and the base permission of `xpd` for
+    /// the contexts `s` and `t` and the class `tclass` of the policy, as the loop of
+    /// `security_compute_xperms_decision` of Linux.
+    pub fn context_compute_xperms(
+        &self,
+        s: &Context,
+        t: &Context,
+        tclass: u32,
+        xpd: &mut XpermsDecision,
+    ) {
+        let Ok(c) = u16::try_from(tclass) else { return };
+        let attrs = |ty: u32| ty.checked_sub(1).and_then(|i| self.type_attr_map.get(i as usize));
+        let (Some(sattr), Some(tattr)) = (attrs(s.ty), attrs(t.ty)) else { return };
+        for i in sattr.iter() {
+            for j in tattr.iter() {
+                let (Ok(si), Ok(tj)) = (u16::try_from(i + 1), u16::try_from(j + 1)) else {
+                    continue;
+                };
+                for e in self.te.search(si, tj, c, spec::XPERMS) {
+                    compute_xperms_decision(xpd, e);
+                }
+                let active = |e: &&Entry| self.cond_active(e.cond_node(), e.cond_list());
+                for e in self.te_cond.search(si, tj, c, spec::XPERMS).filter(active) {
+                    compute_xperms_decision(xpd, e);
+                }
+            }
+        }
     }
 
     /// Removes the permissions that the bounds of the source type do not allow, as
@@ -505,6 +687,61 @@ mod tests {
         let avd = p.context_compute_av(&init, &bin, file);
         assert_eq!(avd.allowed & ent, 0);
         assert_eq!(avd.auditdeny & ent, 0);
+    }
+
+    #[test]
+    fn the_extended_permissions_follow_the_rules() {
+        let p = policy();
+        let file = p.class_value("file").unwrap();
+        let kernel = ctx(&p, "system_u:system_r:kernel_t:s0");
+        let etc = ctx(&p, "system_u:object_r:etc_t:s0");
+        // The drivers of the rules of kernel_t and of its attribute domain.
+        let mut xp = ExtendedPerms::default();
+        let avd = p.context_compute_av_xperms(&kernel, &etc, file, Some(&mut xp));
+        assert_ne!(avd.allowed & bits(&p, "file", &["ioctl"]), 0);
+        assert!(xp.any && xp.base_perms == ext::IOCTL);
+        assert!([0x12, 0x54, 0x89].iter().all(|&d| xperm_test(&xp.drivers, d)));
+        assert!(!xperm_test(&xp.drivers, 0x13) && !xperm_test(&xp.drivers, 0x43));
+        let decision = |driver, base| {
+            let mut xpd = XpermsDecision::new(driver, base);
+            p.context_compute_xperms(&kernel, &etc, file, &mut xpd);
+            xpd
+        };
+        // A rule of functions gives its functions, and a rule of drivers gives all of them.
+        let xpd = decision(0x54, ext::IOCTL);
+        assert_eq!(xpd.used, used::ALLOWED);
+        assert!(xpd.has(0x01, used::ALLOWED) && !xpd.has(0x02, used::ALLOWED));
+        assert!(!xpd.has(0x01, used::AUDITALLOW) && !xpd.has(0x01, used::DONTAUDIT));
+        assert_eq!(decision(0x12, ext::IOCTL).allowed, [u32::MAX; 8]);
+        let xpd = decision(0x89, ext::IOCTL);
+        assert!(xpd.has(0x10, used::ALLOWED) && !xpd.has(0x11, used::ALLOWED));
+        assert!(xpd.has(0x20, used::ALLOWED) && !xpd.has(0x21, used::ALLOWED));
+        // Another driver or another base permission has no rules.
+        assert_eq!(decision(0x43, ext::IOCTL), XpermsDecision::new(0x43, ext::IOCTL));
+        assert_eq!(decision(0x54, ext::NLMSG), XpermsDecision::new(0x54, ext::NLMSG));
+        // init_t has only the rule of domain, and dir has no rules of extended permissions.
+        let init = ctx(&p, "system_u:system_r:init_t:s0");
+        let mut xp = ExtendedPerms::default();
+        p.context_compute_av_xperms(&init, &etc, file, Some(&mut xp));
+        assert!(xperm_test(&xp.drivers, 0x89) && !xperm_test(&xp.drivers, 0x54));
+        let mut xp = ExtendedPerms::default();
+        p.context_compute_av_xperms(&kernel, &etc, p.class_value("dir").unwrap(), Some(&mut xp));
+        assert_eq!(xp, ExtendedPerms::default());
+    }
+
+    #[test]
+    fn a_rule_of_drivers_adds_all_its_drivers() {
+        let mut xp = ExtendedPerms::default();
+        let mut x = Xperms { specified: xperms::IOCTLDRIVER, driver: 0, perms: [0; 8] };
+        xperm_set(&mut x.perms, 0x12);
+        xperm_set(&mut x.perms, 0xff);
+        compute_xperms_drivers(&mut xp, &x);
+        assert!(xp.any && xp.base_perms == ext::IOCTL);
+        assert_eq!(xp.drivers, x.perms);
+        let x = Xperms { specified: xperms::NLMSG, driver: 0x20, perms: [1; 8] };
+        compute_xperms_drivers(&mut xp, &x);
+        assert_eq!(xp.base_perms, ext::IOCTL | ext::NLMSG);
+        assert!(xperm_test(&xp.drivers, 0x20) && !xperm_test(&xp.drivers, 0x00));
     }
 
     #[test]

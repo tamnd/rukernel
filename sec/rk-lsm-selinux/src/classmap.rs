@@ -213,6 +213,12 @@ pub mod class {
     pub const FIFO_FILE: u16 = 14;
     /// `key`.
     pub const KEY: u16 = 50;
+    /// `capability2`.
+    pub const CAPABILITY2: u16 = 53;
+    /// `cap_userns`.
+    pub const CAP_USERNS: u16 = 57;
+    /// `cap2_userns`.
+    pub const CAP2_USERNS: u16 = 58;
 }
 
 /// The permissions of the class `process`, `PROCESS__*` of Linux.
@@ -398,6 +404,9 @@ mod tests {
         };
         assert_eq!(name(class::PROCESS2), Some("process2"));
         assert_eq!(value("key"), Some(class::KEY));
+        assert_eq!(value("capability2"), Some(class::CAPABILITY2));
+        assert_eq!(value("cap_userns"), Some(class::CAP_USERNS));
+        assert_eq!(value("cap2_userns"), Some(class::CAP2_USERNS));
         for (perm, v) in [
             ("transition", process::TRANSITION),
             ("ptrace", process::PTRACE),
