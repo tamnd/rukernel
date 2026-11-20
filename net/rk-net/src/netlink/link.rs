@@ -76,12 +76,60 @@ const GSO_MAX_SIZE: u32 = 8 * GSO_MAX_SEGS;
 /// `fill_link_af` of Linux. It gives `false` if it has no data for the device.
 pub type AfFill = fn(&NetDevice, &mut Builder) -> bool;
 
-static AF: SpinLock<Vec<(u16, AfFill)>> = SpinLock::new(Vec::new());
+/// The function of a family that checks or applies its attributes in `IFLA_AF_SPEC` of a change
+/// of a link, as `validate_link_af` and `set_link_af` of Linux. It gets the data of the nest of
+/// the family.
+pub type AfSet = fn(&NetDevice, &[u8]) -> Result<()>;
+
+/// The functions of a family in `IFLA_AF_SPEC`, as `struct rtnl_af_ops` of Linux.
+#[derive(Clone, Copy)]
+struct AfOps {
+    family: u16,
+    fill: AfFill,
+    /// The check and the change, for a family that takes changes.
+    set: Option<(AfSet, AfSet)>,
+}
+
+static AF: SpinLock<Vec<AfOps>> = SpinLock::new(Vec::new());
 
 /// Registers the attributes of the family `family` in `IFLA_AF_SPEC`, as `rtnl_af_register`
-/// of Linux.
-pub fn register_af(family: u16, fill: AfFill) {
-    AF.lock().push((family, fill));
+/// of Linux. `set` has the check and the change of the attributes of `RTM_SETLINK`. A second
+/// call for a family takes the place of the first one.
+pub fn register_af(family: u16, fill: AfFill, set: Option<(AfSet, AfSet)>) {
+    let mut af = AF.lock();
+    af.retain(|o| o.family != family);
+    af.push(AfOps { family, fill, set });
+}
+
+/// Checks `IFLA_AF_SPEC` of a change of a device, as `validate_linkmsg` of Linux: each family
+/// in it has its functions, and they take its data. A family that is not there gives
+/// `EAFNOSUPPORT`, and a family that takes no changes gives `EOPNOTSUPP`.
+fn check_af_spec(dev: &NetDevice, a: &Attrs<'_>) -> Result<()> {
+    let Some(spec) = a.get(IFLA_AF_SPEC) else { return Ok(()) };
+    let families = AF.lock().clone();
+    for (family, data) in super::msg::attrs(spec) {
+        let ops = families.iter().find(|o| o.family == family).ok_or(Errno::EAFNOSUPPORT)?;
+        let (check, _) = ops.set.ok_or(Errno::EOPNOTSUPP)?;
+        check(dev, data)?;
+    }
+    Ok(())
+}
+
+/// Applies `IFLA_AF_SPEC` of a change of a device, as `do_setlink` of Linux, after
+/// `check_af_spec`. A change of a device that is up goes to the group `RTNLGRP_LINK`, as
+/// `netdev_state_change` of Linux.
+fn set_af_spec(dev: &NetDevice, a: &Attrs<'_>) -> Result<()> {
+    let Some(spec) = a.get(IFLA_AF_SPEC) else { return Ok(()) };
+    let families = AF.lock().clone();
+    for (family, data) in super::msg::attrs(spec) {
+        if let Some((_, set)) = families.iter().find(|o| o.family == family).and_then(|o| o.set) {
+            set(dev, data)?;
+        }
+    }
+    if dev.is_up() {
+        notify_link(dev, RTM_NEWLINK, 0, IFLA_EVENT_NONE);
+    }
+    Ok(())
 }
 
 pub(super) fn init() {
@@ -237,9 +285,9 @@ fn fill_event(
     }
     let spec = b.nest(IFLA_AF_SPEC as u16);
     let families = AF.lock().clone();
-    for (family, f) in families {
-        let at = b.nest(family);
-        if f(dev, &mut b) {
+    for ops in families {
+        let at = b.nest(ops.family);
+        if (ops.fill)(dev, &mut b) {
             b.end_nest(at);
         } else {
             b.truncate(at);
@@ -352,8 +400,15 @@ fn dump(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
 }
 
 /// Changes a device, as `do_setlink` of Linux: the namespace, the hardware address, the MTU, the
-/// name, the flags, the length of the queue and the carrier.
+/// name, the flags, the length of the queue, the carrier and the data of the families in
+/// `IFLA_AF_SPEC`. `IFLA_AF_SPEC` is for a request of `AF_UNSPEC`: a request of another family
+/// that comes here has other attributes in it, for example `IFLA_BRIDGE_FLAGS` of `AF_BRIDGE`,
+/// and these are not changed.
 fn setlink_dev(dev: &Arc<NetDevice>, h: &[u8], a: &Attrs<'_>) -> Result<()> {
+    let af_spec = h[0] == 0;
+    if af_spec {
+        check_af_spec(dev, a)?;
+    }
     // The move to another namespace comes first, as in `do_setlink` of Linux, so the other
     // changes apply in the new namespace.
     if let Some(to) = target_ns(a)? {
@@ -401,6 +456,9 @@ fn setlink_dev(dev: &Arc<NetDevice>, h: &[u8], a: &Attrs<'_>) -> Result<()> {
     // carrier off` brings the device up without a carrier.
     if let Some(on) = a.u8(IFLA_CARRIER)? {
         dev.change_carrier(on != 0)?;
+    }
+    if af_spec {
+        set_af_spec(dev, a)?;
     }
     Ok(())
 }

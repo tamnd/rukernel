@@ -304,6 +304,13 @@ fn kernel_addr(ifindex: u32, addr: Ip, prefix: u8) -> Addr6 {
 static IIDS: PerNet<SpinLock<BTreeMap<u32, [u8; 8]>>> =
     PerNet::new(|| SpinLock::new(BTreeMap::new()));
 
+/// `IN6_ADDR_GEN_MODE_NONE` of `addr_gen_mode`: the device gets no link local address.
+pub(crate) const ADDR_GEN_MODE_NONE: i32 = 1;
+/// `IN6_ADDR_GEN_MODE_STABLE_PRIVACY`, which needs `stable_secret`.
+pub(crate) const ADDR_GEN_MODE_STABLE_PRIVACY: i32 = 2;
+/// `IN6_ADDR_GEN_MODE_RANDOM`, the last mode.
+pub(crate) const ADDR_GEN_MODE_RANDOM: i32 = 3;
+
 /// The interface identifier of the link local address of `d`, as `addrconf_addr_gen` of Linux.
 /// An Ethernet device takes the EUI-64 of its MAC address. A TUN device has no hardware address,
 /// so Linux uses `IN6_ADDR_GEN_MODE_RANDOM` for it: a random identifier that stays the same
@@ -478,10 +485,7 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
                 // The address can be there from an earlier time.
                 let _ = add_addr(Addr6::new(ifindex, ip::LOOPBACK, 128), Origin::KERNEL);
             }
-            let id = interface_id(d);
-            let ll = ipv6::link_local(id.unwrap_or_default());
-            let added =
-                id.is_some() && add_addr(kernel_addr(ifindex, ll, 64), Origin::KERNEL).is_ok();
+            let added = add_link_local(d);
             let changes = ROUTES6.lock().link_up(ifindex, loopback);
             notify_changes(&changes);
             mcast6::up(d);
@@ -493,7 +497,7 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
             let waiting: Vec<(Ip, u32)> = ROUTES6
                 .lock()
                 .addrs_of(ifindex)
-                .filter(|a| !(added && a.addr == ll))
+                .filter(|a| added != Some(a.addr))
                 .map(|a| (a.addr, a.flags))
                 .collect();
             for (addr, flags) in waiting {
@@ -527,6 +531,20 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
     }
 }
 
+/// Adds the link local address of a device, as `addrconf_addr_gen` of Linux, and gives it. A
+/// device with no interface identifier, or with `addr_gen_mode` `IN6_ADDR_GEN_MODE_NONE`, gets
+/// no address.
+fn add_link_local(d: &NetDevice) -> Option<Ip> {
+    let ifindex = d.ifindex();
+    if rk_net::sysctl::conf(Family::Ipv6, Scope::Dev(ifindex), "addr_gen_mode")
+        == ADDR_GEN_MODE_NONE
+    {
+        return None;
+    }
+    let ll = ipv6::link_local(interface_id(d)?);
+    add_addr(kernel_addr(ifindex, ll, 64), Origin::KERNEL).ok().map(|()| ll)
+}
+
 /// Tells if a device takes router advertisements, as `ipv6_accept_ra` of Linux: a device that
 /// forwards takes them only with `accept_ra` 2, and another device with `accept_ra` not 0.
 /// systemd-networkd sets `accept_ra` to 0 and takes the advertisements itself.
@@ -537,10 +555,21 @@ pub(crate) fn accept_ra(forwarding: i32, accept_ra: i32) -> bool {
 /// Checks the attributes of an address against `ifa_ipv6_policy` of Linux.
 /// Takes a write of `net.ipv6.conf.DEV.disable_ipv6`, as `dev_disable_change` of Linux. The
 /// device loses its addresses and routes when IPv6 goes off, and it gets them again when IPv6
-/// comes on and the device is up.
+/// comes on and the device is up. Takes a write of `addr_gen_mode` too.
 pub(crate) fn sysctl_hook(f: Family, scope: Scope, name: &'static str, value: i32) {
-    let (Family::Ipv6, Scope::Dev(ifindex), "disable_ipv6") = (f, scope, name) else { return };
+    let (Family::Ipv6, Scope::Dev(ifindex)) = (f, scope) else { return };
     let Some(d) = dev::by_index(ifindex) else { return };
+    if name == "addr_gen_mode" {
+        // A new mode makes the link local address again, as `addrconf_sysctl_addr_gen_mode`
+        // of Linux. systemd-networkd writes the file when the device is up.
+        if d.is_up() && !rk_net::sysctl::ipv6_disabled(ifindex) {
+            add_link_local(&d);
+        }
+        return;
+    }
+    if name != "disable_ipv6" {
+        return;
+    }
     if value != 0 {
         event(&d, Event::Down);
     } else if d.is_up() {

@@ -59,7 +59,7 @@ pub use tcp::Stream;
 use alloc::string::String;
 use rk_abi::Errno;
 use rk_abi::native::netlink::NLM_F_CREATE;
-use rk_net::consts::AF_INET;
+use rk_net::consts::{AF_INET, AF_INET6};
 use rk_net::dev::{self, Event, LinkKind};
 use rk_vfs::inode::Result;
 
@@ -84,7 +84,12 @@ pub fn init() {
     addrlabel::init();
     link6::init();
     procfs::init();
-    rk_net::netlink::link::register_af(AF_INET as u16, fib::fill_link_af);
+    rk_net::netlink::link::register_af(AF_INET as u16, fib::fill_link_af, None);
+    rk_net::netlink::link::register_af(
+        AF_INET6 as u16,
+        link6::fill_link_af,
+        Some((link6::check_link_af, link6::set_link_af)),
+    );
     rk_net::ioctl::set_ifconf(fib::ifconf);
     dev::add_notifier(fib::event);
     dev::add_notifier(addrconf::event);
