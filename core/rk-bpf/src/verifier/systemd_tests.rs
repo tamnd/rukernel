@@ -7,7 +7,7 @@
 //! the limit of 1,000,000 instructions. Linux 6.8 (Ubuntu 6.8.0-147) processes 25,505
 //! instructions of `sd_bind4` and of `sd_bind6`, and 16 of each `sd_restrictif` program
 //! (restrict-ifaces.bpf.c), as `bpftool -d prog loadall` shows. rk-bpf may not need more than
-//! two times these numbers.
+//! 1.2 times these numbers.
 
 use super::*;
 use crate::map::{MapAttr, map_alloc};
@@ -282,21 +282,196 @@ fn the_socket_bind_programs_of_systemd_load() {
         BPF_CGROUP_INET6_BIND,
         bind_maps(),
     );
-    assert!(n4 <= 2 * LINUX_BIND4, "sd_bind4: {n4} insns, Linux {LINUX_BIND4}");
-    assert!(n6 <= 2 * LINUX_BIND6, "sd_bind6: {n6} insns, Linux {LINUX_BIND6}");
+    assert!(n4 * 5 <= LINUX_BIND4 * 6, "sd_bind4: {n4} insns, Linux {LINUX_BIND4}");
+    assert!(n6 * 5 <= LINUX_BIND6 * 6, "sd_bind6: {n6} insns, Linux {LINUX_BIND6}");
 }
 
 #[test]
 fn the_restrict_ifaces_programs_of_systemd_load() {
     // `sd_restrictif` is a hash map of the interface indexes, and `.rodata` has
-    // `is_allow_list`.
+    // `is_allow_list`. libbpf freezes `.rodata`, so the verifier knows `is_allow_list`.
     let relocs = [(4, BPF_PSEUDO_MAP_FD, 3), (7, BPF_PSEUDO_MAP_VALUE, 4)];
     for attach in [BPF_CGROUP_INET_EGRESS, BPF_CGROUP_INET_INGRESS] {
         let maps = [
             new_map(BPF_MAP_TYPE_HASH, 4, 1, 4096, 0),
             new_map(BPF_MAP_TYPE_ARRAY, 4, 1, 1, BPF_F_RDONLY_PROG | BPF_F_MMAPABLE),
         ];
+        maps[1].frozen.store(true, core::sync::atomic::Ordering::Release);
         let n = load(program(&SD_RESTRICTIF, &relocs), BPF_PROG_TYPE_CGROUP_SKB, attach, maps);
-        assert!(n <= 2 * LINUX_IFACES, "sd_restrictif: {n} insns, Linux {LINUX_IFACES}");
+        assert!(n * 5 <= LINUX_IFACES * 6, "sd_restrictif: {n} insns, Linux {LINUX_IFACES}");
     }
+}
+
+/// Checks a socket filter as root, with an array map of one value of 8 bytes at the
+/// descriptor 3.
+fn check_filter(insns: &[BpfInsn]) -> ::core::result::Result<u32, (Errno, String)> {
+    check_filter_with(insns, new_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1, 0))
+}
+
+/// Checks a socket filter as root, with the map `map` at the descriptor 3.
+fn check_filter_with(
+    insns: &[BpfInsn],
+    map: Arc<BpfMap>,
+) -> ::core::result::Result<u32, (Errno, String)> {
+    let opts = VerifierOpts {
+        prog_type: BPF_PROG_TYPE_SOCKET_FILTER,
+        expected_attach_type: 0,
+        bpf_capable: true,
+        allow_ptr_leaks: true,
+        strict_alignment: false,
+    };
+    let mut log = BpfVerifierLog::new(1);
+    let r = bpf_check(
+        insns.to_vec(),
+        &opts,
+        &|fd| if fd == 3 { Ok(map.clone()) } else { Err(Errno::EBADF) },
+        None,
+        &mut log,
+    );
+    r.map(|v| v.insn_processed).map_err(|e| (e, log.text))
+}
+
+#[test]
+fn a_frozen_read_only_map_gives_constants() {
+    use crate::insn::asm::*;
+    // r0 = *(u8 *)(.rodata + 0); if r0 == 0 goto ok; r0 = *(u8 *)(.rodata + 8), out of the
+    // value. The verifier knows that the value is 0 only when the map is frozen.
+    let mut p = ld_imm64(1, BPF_PSEUDO_MAP_VALUE, 3).to_vec();
+    p.extend([
+        ldx_mem(BPF_B, 0, 1, 0),
+        jmp_imm(BPF_JEQ, 0, 0, 1),
+        ldx_mem(BPF_B, 0, 1, 8),
+        mov64_imm(0, 0),
+        exit(),
+    ]);
+    let rodata = |max_entries: u32, frozen: bool| {
+        let map = new_map(BPF_MAP_TYPE_ARRAY, 4, 1, max_entries, BPF_F_RDONLY_PROG);
+        map.frozen.store(frozen, core::sync::atomic::Ordering::Release);
+        map
+    };
+    let r = check_filter_with(&p, rodata(1, true));
+    assert!(r.is_ok(), "{r:?}");
+    let (e, log) = check_filter_with(&p, rodata(1, false)).unwrap_err();
+    assert_eq!(e, Errno::EACCES);
+    assert!(log.contains("invalid access to map value"), "{log}");
+    // Linux reads only an array map with one element, `array_map_direct_value_addr`. With
+    // more elements, a read of a constant offset of a looked up value fails.
+    let mut p = ld_imm64(1, BPF_PSEUDO_MAP_FD, 3).to_vec();
+    p.extend([
+        mov64_reg(2, BPF_REG_FP),
+        alu64_imm(BPF_ADD, 2, -4),
+        st_mem(BPF_W, 2, 0, 0),
+        call(crate::helpers::func::BPF_FUNC_map_lookup_elem),
+        jmp_imm(BPF_JEQ, 0, 0, 1),
+        ldx_mem(BPF_B, 0, 0, 0),
+        mov64_imm(0, 0),
+        exit(),
+    ]);
+    assert!(check_filter_with(&p, rodata(2, false)).is_ok());
+    assert_eq!(check_filter_with(&p, rodata(2, true)).map_err(|e| e.0), Err(Errno::ENOTSUPP));
+}
+
+/// The start of the programs of the precision tests: r6 = ctx, r0 = the map value, and
+/// r1 = skb->len, a scalar that the verifier does not know. If r0 is NULL, the program goes to
+/// the instruction `null_exit` (r0 = 0; exit).
+fn precision_head(null_exit: usize) -> Vec<BpfInsn> {
+    use crate::insn::asm::*;
+    let mut p = vec![mov64_reg(6, 1)];
+    p.extend(ld_imm64(1, BPF_PSEUDO_MAP_FD, 3));
+    p.extend([
+        mov64_reg(2, BPF_REG_FP),
+        alu64_imm(BPF_ADD, 2, -4),
+        st_mem(BPF_W, 2, 0, 0),
+        call(crate::helpers::func::BPF_FUNC_map_lookup_elem),
+        jmp_imm(BPF_JEQ, 0, 0, null_exit as i16 - 8),
+        ldx_mem(BPF_W, 1, 6, 0),
+    ]);
+    p
+}
+
+/// A refused program must stay refused with the pruning. The tests have a scalar that is a
+/// constant on each path, and a byte store at r0 + the scalar. With 8 the store is out of the
+/// value, with 7 it is in the value. `do_check` goes on the path of the next instruction
+/// first, so it keeps the state of the good path at the join, and then the other path comes
+/// to the join. If the scalar were not precise in the kept state, the pruning would stop the
+/// other path at the join, and the verifier would accept the bad store.
+fn assert_precise(prog: impl Fn(i32) -> Vec<BpfInsn>) {
+    assert!(check_filter(&prog(7)).is_ok(), "{:?}", check_filter(&prog(7)));
+    let (e, log) = check_filter(&prog(8)).expect_err("the store at r0 + 8 is out of the value");
+    assert_eq!(e, Errno::EACCES);
+    assert!(log.contains("invalid access to map value"), "{log}");
+}
+
+#[test]
+fn a_pointer_offset_is_precise_at_a_join() {
+    use crate::insn::asm::*;
+    // 9: r7 = bad; 10: if r1 > 5 goto 12; 11: r7 = 0; 12: r0 += r7 (the join).
+    assert_precise(|bad| {
+        let mut p = precision_head(14);
+        p.extend([
+            mov64_imm(7, bad),
+            jmp_imm(BPF_JGT, 1, 5, 1),
+            mov64_imm(7, 0),
+            alu64_reg(BPF_ADD, 0, 7),
+            st_mem(BPF_B, 0, 0, 1),
+            mov64_imm(0, 0),
+            exit(),
+        ]);
+        p
+    });
+}
+
+#[test]
+fn a_spilled_pointer_offset_is_precise_at_a_join() {
+    use crate::insn::asm::*;
+    // The scalar is in the stack slot fp-8 at the join 14, so the slot must be precise.
+    // 9: r7 = bad; 10: *(u64 *)(fp - 8) = r7; 11: if r1 > 5 goto 14; 12: r7 = 0;
+    // 13: *(u64 *)(fp - 8) = r7; 14: r8 = *(u64 *)(fp - 8); 15: r0 += r8.
+    assert_precise(|bad| {
+        let mut p = precision_head(17);
+        p.extend([
+            mov64_imm(7, bad),
+            stx_mem(BPF_DW, BPF_REG_FP, 7, -8),
+            jmp_imm(BPF_JGT, 1, 5, 2),
+            mov64_imm(7, 0),
+            stx_mem(BPF_DW, BPF_REG_FP, 7, -8),
+            ldx_mem(BPF_DW, 8, BPF_REG_FP, -8),
+            alu64_reg(BPF_ADD, 0, 8),
+            st_mem(BPF_B, 0, 0, 1),
+            mov64_imm(0, 0),
+            exit(),
+        ]);
+        p
+    });
+}
+
+#[test]
+fn a_pruned_path_gives_the_precision_to_its_parents() {
+    use crate::insn::asm::*;
+    // The first path (10 to 13) keeps the state at the join 21 with r7 = 0 precise. The second
+    // path (14 to 17) keeps the state at 20 with r7 = 0, and the state at 21 prunes it. The
+    // third path (18) comes to 20 with r7 = bad. If the pruning at 21 did not mark r7 precise
+    // in the state at 20 (`propagate_precision`), the state at 20 would prune the third path.
+    assert_precise(|bad| {
+        let mut p = precision_head(23);
+        p.extend([
+            mov64_imm(7, 0),
+            jmp_imm(BPF_JGT, 1, 5, 3),
+            mov64_imm(2, 0),
+            mov64_imm(2, 0),
+            jmp_imm(BPF_JA, 0, 0, 7),
+            jmp_imm(BPF_JGT, 1, 9, 3),
+            mov64_imm(3, 0),
+            mov64_imm(3, 0),
+            jmp_imm(BPF_JA, 0, 0, 2),
+            mov64_imm(7, bad),
+            mov64_imm(3, 0),
+            mov64_imm(3, 0),
+            alu64_reg(BPF_ADD, 0, 7),
+            st_mem(BPF_B, 0, 0, 1),
+            mov64_imm(0, 0),
+            exit(),
+        ]);
+        p
+    });
 }

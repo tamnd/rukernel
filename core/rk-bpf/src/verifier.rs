@@ -44,7 +44,7 @@ mod states;
 #[cfg(test)]
 mod systemd_tests;
 
-use states::{StateLists, Stats, Visit};
+use states::{Bt, Hist, StateLists, Stats, Visit};
 
 type Result<T> = core::result::Result<T, Errno>;
 
@@ -261,6 +261,10 @@ struct State {
     subprog: usize,
     /// The frames of the callers, the main program first.
     callers: Vec<Frame>,
+    /// The jump history from the parent state, `jmp_history` of Linux.
+    hist: Vec<Hist>,
+    /// The first instruction after the parent state, `first_insn_idx` of Linux.
+    first_insn: usize,
 }
 
 /// The state of a caller, `struct bpf_func_state` of Linux.
@@ -353,6 +357,14 @@ struct Env<'a> {
     subprogs: Vec<Subprog>,
     /// The type of the pointer of each load or store, `insn_aux_data[].ptr_type` of Linux.
     ptr_types: Vec<RegType>,
+    /// The instruction that `do_check` looks at, `insn_idx` of Linux.
+    insn_idx: usize,
+    /// The instruction before it on the path, `prev_insn_idx` of Linux.
+    prev_insn: Option<usize>,
+    /// The instruction has an entry in the jump history, `cur_hist_ent` of Linux.
+    cur_hist_ent: bool,
+    /// The registers that the instruction needs precise, for `mark_chain_precision`.
+    precise_req: u16,
 }
 
 /// What the program does with a memory access.
@@ -429,6 +441,10 @@ pub fn bpf_check(
             stats: Stats::default(),
             subprogs: Vec::new(),
             ptr_types: Vec::new(),
+            insn_idx: 0,
+            prev_insn: None,
+            cur_hist_ent: false,
+            precise_req: 0,
         };
         let r = env
             .add_subprogs()
@@ -461,6 +477,10 @@ pub fn bpf_check(
         stats: Stats::default(),
         subprogs,
         ptr_types: vec![RegType::NotInit; insns.len()],
+        insn_idx: 0,
+        prev_insn: None,
+        cur_hist_ent: false,
+        precise_req: 0,
     };
     let r = env
         .check_cfg()
@@ -938,13 +958,29 @@ impl Env<'_> {
         let mut regs = Box::new([Reg::NOT_INIT; MAX_BPF_REG]);
         regs[1] = Reg::ptr(RegType::PtrToCtx);
         regs[BPF_REG_FP as usize] = Reg::ptr(RegType::PtrToStack);
-        let st =
-            State { regs, stack: vec![StackSlot::EMPTY; SLOTS], subprog: 0, callers: Vec::new() };
+        let st = State {
+            regs,
+            stack: vec![StackSlot::EMPTY; SLOTS],
+            subprog: 0,
+            callers: Vec::new(),
+            hist: Vec::new(),
+            first_insn: 0,
+        };
         let prune = self.prune_points();
-        let live = states::live_regs(self.insns);
+        let (prog_type, bpf_capable) = (self.prog_type, self.bpf_capable);
+        // A helper reads only the registers of its arguments, as `check_func_arg` and
+        // `get_call_summary` of Linux. The verifier refuses a call of an unknown helper.
+        let args = |func_id: i32| match get_func_proto(prog_type, func_id, bpf_capable) {
+            Some(p) => (0..5)
+                .filter(|&i| p.arg_type[i] != ArgType::DontCare)
+                .fold(0u16, |m, i| m | 1 << (i + 1)),
+            None => 0b11_1110,
+        };
+        let live = states::live_regs(self.insns, &args);
         let mut lists = StateLists::new(self.insns.len());
-        // A branch that waits remembers the length of the path of kept states when it starts.
-        let mut pending: Vec<(usize, State, usize)> = vec![(0, st, 0)];
+        // A branch that waits remembers the length of the path of kept states when it starts,
+        // and the jump before it.
+        let mut pending: Vec<Pending> = vec![(0, st, 0, None)];
         let r = self.check_paths(&prune, &live, &mut lists, &mut pending);
         self.stats = lists.stats;
         r
@@ -956,9 +992,9 @@ impl Env<'_> {
         prune: &[bool],
         live: &[u16],
         lists: &mut StateLists,
-        pending: &mut Vec<(usize, State, usize)>,
+        pending: &mut Vec<Pending>,
     ) -> Result<()> {
-        while let Some((mut pc, mut st, depth)) = pending.pop() {
+        while let Some((mut pc, mut st, depth, mut prev)) = pending.pop() {
             lists.leave_path(depth);
             loop {
                 // Linux counts the instruction where the path stops.
@@ -971,9 +1007,16 @@ impl Env<'_> {
                     );
                     return Err(Errno::E2BIG);
                 }
+                self.insn_idx = pc;
+                self.prev_insn = prev;
+                self.cur_hist_ent = false;
+                // The path did not come from the instruction before, so the jump history
+                // remembers the jump, as `is_jmp_point` in `do_check` of Linux.
+                let jumped = prev.is_some_and(|p| p + 1 != pc);
                 if prune[pc] {
                     match lists.visit(
                         pc,
+                        prev,
                         &mut st,
                         live,
                         self.bpf_capable,
@@ -981,7 +1024,17 @@ impl Env<'_> {
                         self.insn_processed,
                         self.jmps_processed,
                     ) {
-                        Visit::Prune => break,
+                        Visit::Prune(id) => {
+                            // The precise scalars of the safe state must be precise in the
+                            // parents of this state too, `propagate_precision` of Linux.
+                            if self.bpf_capable {
+                                if jumped {
+                                    self.push_jmp_history(&mut st, None);
+                                }
+                                lists.propagate_precision(self.insns, id, &st, pc);
+                            }
+                            break;
+                        }
                         Visit::Loop => {
                             verbose!(self, "infinite loop detected at insn {}\n", pc);
                             return Err(Errno::EINVAL);
@@ -989,13 +1042,24 @@ impl Env<'_> {
                         Visit::Go => {}
                     }
                 }
+                if jumped {
+                    self.push_jmp_history(&mut st, None);
+                }
                 if self.log.level & BPF_LOG_LEVEL2 != 0 {
                     verbose!(self, "{}: (code {:02x})\n", pc, self.insns[pc].code);
                 }
                 if matches!(bpf_class(self.insns[pc].code), BPF_JMP | BPF_JMP32) {
                     self.jmps_processed += 1;
                 }
-                match self.do_insn(pc, &mut st)? {
+                let frame = st.callers.len();
+                self.precise_req = 0;
+                let next = self.do_insn(pc, &mut st)?;
+                if self.precise_req != 0 && self.bpf_capable {
+                    let bt = Bt::regs(frame, self.precise_req);
+                    lists.mark_chain_precision(self.insns, &st.hist, st.first_insn, pc, bt);
+                }
+                prev = Some(pc);
+                match next {
                     Next::Go(next) => pc = next,
                     Next::Branch(next, other, other_state) => {
                         if pending.len() >= BPF_COMPLEXITY_LIMIT_JMP_SEQ {
@@ -1006,7 +1070,7 @@ impl Env<'_> {
                             );
                             return Err(Errno::E2BIG);
                         }
-                        pending.push((other, *other_state, lists.path_len()));
+                        pending.push((other, *other_state, lists.path_len(), Some(pc)));
                         pc = next;
                     }
                     Next::Exit => break,
@@ -1014,6 +1078,37 @@ impl Env<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Adds an entry for the instruction to the jump history, or adds the stack slot to its
+    /// entry, `push_jmp_history` of Linux. Without `CAP_BPF` the verifier does not track the
+    /// precision, so it does not need the history.
+    fn push_jmp_history(&mut self, st: &mut State, slot: Option<states::SlotRef>) {
+        if !self.bpf_capable {
+            return;
+        }
+        if self.cur_hist_ent {
+            if let Some(h) = st.hist.last_mut()
+                && slot.is_some()
+            {
+                h.slot = slot;
+            }
+            return;
+        }
+        st.hist.push(Hist {
+            idx: self.insn_idx as u32,
+            prev: self.prev_insn.map_or(u32::MAX, |p| p as u32),
+            slot,
+        });
+        self.cur_hist_ent = true;
+    }
+
+    /// The register `regno` needs precision, `mark_chain_precision` of Linux. `check_paths`
+    /// does the backtracking after the instruction.
+    fn mark_chain_precision(&mut self, regno: u8) {
+        if (regno as usize) < MAX_BPF_REG {
+            self.precise_req |= 1 << regno;
+        }
     }
 
     /// The instructions where `do_check` compares the states, as `mark_prune_point` in
@@ -1356,9 +1451,15 @@ impl Env<'_> {
                 return Err(Errno::EACCES);
             }
             if dst.is_pointer() {
+                // Pointer plus a scalar: the offset must be precise.
+                if bpf_src(insn.code) == BPF_X {
+                    self.mark_chain_precision(insn.src_reg);
+                }
                 return self.adjust_ptr_min_max_vals(d, op, dst, src);
             }
             if op == BPF_ADD {
+                // A scalar plus a pointer.
+                self.mark_chain_precision(d);
                 return self.adjust_ptr_min_max_vals(d, op, src, dst);
             }
             verbose!(self, "R{} tried to subtract pointer from scalar\n", d);
@@ -1480,6 +1581,7 @@ impl Env<'_> {
                 let frameno = reg.frameno;
                 self.grow_stack(st.subprog_of(frameno), -off);
                 let cur = st.curframe();
+                let spi = (MAX_BPF_STACK as i64 + off) as usize / 8;
                 let stack = st.stack_of(frameno);
                 if t == Access::Write {
                     let v = val.map(|(_, v)| v).unwrap_or_else(Reg::unknown);
@@ -1504,9 +1606,18 @@ impl Env<'_> {
                         return Err(Errno::EINVAL);
                     }
                     stack_write(stack, off, size, v);
+                    // A spill: the jump history remembers the slot for the backtracking.
+                    if size == 8 {
+                        self.push_jmp_history(st, Some((frameno as u8, spi as u8)));
+                    }
                     Ok(Reg::NOT_INIT)
                 } else {
-                    self.stack_read(stack, off, size)
+                    let fill = size == 8 && stack[spi].is_spill();
+                    let v = self.stack_read(stack, off, size)?;
+                    if fill {
+                        self.push_jmp_history(st, Some((frameno as u8, spi as u8)));
+                    }
+                    Ok(v)
                 }
             }
             RegType::PtrToMapValue => {
@@ -1533,6 +1644,12 @@ impl Env<'_> {
                     return Err(Errno::EACCES);
                 }
                 self.check_map_access(regno, reg, off, size, map.value_size)?;
+                // The programs cannot change a frozen map with `BPF_F_RDONLY_PROG`, so the
+                // verifier reads the value as a constant, as `check_mem_access` of Linux.
+                if t == Access::Read && reg.var.is_const() && bpf_map_is_rdonly(&map) {
+                    let map_off = reg.off as i64 + off as i64 + reg.var.value as i64;
+                    return bpf_map_direct_read(&map, map_off as usize, size).map(Reg::known);
+                }
                 Ok(Reg::unknown_of_size(size))
             }
             RegType::PtrToCtx => {
@@ -1770,6 +1887,7 @@ impl Env<'_> {
             );
             return Err(Errno::EINVAL);
         }
+        self.mark_chain_precision(0);
         // The 32-bit value is the result, as `return_32bit` of Linux.
         let (min, max) = if r0.umax <= u64::from(u32::MAX) {
             (r0.umin as i64, r0.umax as i64)
@@ -1933,7 +2051,7 @@ impl Env<'_> {
                     Reg::known(insn.imm as i64 as u64)
                 };
                 let target = (pc as i64 + 1 + insn.off as i64) as usize;
-                self.check_cond_jmp_op(
+                let next = self.check_cond_jmp_op(
                     pc,
                     target,
                     class == BPF_JMP32,
@@ -1942,7 +2060,18 @@ impl Env<'_> {
                     dst,
                     src,
                     st,
-                )
+                )?;
+                // The verifier knew the result of the jump from the bounds of the scalars, so
+                // they must be precise, as in `check_cond_jmp_op` of Linux.
+                if !matches!(next, Next::Branch(..)) {
+                    if !dst.is_pointer() {
+                        self.mark_chain_precision(insn.dst_reg);
+                    }
+                    if x && !src.is_pointer() {
+                        self.mark_chain_precision(insn.src_reg);
+                    }
+                }
+                Ok(next)
             }
         }
     }
@@ -2269,6 +2398,8 @@ impl Env<'_> {
                     return Err(Errno::EACCES);
                 }
                 self.check_helper_mem_access(st, regno, reg, size_reg.umax as u32, Access::Write)?;
+                // `check_mem_size_reg` of Linux: the size must be precise.
+                self.mark_chain_precision(regno + 1);
             }
             ArgType::ConstSize => {}
         }
@@ -2366,6 +2497,10 @@ impl Env<'_> {
         }
     }
 }
+
+/// A branch that waits: the instruction, the state, the length of the path of kept states, and
+/// the jump.
+type Pending = (usize, State, usize, Option<usize>);
 
 /// What comes after an instruction.
 enum Next {
@@ -2742,6 +2877,33 @@ fn mark_ptr_or_null_regs(st: &mut State, id: u32, is_null: bool) {
             }
         }
     }
+}
+
+/// Tells if the programs and the system calls cannot change the map, `bpf_map_is_rdonly` of
+/// Linux.
+fn bpf_map_is_rdonly(map: &BpfMap) -> bool {
+    use core::sync::atomic::Ordering;
+    map.map_flags & BPF_F_RDONLY_PROG != 0
+        && map.frozen.load(Ordering::Acquire)
+        && map.writecnt.load(Ordering::Acquire) == 0
+}
+
+/// Reads `size` bytes at `off` of the value of a map, `bpf_map_direct_read` of Linux. Only an
+/// array map with one element has a direct value, as `array_map_direct_value_addr` of Linux.
+fn bpf_map_direct_read(map: &BpfMap, off: usize, size: u32) -> Result<u64> {
+    if map.map_type != BPF_MAP_TYPE_ARRAY {
+        return Err(Errno::EINVAL);
+    }
+    if map.max_entries != 1 {
+        return Err(Errno::ENOTSUPP);
+    }
+    if off >= map.value_size as usize || !matches!(size, 1 | 2 | 4 | 8) {
+        return Err(Errno::EINVAL);
+    }
+    let elem = map.ops.map_lookup_elem(&0u32.to_le_bytes()).ok_or(Errno::EINVAL)?;
+    let mut buf = [0u8; 8];
+    elem.value(0).read(off, &mut buf[..size as usize]);
+    Ok(u64::from_le_bytes(buf))
 }
 
 /// Writes the stack, as `check_stack_write_fixed_off` of Linux. A write of 8 bytes spills the
