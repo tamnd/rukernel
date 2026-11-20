@@ -48,6 +48,7 @@ use crate::netlink::nfnetlink::{
     nfnl_msg_type,
 };
 use crate::ns::PerNet;
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -716,6 +717,8 @@ impl NftSet {
         if self.flags & NFT_SET_TIMEOUT == 0 || self.collected {
             return;
         }
+        #[cfg(test)]
+        work::add(&work::SCANNED, self.elems.len());
         self.elems.retain(|_, e| !e.expired(now));
         self.collected = true;
     }
@@ -740,9 +743,45 @@ impl NftSet {
 
     /// The elements that have not expired with the ones of `dynset`, for the dumps.
     fn view(&self) -> BTreeMap<ElemKey, NftElem> {
-        let mut elems = self.live_elems().map(|(k, e)| (k.clone(), e.clone())).collect();
+        let mut elems: BTreeMap<_, _> =
+            self.live_elems().map(|(k, e)| (k.clone(), e.clone())).collect();
+        #[cfg(test)]
+        work::add(&work::COPIED, elems.len());
         nft_dyn_apply(&mut elems, &self.dynamic.0.lock(), &BTreeSet::new());
         elems
+    }
+
+    /// The elements in which `NFT_MSG_GETSETELEM` looks: the ones of the set, or a copy with
+    /// the ones of `dynset` if it changed some since the last commit.
+    fn get_view(&self) -> Cow<'_, BTreeMap<ElemKey, NftElem>> {
+        if self.dynamic.0.lock().elems.is_empty() {
+            Cow::Borrowed(&self.elems)
+        } else {
+            Cow::Owned(self.view())
+        }
+    }
+}
+
+/// The work of a batch in the tests: the elements that the removal of the expired elements
+/// looked at, and the elements that a copy of a set copied.
+#[cfg(test)]
+mod work {
+    extern crate std;
+    use core::cell::Cell;
+    use std::thread::LocalKey;
+
+    std::thread_local! {
+        pub(super) static SCANNED: Cell<usize> = const { Cell::new(0) };
+        pub(super) static COPIED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add(counter: &'static LocalKey<Cell<usize>>, n: usize) {
+        counter.with(|c| c.set(c.get() + n));
+    }
+
+    /// Gives the counts and sets them back to 0.
+    pub(super) fn take() -> (usize, usize) {
+        (SCANNED.with(|c| c.replace(0)), COPIED.with(|c| c.replace(0)))
     }
 }
 
@@ -1948,22 +1987,15 @@ fn nf_tables_getsetelem(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<()> {
         .map_err(|e| bad(info, nla, NFTA_SET_ELEM_LIST_SET, e))?;
     let set = &table.sets[s];
     let Some(list) = nla.get(NFTA_SET_ELEM_LIST_ELEMENTS) else { return Err(Errno::EINVAL) };
-    // The elements of the set, with the ones of `dynset` if it changed some: a copy only then.
     let now = nft_now_ns();
-    let copy;
-    let view = if set.dynamic.0.lock().elems.is_empty() {
-        &set.elems
-    } else {
-        copy = set.view();
-        &copy
-    };
+    let view = set.get_view();
     let mut replies = Vec::new();
     for (_, attr) in msg::attrs(list) {
         let ea = Attrs::parse(attr, NFTA_SET_ELEM_MAX);
         let flags = nft_setelem_parse_flags(set, &ea)?;
         let key =
             nft_setelem_parse_elemkey(set, &ea, flags).inspect_err(|_| info.req.bad_attr(attr))?;
-        let Some((key, e)) = nft_setelem_get(set, view, &key, now) else {
+        let Some((key, e)) = nft_setelem_get(set, &view, &key, now) else {
             info.req.bad_attr(attr);
             return Err(Errno::ENOENT);
         };
@@ -4218,6 +4250,74 @@ mod tests {
         n.elems.insert(k(1), e);
         n.gc(u64::MAX);
         assert_eq!(n.nelems(), 1);
+    }
+
+    #[test]
+    fn a_batch_of_400_inserts_in_a_set_of_10000_scans_it_once_and_a_get_copies_nothing() {
+        // The batch of `nft add element` of maps/vmap_timeout: 400 elements in a set with
+        // timeouts, which has 10000 elements already. The set has a size, so an insert checks
+        // the count of the elements.
+        let n = 10_000u32;
+        let key = |i: u32| ElemKey { catchall: false, key: i.to_be_bytes().to_vec(), end: false };
+        let e = NftElem {
+            key_end: None,
+            data: None,
+            flags: 0,
+            udata: None,
+            timeout: 0,
+            expires: 0,
+            exprs: Vec::new(),
+            seq: 0,
+        };
+        let mut s = NftSet { flags: NFT_SET_TIMEOUT, size: 65_536, ..set(b"m") };
+        for i in 0..n {
+            s.elems.insert(key(i), e.clone());
+        }
+        let mut t = table();
+        t.sets.push(s);
+        let mut batch = NftBatch {
+            net: NFT.get().lock(),
+            tables: alloc::vec![t],
+            table_handle: 1,
+            next_seq: 1,
+            notices: Vec::new(),
+            listen: false,
+            changed: false,
+            updated: Vec::new(),
+            added_devs: Vec::new(),
+            validate: false,
+        };
+        let ctx = NftCtx {
+            family: NFPROTO_IPV4,
+            portid: 0,
+            seq: 0,
+            flags: 0,
+            report: false,
+            ty: NFT_MSG_NEWSETELEM,
+        };
+        work::take();
+        for i in n..n + 400 {
+            let mut b = Builder::new(0, 0, 0, 0);
+            let k = b.nest(NFTA_SET_ELEM_KEY as u16 | NLA_F_NESTED as u16);
+            b.put(NFTA_DATA_VALUE as u16, &i.to_be_bytes());
+            b.end_nest(k);
+            batch.nft_add_set_elem(&ctx, 0, 0, &b.finish()[msg::HDRLEN..]).unwrap();
+        }
+        let set = &batch.tables[0].sets[0];
+        assert_eq!(set.nelems(), 10_400);
+        // The batch looked at each element of the set once for the ones that expired, and
+        // copied nothing.
+        assert_eq!(work::take(), (10_000, 0));
+        // A get looks in the elements of the set, with no copy.
+        let view = set.get_view();
+        assert!(matches!(view, Cow::Borrowed(_)));
+        assert_eq!(nft_setelem_get(set, &view, &key(5), 0).map(|(k, _)| k), Some(key(5)));
+        drop(view);
+        assert_eq!(work::take(), (0, 0));
+        // With a change of `dynset` that no commit took yet, a get copies the set.
+        set.dynamic.0.lock().elems.insert(key(n + 400).key, DynElem::Add(e));
+        assert_eq!(set.get_view().len(), 10_401);
+        assert_eq!(work::take(), (0, 10_400));
     }
 
     #[test]
