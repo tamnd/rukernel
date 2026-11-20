@@ -647,6 +647,19 @@ impl Table6 {
         self.lookup_flow(&Flow { dst: *dst, oif, iif: self.loopback, ..Flow::default() })
     }
 
+    /// Finds the route to the gateway `gw` of a new route or nexthop out of `oif`, or out of any
+    /// interface if `oif` is 0, as `rt6_lookup` in `ip6_route_check_nh` of Linux. The route
+    /// needs no source address, so `src` of the next hop is `ip::ANY` if `gw` is not local. A
+    /// gateway is good while each address of the interface is tentative, as on Linux.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ENETUNREACH` if no route matches, and the error of a route or a rule that
+    /// rejects.
+    pub fn lookup_gateway(&self, gw: &Ip, oif: u32) -> Result<(Next6, Option<&Route6>)> {
+        self.find_flow(&Flow { dst: *gw, oif, iif: self.loopback, ..Flow::default() })
+    }
+
     /// Finds the route for the flow `fl` as `lookup_route`, through the rules, as
     /// `fib6_rule_lookup` of Linux.
     ///
@@ -654,6 +667,19 @@ impl Table6 {
     ///
     /// Gives the errors of `lookup`, and the error of a rule that rejects.
     pub fn lookup_flow(&self, fl: &Flow) -> Result<(Next6, Option<&Route6>)> {
+        let (mut next, route) = self.find_flow(fl)?;
+        if !next.local {
+            next.src = match route.and_then(|r| r.prefsrc) {
+                Some(s) => s,
+                None => self.select_src(&fl.dst, next.ifindex).ok_or(Errno::EADDRNOTAVAIL)?,
+            };
+        }
+        Ok((next, route))
+    }
+
+    /// Finds the route for the flow `fl` as `lookup_flow`, but without the source address of
+    /// a route that is not local: `src` is `ip::ANY`.
+    fn find_flow(&self, fl: &Flow) -> Result<(Next6, Option<&Route6>)> {
         let (dst, oif) = (&fl.dst, fl.oif);
         // A link local address of another interface is not local to a flow out of `oif`. Linux
         // looks up such a flow with `RT6_LOOKUP_F_IFACE`, so the packet goes out on the link of
@@ -712,11 +738,7 @@ impl Table6 {
             None if oif != 0 && ipv6::needs_scope(dst) => (oif, *dst, 0),
             None => return Err(Errno::ENETUNREACH),
         };
-        let src = match route.and_then(|r| r.prefsrc) {
-            Some(s) => s,
-            None => self.select_src(dst, ifindex).ok_or(Errno::EADDRNOTAVAIL)?,
-        };
-        Ok((Next6 { ifindex, hop, src, local: false, mtu }, route))
+        Ok((Next6 { ifindex, hop, src: ip::ANY, local: false, mtu }, route))
     }
 
     /// Tells if the interface `ifindex` has the link local address `a` or has an address.
