@@ -1963,28 +1963,37 @@ impl AddressSpace {
         if want == 0 {
             return (0, 0, Some(start));
         }
-        let st = self.state.lock();
-        let mut pages = Vec::new();
-        for vma in st.vmas.iter().filter(|v| v.start < end && start < v.end) {
-            if !vma.shared && !vma.hugetlb && !vma.locked {
-                let (from, to) = (start.max(vma.start), end.min(vma.end));
-                pages.extend(self.vm.mapped_pages(VirtAddr::new(from), VirtAddr::new(to)));
-            }
-        }
-        // The writes wait for the disk, so they run with no lock of the areas, as the write back
-        // of `munmap`.
-        drop(st);
-        let (mut scanned, mut n) = (0, 0);
-        for page in pages {
-            scanned += 1;
-            // A page that cannot go takes no swap entry.
-            let Some(frame) = self.vm.swap_out_start(page) else { continue };
-            let Some(slot) = SwapSlot::alloc(self.memcg()) else {
-                return (scanned, n, Some(page.get()));
+        let (mut scanned, mut n, mut at) = (0, 0, start);
+        while at < end {
+            // The pages go in batches of `RECLAIM_BATCH` bytes, so a reclaim that wants a few
+            // pages does not first collect each mapped page of a large space, as `walk_page_range`
+            // of Linux stops when the reclaim has enough.
+            let st = self.state.lock();
+            let Some(vma) = st
+                .vmas
+                .iter()
+                .find(|v| at < v.end && v.start < end && !v.shared && !v.hugetlb && !v.locked)
+            else {
+                break;
             };
-            n += usize::from(self.swap_out(page, &frame, slot));
-            if n >= want {
-                return (scanned, n, Some(page.get() + PAGE_SIZE));
+            let from = at.max(vma.start);
+            let to = end.min(vma.end).min(from.saturating_add(RECLAIM_BATCH));
+            let pages = self.vm.mapped_pages(VirtAddr::new(from), VirtAddr::new(to));
+            // The writes wait for the disk, so they run with no lock of the areas, as the write
+            // back of `munmap`.
+            drop(st);
+            at = to;
+            for page in pages {
+                scanned += 1;
+                // A page that cannot go takes no swap entry.
+                let Some(frame) = self.vm.swap_out_start(page) else { continue };
+                let Some(slot) = SwapSlot::alloc(self.memcg()) else {
+                    return (scanned, n, Some(page.get()));
+                };
+                n += usize::from(self.swap_out(page, &frame, slot));
+                if n >= want {
+                    return (scanned, n, Some(page.get() + PAGE_SIZE));
+                }
             }
         }
         (scanned, n, None)
@@ -2479,6 +2488,10 @@ fn only_enomem(r: Result<(), Errno>) -> Result<(), Errno> {
         _ => Ok(()),
     }
 }
+
+/// The bytes of the address space that the reclaim of anonymous memory looks at in one step, the
+/// size of one page table. See [`AddressSpace::page_out_range`].
+const RECLAIM_BATCH: usize = 2 << 20;
 
 /// The pages of a populate between two calls of the hook of [`set_populate_hook`], as
 /// `MEMCG_CHARGE_BATCH` of Linux.
