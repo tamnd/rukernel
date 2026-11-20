@@ -376,6 +376,44 @@ pub fn bounded_transition(old: u32, new: u32) -> Result<(), Errno> {
     Err(Errno::EPERM)
 }
 
+/// Checks the `validatetrans` rules of the class `tclass` of the kernel for a change of the
+/// label of an object from `old` to `new` by a task of `task`, as
+/// `security_validate_transition` of Linux. A denial makes a `SELINUX_ERR` audit record, and
+/// it is an error only in enforcing mode. Before the first policy load, each change is valid.
+///
+/// # Errors
+///
+/// `EINVAL` for an unknown SID or class, `EPERM` if a rule denies the change in enforcing
+/// mode.
+pub fn validate_transition(old: u32, new: u32, task: u32, tclass: u16) -> Result<(), Errno> {
+    let Some(p) = policy() else { return Ok(()) };
+    let func = "security_validate_transition";
+    let class = services::unmap_class(&p.map, tclass);
+    let rules = &p.db.class(class).ok_or(Errno::EINVAL)?.validatetrans;
+    let o = search(&p, old, false, func).ok_or(Errno::EINVAL)?.context;
+    let n = search(&p, new, false, func).ok_or(Errno::EINVAL)?.context;
+    let t = search(&p, task, false, func).ok_or(Errno::EINVAL)?.context;
+    if rules.iter().all(|r| p.db.constraint_eval(&o, &n, Some(&t), &r.expr)) {
+        return Ok(());
+    }
+    log_transition(&p.db, [&o, &n, &t], class);
+    if enforcing() { Err(Errno::EPERM) } else { Ok(()) }
+}
+
+/// The `SELINUX_ERR` record of a denial of [`validate_transition`] for the old, the new and
+/// the task context. The text is not inline, so that it is not in the frame of the check.
+#[inline(never)]
+fn log_transition(db: &Policydb, [o, n, t]: [&Context; 3], class: u32) {
+    let cname = db.name(crate::policydb::sym::CLASSES, class).unwrap_or_default();
+    services::log_err(&format!(
+        "op=security_validate_transition seresult=denied oldcontext={} newcontext={} \
+         taskcontext={} tclass={cname}",
+        db.context_to_string(o),
+        db.context_to_string(n),
+        db.context_to_string(t)
+    ));
+}
+
 /// Reads a binary policy into a box. The function is not inline, so that the large values of
 /// the read are not in the frame of [`load_policy`] on the kernel stack.
 #[inline(never)]

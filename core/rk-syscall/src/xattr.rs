@@ -89,17 +89,30 @@ fn give(cx: &Cx<'_>, addr: u64, size: u64, data: &[u8], max: usize) -> SysResult
     Ok(data.len() as u64)
 }
 
+/// Changes the attribute `name`. The security modules check the change of an attribute that
+/// is not an ACL, and see the new value after it, as `__vfs_setxattr_locked` of Linux. A
+/// security module changes an attribute of `security.` that the file system does not keep, as
+/// `security_inode_setsecurity` in `__vfs_setxattr_noperm` of Linux.
 fn set(cx: &Cx<'_>, target: Target, name: Vec<u8>, value: u64, size: u64, flags: u64) -> SysResult {
-    let Some((inode, _)) = target else {
+    let Some((inode, at)) = target else {
         return Err(Errno::EOPNOTSUPP);
     };
     rk_vfs::inode::check_fixed(&*inode)?;
     check(cx, &inode, &name, true)?;
     let value = if size == 0 { Vec::new() } else { cx.read_bytes(value, size as usize)? };
+    let flags = flags as u32;
     if is_acl(&name) {
         acl::set(&cx.process().cred(), &*inode, &name, &value)?;
     } else {
-        inode.set_xattr(&name, &value, flags as u32)?;
+        rk_vfs::security::inode_setxattr(&*inode, at.as_ref(), &name, &value, flags)?;
+        match inode.set_xattr(&name, &value, flags) {
+            Ok(()) => rk_vfs::security::inode_post_setxattr(&*inode, &name, &value, flags),
+            Err(Errno::EOPNOTSUPP) if name.starts_with(b"security.") => {
+                let suffix = &name[b"security.".len()..];
+                rk_vfs::security::inode_setsecurity(&*inode, at.as_ref(), suffix, &value, flags)?;
+            }
+            Err(e) => return Err(e),
+        }
     }
     // As `fsnotify_xattr` of Linux.
     rk_vfs::notify::xattr(None, &inode);
@@ -162,8 +175,10 @@ fn list(cx: &Cx<'_>, target: Target, addr: u64, size: u64) -> SysResult {
     give(cx, addr, size, &out, XATTR_LIST_MAX)
 }
 
+/// Removes the attribute `name`. The security modules check the removal of an attribute that
+/// is not an ACL, as `__vfs_removexattr_locked` of Linux.
 fn remove(cx: &Cx<'_>, target: Target, name: Vec<u8>) -> SysResult {
-    let Some((inode, _)) = target else {
+    let Some((inode, at)) = target else {
         return Err(Errno::ENODATA);
     };
     rk_vfs::inode::check_fixed(&*inode)?;
@@ -171,6 +186,7 @@ fn remove(cx: &Cx<'_>, target: Target, name: Vec<u8>) -> SysResult {
     if is_acl(&name) {
         acl::remove(&cx.process().cred(), &*inode, &name)?;
     } else {
+        rk_vfs::security::inode_removexattr(&*inode, at.as_ref(), &name)?;
         inode.remove_xattr(&name)?;
     }
     rk_vfs::notify::xattr(None, &inode);

@@ -16951,7 +16951,7 @@ static void test_selinux(void)
 	static char want[512];
 	struct statfs sfs;
 	struct stat st;
-	unsigned long ino_w = 0, ino_e = 0, ino_n = 0, ino_d = 0;
+	unsigned long ino_w = 0, ino_e = 0, ino_n = 0, ino_d = 0, ino_f = 0;
 	int n, fd, len, efd, xfd, cfd;
 
 	n = klogctl(3, buf, sizeof(buf) - 1);
@@ -17070,6 +17070,23 @@ static void test_selinux(void)
 	if (mkdir("/tmp/rk-d", 0755) == 0 && stat("/tmp/rk-d", &st) == 0)
 		ino_d = st.st_ino;
 	check("selinux: a mkdir and an rmdir that the policy does not allow work in permissive mode", ino_d != 0 && rmdir("/tmp/rk-d") == 0);
+	/*
+	 * The label of a new file and the changes of security.selinux, as selinux_inode_init_security, selinux_inode_setxattr and
+	 * selinux_inode_post_setxattr of Linux. A new file gets the label of attr/fscreate, else the label of the type transition. A
+	 * change of the label needs relabelfrom and relabelto, and the change of the level needs the validatetrans rule.
+	 */
+	n = getxattr("/tmp/named", "security.selinux", buf, 256);
+	check("selinux: a new directory gets the label of the type_transition rule for its name", n == 27 && strcmp(buf, "system_u:object_r:bin_t:s0") == 0);
+	check("selinux: a write to attr/fscreate works", aa_write("/proc/self/attr/fscreate", "system_u:object_r:bin_t:s0", 26, 0) == 0);
+	fd = open("/tmp/rk-f", O_WRONLY | O_CREAT, 0644);
+	if (fd >= 0 && fstat(fd, &st) == 0)
+		ino_f = st.st_ino;
+	n = fd >= 0 && close(fd) == 0 ? getxattr("/tmp/rk-f", "security.selinux", buf, 256) : -1;
+	check("selinux: a new file gets the label of attr/fscreate", n == 27 && strcmp(buf, "system_u:object_r:bin_t:s0") == 0);
+	aa_write("/proc/self/attr/fscreate", "\n", 1, 0);
+	n = setxattr("/tmp/rk-f", "security.selinux", "system_u:object_r:etc_t:s1", 27, 0) == 0 ? getxattr("/tmp/rk-f", "security.selinux", buf, 256) : -1;
+	check("selinux: a setxattr of security.selinux changes the label in permissive mode", n == 27 && strcmp(buf, "system_u:object_r:etc_t:s1") == 0);
+	check("selinux: a removexattr of security.selinux gives EACCES", removexattr("/tmp/rk-f", "security.selinux") < 0 && errno == EACCES);
 	n = aa_run_at("/tmp/rk-sub", init, sub, buf, 256);
 	check("selinux: an exec after a write to attr/exec runs with the new context", n == (int)sizeof(init) && strcmp(buf, init) == 0);
 	n = aa_run_at("/tmp/rk-sub", NULL, sub, buf, 256);
@@ -17136,7 +17153,16 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the denial of the unlink", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "avc:  denied  { rmdir } for  pid=1 comm=\"init\" name=\"rk-d\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=dir permissive=1", ino_d, kernel);
 	check("selinux: the kernel log has the denial of the rmdir", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { relabelfrom } for  pid=1 comm=\"init\" name=\"rk-f\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:bin_t:s0 tclass=file permissive=1", ino_f, kernel);
+	check("selinux: the kernel log has the denial of relabelfrom", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { relabelto } for  pid=1 comm=\"init\" name=\"rk-f\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:etc_t:s1 tclass=file permissive=1", ino_f, kernel);
+	check("selinux: the kernel log has the denial of relabelto", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "op=security_validate_transition seresult=denied oldcontext=system_u:object_r:bin_t:s0 newcontext=system_u:object_r:etc_t:s1 taskcontext=%s tclass=file", kernel);
+	check("selinux: the kernel log has the denial of the validatetrans rule", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { associate } for  pid=1 comm=\"init\" name=\"rk-f\" dev=\"tmpfs\" ino=%lu scontext=system_u:object_r:etc_t:s1 tcontext=system_u:object_r:tmpfs_t:s0 tclass=filesystem permissive=1", ino_f);
+	check("selinux: the kernel log has the denial of the associate of the new label", strstr(buf, want) != NULL);
 	unlink("/tmp/rk-aa-w");
+	unlink("/tmp/rk-f");
 	unlink("/tmp/rk-sub");
 	umount("/tmp");
 	umount("/proc");
