@@ -464,7 +464,7 @@ pub(crate) fn route_mc(dst: Addr, oif: u32, src: Addr) -> Result<route::Next> {
     } else {
         src
     };
-    Ok(route::Next { ifindex: oif, hop: dst, src, local: false, broadcast: false })
+    Ok(route::Next { ifindex: oif, hop: dst, via6: None, src, local: false, broadcast: false })
 }
 
 /// Removes the neighbours and the proxy entries of an interface, as `arp_ifdown` of Linux.
@@ -935,6 +935,11 @@ pub(crate) fn xmit(dev: &NetDevice, next: &route::Next, mut buf: NetBuf) -> Resu
     if matches!(dev.kind(), LinkKind::Loopback | LinkKind::Tun | LinkKind::Line { .. }) {
         ether(MacAddr::ZERO).push(&mut buf);
         return dev.transmit(buf);
+    }
+    // A route through an IPv6 gateway takes the link address of the gateway from the
+    // neighbours of IPv6, as `ip_neigh_gw6` of Linux.
+    if let Some(gw) = next.via6 {
+        return crate::stack6::transmit_v4(dev, &gw, buf);
     }
     let dst = Header::parse_loose(buf.data()).map_or(next.hop, |h| h.dst);
     if next.broadcast || dst == ipv4::BROADCAST {

@@ -12,10 +12,9 @@
 //! device or `RTA_MULTIPATH`.
 //!
 //! The limits: a packet through a group takes the first path, without a hash. Resilient
-//! groups, encapsulations and IPv4 routes through an IPv6 nexthop give `EOPNOTSUPP`. The
-//! packet counts of a group are 0. A loss of the carrier does not remove the nexthops of the
-//! device. A dump with `NHA_MASTER` gives no nexthops, because the kernel has no master
-//! devices.
+//! groups and encapsulations give `EOPNOTSUPP`. The packet counts of a group are 0. A loss of
+//! the carrier does not remove the nexthops of the device. A dump with `NHA_MASTER` gives no
+//! nexthops, because the kernel has no master devices.
 //!
 //! The lock of the nexthops comes after the lock of the IPv4 or the IPv6 routes. A function
 //! that holds the lock of the nexthops never takes the lock of the routes.
@@ -370,7 +369,7 @@ pub(crate) fn put_multipath(b: &mut Builder, paths: &[Path], family: u32) {
 
 /// Adds the gateway and the device of one path, as `fib_nexthop_info` of Linux.
 pub(crate) fn put_path(b: &mut Builder, p: &Path, family: u32) {
-    use rk_abi::native::rtnetlink::{RTA_GATEWAY, RTA_OIF, RTA_VIA};
+    use rk_abi::native::rtnetlink::{RTA_GATEWAY, RTA_OIF};
     match p.gateway {
         Gateway::None => {}
         Gateway::V4(a) => {
@@ -379,15 +378,18 @@ pub(crate) fn put_path(b: &mut Builder, p: &Path, family: u32) {
         Gateway::V6(a) if family == AF_INET6 => {
             b.put(RTA_GATEWAY as u16, &a);
         }
-        Gateway::V6(a) => {
-            let mut via = Vec::from((AF_INET6 as u16).to_ne_bytes());
-            via.extend_from_slice(&a);
-            b.put(RTA_VIA as u16, &via);
-        }
+        Gateway::V6(a) => put_via6(b, &a),
     }
     if p.ifindex != 0 {
         b.u32(RTA_OIF as u16, p.ifindex);
     }
+}
+
+/// Adds the IPv6 gateway of an IPv4 route as an `RTA_VIA` with the family `AF_INET6`.
+pub(crate) fn put_via6(b: &mut Builder, gw: &Ip) {
+    let mut via = Vec::from((AF_INET6 as u16).to_ne_bytes());
+    via.extend_from_slice(gw);
+    b.put(rk_abi::native::rtnetlink::RTA_VIA as u16, &via);
 }
 
 /// Adds an attribute without a builder.
@@ -405,6 +407,10 @@ fn apply4(t: &Table, r: &mut Route) -> Option<()> {
     let i = t.first(nh)?;
     r.gateway = match i.gateway {
         Gateway::V4(a) => Some(a),
+        _ => None,
+    };
+    r.via6 = match i.gateway {
+        Gateway::V6(a) => Some(a),
         _ => None,
     };
     r.ifindex = i.ifindex;
@@ -507,19 +513,14 @@ fn check_nexthop6(t: &Table, nh: &Nexthop) -> core::result::Result<(), &'static 
 ///
 /// # Errors
 ///
-/// Gives `EINVAL` with the message of Linux for a nexthop that the route can not use, and
-/// `EOPNOTSUPP` for an IPv6 gateway.
+/// Gives `EINVAL` with the message of Linux for a nexthop that the route can not use. An IPv6
+/// gateway is good: the route goes through it, as a route with an `RTA_VIA`.
 pub(crate) fn check_route4(req: &Request<'_>, r: &mut Route) -> Result<()> {
     let t = NEXTHOPS.lock();
     let nh =
         t.map.get(&r.nhid).ok_or_else(|| req.error("Nexthop id does not exist", Errno::EINVAL))?;
     if !rejects(r.kind) {
         check_nexthop4(&t, nh, r.scope).map_err(|m| req.error(m, Errno::EINVAL))?;
-    }
-    if t.paths(nh).iter().any(|p| matches!(p.gateway, Gateway::V6(_))) {
-        return Err(
-            req.error("IPv4 routes through IPv6 gateways are not supported", Errno::EOPNOTSUPP)
-        );
     }
     apply4(&t, r);
     Ok(())

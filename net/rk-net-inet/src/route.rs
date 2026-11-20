@@ -10,6 +10,7 @@
 //! longer prefix first, then by the type of service and the priority. A lookup looks in the
 //! table `local` and then in the table `main`, as the default rules of Linux.
 
+use crate::ip::Ip;
 use crate::ipv4::{self, Addr};
 use crate::rules::{Flow, Rules, Step};
 use alloc::string::String;
@@ -165,6 +166,9 @@ pub struct Route {
     pub prefsrc: Option<Addr>,
     /// The gateway, or `None` for a subnet on the link.
     pub gateway: Option<Addr>,
+    /// The IPv6 gateway of a route through an IPv6 gateway, the `RTA_VIA` of Linux 5.2. A
+    /// route has a gateway or an IPv6 gateway, not the two.
+    pub via6: Option<Ip>,
     /// The interface index, or 0 for a route without a device.
     pub ifindex: u32,
     /// The flags of the next hop, `RTNH_F_*`.
@@ -194,6 +198,7 @@ impl Route {
             protocol: RTPROT_BOOT as u8,
             prefsrc: None,
             gateway,
+            via6: None,
             ifindex,
             flags: 0,
             metrics: [0; RTAX_MAX as usize],
@@ -247,6 +252,8 @@ pub struct Match {
     pub prefsrc: Option<Addr>,
     /// The gateway.
     pub gateway: Option<Addr>,
+    /// The IPv6 gateway.
+    pub via6: Option<Ip>,
     /// The interface.
     pub ifindex: Option<u32>,
     /// The priority.
@@ -267,13 +274,17 @@ impl Match {
             && opt(self.protocol, r.protocol)
             && (self.prefsrc.is_none() || self.prefsrc == r.prefsrc)
             && (self.gateway.is_none() || self.gateway == r.gateway)
+            && (self.via6.is_none() || self.via6 == r.via6)
             && self.ifindex.is_none_or(|i| i == r.ifindex)
             && self.priority.is_none_or(|p| p == r.priority)
             // A route through a nexthop object matches its ID, or a request without a next
             // hop, as `fib_nh_match` of Linux.
             && match self.nhid {
                 Some(id) => r.nhid == id,
-                None => r.nhid == 0 || (self.gateway.is_none() && self.ifindex.is_none()),
+                None => {
+                    r.nhid == 0
+                        || (self.gateway.is_none() && self.via6.is_none() && self.ifindex.is_none())
+                }
             }
     }
 }
@@ -285,6 +296,9 @@ pub struct Next {
     pub ifindex: u32,
     /// The address of the next hop: the gateway or the destination.
     pub hop: Addr,
+    /// The IPv6 gateway of a route through an IPv6 gateway. The packet then goes to the link
+    /// address of this neighbour of IPv6, and `hop` is the destination.
+    pub via6: Option<Ip>,
     /// The source address for a packet on this route.
     pub src: Addr,
     /// Tells if the destination is a local address.
@@ -514,6 +528,7 @@ impl Table {
                 protocol: RTPROT_KERNEL as u8,
                 prefsrc: Some(prim),
                 gateway: None,
+                via6: None,
                 ifindex: link.ifindex,
                 flags: 0,
                 metrics: [0; RTAX_MAX as usize],
@@ -843,7 +858,7 @@ impl Table {
     /// not a unicast or local address.
     pub fn check_nexthop(&self, r: &Route, up: impl Fn(u32) -> Option<bool>) -> Result<u32> {
         if r.scope == RT_SCOPE_HOST as u8 {
-            if r.gateway.is_some() {
+            if r.gateway.is_some() || r.via6.is_some() {
                 return Err(Errno::EINVAL);
             }
             up(r.ifindex).ok_or(Errno::ENODEV)?;
@@ -935,7 +950,8 @@ impl Table {
                 });
             }
             let src = self.select_addr(oif, ipv4::ANY, RT_SCOPE_LINK as u8).unwrap_or(ipv4::ANY);
-            let next = Next { ifindex: oif, hop: dst, src, local: false, broadcast: false };
+            let next =
+                Next { ifindex: oif, hop: dst, via6: None, src, local: false, broadcast: false };
             return Ok((next, None));
         };
         if let Some(e) = r.error() {
@@ -945,7 +961,8 @@ impl Table {
         if kind == RTN_LOCAL {
             let ifindex = if self.loopback != 0 { self.loopback } else { r.ifindex };
             let src = r.prefsrc.unwrap_or(dst);
-            return Ok((Next { ifindex, hop: dst, src, local: true, broadcast: false }, Some(r)));
+            let next = Next { ifindex, hop: dst, via6: None, src, local: true, broadcast: false };
+            return Ok((next, Some(r)));
         }
         let hop = r.gateway.unwrap_or(dst);
         let src = match r.prefsrc {
@@ -957,7 +974,7 @@ impl Table {
             }
         };
         let broadcast = kind == RTN_BROADCAST || self.is_broadcast(dst);
-        Ok((Next { ifindex: r.ifindex, hop, src, local: false, broadcast }, Some(r)))
+        Ok((Next { ifindex: r.ifindex, hop, via6: r.via6, src, local: false, broadcast }, Some(r)))
     }
 
     /// Finds the route of a received packet to `dst`, as `ip_route_input_slow` of Linux. The
@@ -993,6 +1010,7 @@ impl Table {
         let next = Next {
             ifindex: r.ifindex,
             hop: r.gateway.unwrap_or(dst),
+            via6: r.via6,
             src: r.prefsrc.unwrap_or(ipv4::ANY),
             local: kind == RTN_LOCAL,
             broadcast: kind == RTN_BROADCAST || self.is_broadcast(dst),

@@ -89,9 +89,11 @@ These tests do not pass on Linux either. rukernel gives the same result for each
 
 - NetworkdDHCPClientTests: test_dhcp_client_ipv4_dbus_status fails. test_dhcp_client_vrf is xfail.
 - NetworkdNetDevTests: test_macsec, test_nlmon and test_vxlan give an error. test_bareudp, test_batadv, test_vcan, test_vxcan and test_vrf are xfail. The three test_rps_cpu tests are skipped.
-- NetworkdNetworkTests: test_nexthop gives an error. On Linux, `ip -0 nexthop list id 21` exits with 2. On rukernel, it stops before that, at the first wait_online, because networkd says "IPv4 routes through IPv6 gateways are not supported" (RTA_VIA, see "Exceptions"). Before #809, networkd failed veth99 earlier, with "No route to host" for the nexthop with ID 2. test_prefix_route and test_route_vrf are xfail.
+- NetworkdNetworkTests: test_prefix_route and test_route_vrf are xfail.
 - NetworkdRATests: test_ndisc_mtu and test_ndisc_redirect fail.
 - NetworkdSRIOVTests and NetworkdL2TPTests: all xfail.
+
+test_nexthop gives an error on Linux, because `ip -0 nexthop list id 21` exits with 2. On rukernel it gave an error too, but for another cause: networkd stopped at the first wait_online with "IPv4 routes through IPv6 gateways are not supported". Before #809, networkd failed veth99 earlier, with "No route to host" for the nexthop with ID 2. With RTA_VIA (see "The kernel fixes"), test_nexthop passes on rukernel.
 
 The tests that pass on Linux and not on rukernel are in "Exceptions".
 
@@ -121,6 +123,7 @@ These pull requests of #538 fixed the kernel for these tests:
 - #806: `getsockopt` of IP_PKTOPTIONS and IPV6_2292PKTOPTIONS on a TCP socket. systemd-resolved closed each TCP connection to its stub resolver without them, so `dig +tcp` and `dig AXFR` got "connection reset" and TEST-75 stopped at testcase_08_resolved on rukernel 0.5.36 at 557e553.
 - #808: IFLA_INET6_ADDR_GEN_MODE in RTM_SETLINK and the AF_INET6 attributes in IFLA_AF_SPEC of each link. A device with addr_gen_mode 1 (none) gets no link local address. With this, test_link_local_addressing_ipv6ll passes.
 - #809: the IPv6 gateway of a new nexthop or route is on the link while each address of the interface is tentative. Before, networkd got "No route to host" for the nexthop `id 2 via 2001:1234:5:8f63::2 dev veth99` in test_nexthop.
+- RTA_VIA: an IPv4 route or nexthop through an IPv6 gateway, as Linux 5.2 and later. With this, test_route_via_ipv6 and test_nexthop pass on rukernel (the run of NetworkdNetworkTests on 2026-11-21 gave 31 passes of 42, and 29 before).
 
 ## Exceptions
 
@@ -137,7 +140,6 @@ These tests pass on Linux and do not pass on rukernel. Most of them need a devic
   - An IPv6 address with a peer address: test_address_static.
   - Proxy NDP entries: test_ipv6_proxy_ndp.
   - The files retrans_time_ms and base_reachable_time_ms in /proc/sys/net/ipv6/neigh/DEV: test_ipv6_neigh_retrans_time and test_ipv6_prefix_delegation.
-  - An IPv4 route through an IPv6 gateway (RTA_VIA): test_route_via_ipv6.
   - addr_gen_mode none: networkd sets IFLA_INET6_ADDR_GEN_MODE with RTM_SETLINK, and reads it from IFLA_AF_SPEC. rukernel did not take it, so with LinkLocalAddressing=no the device still had an fe80 address, and test_link_local_addressing_ipv6ll did not get a new fe80 address after the change of its .network file. #808 came after this run, and with it test_link_local_addressing_ipv6ll passes. test_link_local_addressing also needs stable_secret and the mode stable privacy (IPv6StableSecretAddress), which rukernel does not have.
   - Temporary IPv6 addresses: test_dhcp6pd.
   - Multipath routes: test_route_static. It also uses gre devices.

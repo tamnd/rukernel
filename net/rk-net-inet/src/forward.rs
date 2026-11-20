@@ -192,7 +192,9 @@ fn redirect(dev: &NetDevice, h: &Header, next: &route::Next) -> bool {
     }
     let t = ROUTES.lock();
     // `__fib_validate_source` gives 1 when the route back to the sender has no gateway.
-    let onlink = t.lookup_input(h.src).is_ok_and(|(n, _)| n.ifindex == ifindex && n.hop == h.src);
+    let onlink = t
+        .lookup_input(h.src)
+        .is_ok_and(|(n, _)| n.ifindex == ifindex && n.hop == h.src && n.via6.is_none());
     if !onlink {
         return false;
     }

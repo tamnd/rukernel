@@ -460,6 +460,7 @@ fn rt_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<()> {
             protocol: None,
             prefsrc: r.prefsrc,
             gateway: r.gateway,
+            via6: None,
             ifindex: (r.ifindex != 0).then_some(r.ifindex),
             priority: (r.priority != 0).then_some(r.priority),
             nhid: None,
