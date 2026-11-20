@@ -6,7 +6,9 @@ use crate::consts::{
 use crate::{Message, NoPaths, Socket, dev};
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_abi::native::if_link::{IFLA_ADDRESS, IFLA_CARRIER, IFLA_IFNAME, IFLA_LINKINFO, IFLA_MTU};
+use rk_abi::native::if_link::{
+    IFLA_ADDRESS, IFLA_AF_SPEC, IFLA_CARRIER, IFLA_IFNAME, IFLA_LINKINFO, IFLA_MTU,
+};
 use rk_abi::native::netlink::{
     NETLINK_PKTINFO, NETLINK_ROUTE, NLM_F_ACK, NLM_F_CAPPED, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL,
     NLM_F_MULTI, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR,
@@ -336,6 +338,49 @@ fn setlink_changes_the_hardware_address_and_sends_a_new_link() {
     r.put(IFLA_ADDRESS as u16, &m);
     send(&s, r.finish());
     assert_eq!(ack_error(&s), i32::from(Errno::EOPNOTSUPP.get()));
+    dev::unregister(&d);
+}
+
+/// `IFLA_AF_SPEC` of `RTM_SETLINK` is checked before each change, as `validate_linkmsg` of
+/// Linux: a family that is not there gives `EAFNOSUPPORT`, a family without changes gives
+/// `EOPNOTSUPP`, and an error of the check of a family stops the whole change.
+#[test]
+fn setlink_checks_each_family_of_the_af_spec_first() {
+    fn fill(_: &dev::NetDevice, _: &mut Builder) -> bool {
+        false
+    }
+    fn check(_: &dev::NetDevice, data: &[u8]) -> crate::Result<()> {
+        if data == [1, 0, 0, 0] { Ok(()) } else { Err(Errno::EINVAL) }
+    }
+    fn set(_: &dev::NetDevice, _: &[u8]) -> crate::Result<()> {
+        Ok(())
+    }
+    let _serial = crate::TEST_DEVICES.lock();
+    let s = socket();
+    // Families that no part of the kernel has.
+    link::register_af(250, fill, None);
+    link::register_af(252, fill, Some((check, set)));
+    let d = crate::dummy::create(Some(b"afd0"), None).unwrap();
+    let req = |family: u16, data: &[u8]| {
+        let mut r = link_req(RTM_SETLINK, NLM_F_ACK, d.ifindex() as i32, 0, 0);
+        r.u32(IFLA_MTU as u16, 1400);
+        let spec = r.nest(IFLA_AF_SPEC as u16);
+        r.put(family, data);
+        r.end_nest(spec);
+        r.finish()
+    };
+    for (family, data, err) in [
+        (251, &[1, 0, 0, 0], Errno::EAFNOSUPPORT),
+        (250, &[1, 0, 0, 0], Errno::EOPNOTSUPP),
+        (252, &[2, 0, 0, 0], Errno::EINVAL),
+    ] {
+        send(&s, req(family, data));
+        assert_eq!(ack_error(&s), i32::from(err.get()));
+        assert_eq!(d.mtu(), 1500);
+    }
+    send(&s, req(252, &[1, 0, 0, 0]));
+    assert_eq!(ack_error(&s), 0);
+    assert_eq!(d.mtu(), 1400);
     dev::unregister(&d);
 }
 

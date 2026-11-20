@@ -6,7 +6,13 @@
 //! the device, the token and the mode of the address generator. The kernel keeps no IPv6
 //! counters for each device, thus the messages have no `IFLA_INET6_STATS` and no
 //! `IFLA_INET6_ICMP6STATS`. A token cannot be set, thus the token is always `::`.
+//!
+//! `IFLA_AF_SPEC` of each link has the same attributes for `AF_INET6`, as `inet6_fill_link_af`
+//! of Linux. `RTM_SETLINK` sets the mode of the address generator with
+//! `IFLA_INET6_ADDR_GEN_MODE` in it, as `inet6_set_link_af` of Linux. systemd-networkd sets the
+//! mode `IN6_ADDR_GEN_MODE_NONE` so that the kernel makes no link local address.
 
+use crate::addrconf::{ADDR_GEN_MODE_RANDOM, ADDR_GEN_MODE_STABLE_PRIVACY};
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::if_link::{
@@ -17,7 +23,7 @@ use rk_abi::native::rtnetlink::{RTM_GETLINK, RTM_NEWLINK};
 use rk_net::consts::{AF_INET6, IF_OPER_UNKNOWN, IF_OPER_UP};
 use rk_net::dev::{self, LinkKind, NetDevice};
 use rk_net::netlink::link::IFINFO_LEN;
-use rk_net::netlink::msg::Builder;
+use rk_net::netlink::msg::{Attrs, Builder};
 use rk_net::netlink::{self, Request};
 use rk_net::sysctl::{self, Family, Scope};
 use rk_vfs::inode::Result;
@@ -29,6 +35,7 @@ const IFLA_INET6_CONF: u16 = 2;
 const IFLA_INET6_CACHEINFO: u16 = 5;
 const IFLA_INET6_TOKEN: u16 = 7;
 const IFLA_INET6_ADDR_GEN_MODE: u16 = 8;
+const IFLA_INET6_MAX: u16 = 9;
 
 /// The modes of the address generator, `IN6_ADDR_GEN_MODE_*` of <linux/if_link.h>.
 const IN6_ADDR_GEN_MODE_EUI64: u8 = 0;
@@ -197,6 +204,51 @@ fn fill_attrs(d: &NetDevice, b: &mut Builder) {
     b.u8(IFLA_INET6_ADDR_GEN_MODE, addr_gen_mode(d));
 }
 
+/// Adds the attributes of IPv6 to `IFLA_AF_SPEC` of a link, as `inet6_fill_link_af` of Linux. A
+/// device without IPv6 has none.
+pub(crate) fn fill_link_af(d: &NetDevice, b: &mut Builder) -> bool {
+    if !has_ipv6(d) {
+        return false;
+    }
+    fill_attrs(d, b);
+    true
+}
+
+/// Checks the attributes of `AF_INET6` in `IFLA_AF_SPEC` of `RTM_SETLINK`, as
+/// `inet6_validate_link_af` of Linux. The request must have a token or a mode, and the mode must
+/// be one of Linux. `IN6_ADDR_GEN_MODE_STABLE_PRIVACY` needs `stable_secret`, which the kernel
+/// does not have. A token cannot be set, so it gives `EOPNOTSUPP`.
+pub(crate) fn check_link_af(d: &NetDevice, data: &[u8]) -> Result<()> {
+    if !has_ipv6(d) {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    let a = Attrs::parse(data, IFLA_INET6_MAX);
+    let mode = a.u8(u32::from(IFLA_INET6_ADDR_GEN_MODE))?;
+    let token = a.get(u32::from(IFLA_INET6_TOKEN));
+    if token.is_some_and(|t| t.len() > 16) {
+        return Err(Errno::ERANGE);
+    }
+    match (token, mode.map(i32::from)) {
+        (None, None) => Err(Errno::EINVAL),
+        (Some(_), _) => Err(Errno::EOPNOTSUPP),
+        (None, Some(m)) if m > ADDR_GEN_MODE_RANDOM || m == ADDR_GEN_MODE_STABLE_PRIVACY => {
+            Err(Errno::EINVAL)
+        }
+        (None, Some(_)) => Ok(()),
+    }
+}
+
+/// Applies the attributes of `AF_INET6` in `IFLA_AF_SPEC` after `check_link_af`, as
+/// `inet6_set_link_af` of Linux. It stores the mode and makes no address: the mode counts at the
+/// next time the device goes up.
+pub(crate) fn set_link_af(d: &NetDevice, data: &[u8]) -> Result<()> {
+    let a = Attrs::parse(data, IFLA_INET6_MAX);
+    if let Some(m) = a.u8(u32::from(IFLA_INET6_ADDR_GEN_MODE))? {
+        sysctl::store_conf(Family::Ipv6, Scope::Dev(d.ifindex()), "addr_gen_mode", i32::from(m))?;
+    }
+    Ok(())
+}
+
 /// Checks the request of a dump with the strict checks, as `inet6_valid_dump_ifinfo` of Linux:
 /// a whole `struct ifinfomsg` with only the family, and no attribute after it.
 fn check_dump(req: &Request<'_>) -> Result<()> {
@@ -228,13 +280,43 @@ fn dump(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rk_net::netlink::msg::Attrs;
 
     #[test]
     fn the_conf_has_each_value_of_linux() {
         // `DEVCONF_ACCEPT_RA_MIN_LFT` is the last one, 58.
         assert_eq!(DEVCONF.len(), 59);
         assert_eq!(DEVCONF[47].0, Some("addr_gen_mode"));
+    }
+
+    /// systemd-networkd sets the mode of the address generator with `RTM_SETLINK`, as
+    /// `inet6_validate_link_af` and `inet6_set_link_af` of Linux.
+    #[test]
+    fn a_link_takes_the_mode_of_the_address_generator() {
+        dev::init();
+        let d = rk_net::dummy::create(Some(b"agm1"), None).unwrap();
+        let attr = |ty: u16, data: &[u8]| {
+            let mut b = Builder::new(0, 0, 0, 0);
+            b.put(ty, data);
+            b.finish()[16..].to_vec()
+        };
+        let mode = |m: u8| attr(IFLA_INET6_ADDR_GEN_MODE, &[m]);
+        assert_eq!(check_link_af(&d, &[]), Err(Errno::EINVAL));
+        assert_eq!(check_link_af(&d, &attr(IFLA_INET6_FLAGS, &[0; 4])), Err(Errno::EINVAL));
+        assert_eq!(check_link_af(&d, &attr(IFLA_INET6_ADDR_GEN_MODE, &[])), Err(Errno::ERANGE));
+        assert_eq!(check_link_af(&d, &attr(IFLA_INET6_TOKEN, &[0; 16])), Err(Errno::EOPNOTSUPP));
+        assert_eq!(check_link_af(&d, &mode(2)), Err(Errno::EINVAL));
+        assert_eq!(check_link_af(&d, &mode(4)), Err(Errno::EINVAL));
+        for m in [0, 1, 3] {
+            assert_eq!(check_link_af(&d, &mode(m)), Ok(()));
+        }
+        set_link_af(&d, &mode(1)).unwrap();
+        assert_eq!(addr_gen_mode(&d), 1);
+        let mut b = Builder::new(0, 0, 0, 0);
+        assert!(fill_link_af(&d, &mut b));
+        let m = b.finish();
+        let info = Attrs::parse(&m[16..], IFLA_INET6_MAX);
+        assert_eq!(info.u8(u32::from(IFLA_INET6_ADDR_GEN_MODE)).unwrap(), Some(1));
+        dev::unregister(&d);
     }
 
     #[test]

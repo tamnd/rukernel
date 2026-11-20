@@ -415,6 +415,19 @@ pub fn set_conf(f: Family, scope: Scope, name: &str, v: i32) -> Result<()> {
     Ok(())
 }
 
+/// Stores a `conf` value of the current namespace with no hook, as the kernel sets a field of
+/// the configuration of a device: `IFLA_INET6_ADDR_GEN_MODE` of `RTM_SETLINK` sets
+/// `addr_gen_mode`, as `inet6_set_link_af` of Linux, and it makes no address.
+///
+/// # Errors
+///
+/// Gives `EINVAL` if no value has the name `name`.
+pub fn store_conf(f: Family, scope: Scope, name: &str, v: i32) -> Result<()> {
+    let at = f.params().iter().position(|p| p.name == name).ok_or(Errno::EINVAL)?;
+    TABLES.lock().conf(scope).values(f)[at] = v;
+    Ok(())
+}
+
 /// Tells if IPv6 is off on the device `ifindex`, `net.ipv6.conf.DEV.disable_ipv6`.
 pub fn ipv6_disabled(ifindex: u32) -> bool {
     conf(Family::Ipv6, Scope::Dev(ifindex), "disable_ipv6") != 0
@@ -709,6 +722,12 @@ pub fn write(path: &str, data: &[u8]) -> Result<()> {
                     return Err(Errno::EINVAL);
                 }
             }
+            // `IN6_ADDR_GEN_MODE_STABLE_PRIVACY` needs `stable_secret`, as
+            // `check_stable_privacy` of Linux. The kernel has no `stable_secret`, so a device
+            // cannot have that mode.
+            if let (Family::Ipv6, "addr_gen_mode", Scope::Dev(_), 2) = (f, param.name, scope, v) {
+                return Err(Errno::EINVAL);
+            }
             conf_write(f, scope, param.name, at, v);
             Ok(())
         }
@@ -751,19 +770,21 @@ fn forward_change(f: Family, v: i32) {
     }
 }
 
-/// Writes the value at `at` of `conf`. A write of `all` sets `forwarding` and `disable_ipv6` of
-/// each device too, as `addrconf_disable_ipv6` and `addrconf_fixup_forwarding` of Linux. The
-/// hooks run for each device that changes.
+/// Writes the value at `at` of `conf`. A write of `all` sets `forwarding`, `disable_ipv6` and
+/// `addr_gen_mode` of each device too, as `addrconf_disable_ipv6`, `addrconf_fixup_forwarding`
+/// and `addrconf_sysctl_addr_gen_mode` of Linux. The hooks run for each device that changes.
 fn conf_write(f: Family, scope: Scope, name: &'static str, at: usize, v: i32) {
     if scope == Scope::All && name == "forwarding" {
         return forward_change(f, v);
     }
-    let all_devs = scope == Scope::All && f == Family::Ipv6 && name == "disable_ipv6";
+    let all_devs = scope == Scope::All
+        && f == Family::Ipv6
+        && matches!(name, "disable_ipv6" | "addr_gen_mode");
     let mut changed = Vec::new();
     let devs = if all_devs { dev::devices() } else { Vec::new() };
     {
         let mut t = TABLES.lock();
-        t.conf(scope).values(f)[at] = v;
+        let old = core::mem::replace(&mut t.conf(scope).values(f)[at], v);
         if all_devs {
             t.conf(Scope::Default).values(f)[at] = v;
             for d in devs {
@@ -773,7 +794,7 @@ fn conf_write(f: Family, scope: Scope, name: &'static str, at: usize, v: i32) {
                     changed.push(Scope::Dev(i));
                 }
             }
-        } else {
+        } else if old != v || !matches!(scope, Scope::Dev(_)) {
             changed.push(scope);
         }
     }
@@ -868,6 +889,24 @@ mod tests {
         write("ipv6/conf/mtu6dummy0/mtu", b"1550").unwrap();
         d.set_mtu(1500).unwrap();
         assert_eq!(read("ipv6/conf/mtu6dummy0/mtu").unwrap(), b"1500\n");
+        dev::unregister(&d);
+    }
+
+    /// A device cannot have `IN6_ADDR_GEN_MODE_STABLE_PRIVACY` without `stable_secret`, as
+    /// `addrconf_sysctl_addr_gen_mode` of Linux. `default` has no device, so it takes the mode.
+    #[test]
+    fn a_device_takes_the_modes_of_the_address_generator() {
+        let _serial = crate::TEST_DEVICES.lock();
+        dev::init();
+        let d = crate::dummy::create(Some(b"agm6dummy0"), None).unwrap();
+        assert_eq!(write("ipv6/conf/agm6dummy0/addr_gen_mode", b"2"), Err(Errno::EINVAL));
+        assert_eq!(write("ipv6/conf/agm6dummy0/addr_gen_mode", b"4"), Err(Errno::EINVAL));
+        write("ipv6/conf/agm6dummy0/addr_gen_mode", b"1").unwrap();
+        assert_eq!(read("ipv6/conf/agm6dummy0/addr_gen_mode").unwrap(), b"1\n");
+        store_conf(Family::Ipv6, Scope::Dev(d.ifindex()), "addr_gen_mode", 3).unwrap();
+        assert_eq!(read("ipv6/conf/agm6dummy0/addr_gen_mode").unwrap(), b"3\n");
+        write("ipv6/conf/default/addr_gen_mode", b"2").unwrap();
+        write("ipv6/conf/default/addr_gen_mode", b"0").unwrap();
         dev::unregister(&d);
     }
 }

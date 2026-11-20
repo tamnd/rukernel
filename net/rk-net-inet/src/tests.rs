@@ -1237,6 +1237,33 @@ fn a_link_local_address_of_another_interface_is_reached_through_the_link() {
     assert!(t.lookup(&client, 4).unwrap().local);
 }
 
+/// systemd-networkd-tests.py test_link_local_addressing_ipv6ll: networkd sets
+/// `IN6_ADDR_GEN_MODE_NONE`, so the device gets no link local address when it goes up. A write
+/// of another mode to the file of the device makes the address, as
+/// `addrconf_sysctl_addr_gen_mode` of Linux.
+#[test]
+fn a_device_with_the_mode_none_has_no_link_local_address() {
+    use crate::addrconf::{event, sysctl_hook};
+    use rk_net::dev::Event;
+    use rk_net::sysctl::{Family, Scope};
+    rk_net::dev::init();
+    let mac = MacAddr([0x52, 0x54, 0, 0xa6, 0x0d, 0x01]);
+    let d = rk_net::dummy::create(Some(b"agm0"), Some(mac)).unwrap();
+    let i = d.ifindex();
+    let ll = crate::ipv6::link_local(crate::ipv6::eui64(mac));
+    let has_ll = || crate::stack6::ROUTES6.lock().addrs_of(i).any(|a| a.addr == ll);
+    rk_net::sysctl::write("ipv6/conf/agm0/addr_gen_mode", b"1").unwrap();
+    d.set_up(true);
+    event(&d, Event::Up);
+    assert!(!has_ll());
+    rk_net::sysctl::store_conf(Family::Ipv6, Scope::Dev(i), "addr_gen_mode", 0).unwrap();
+    sysctl_hook(Family::Ipv6, Scope::Dev(i), "addr_gen_mode", 0);
+    assert!(has_ll());
+    d.set_up(false);
+    event(&d, Event::Down);
+    rk_net::dev::unregister(&d);
+}
+
 #[test]
 fn ipv6_addresses_and_routes() {
     use crate::route6::{Addr6, Route6, Table6};
