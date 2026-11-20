@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- SELinux checks the operations on the names of the directories, as `may_create`, `may_link` and `may_rename` of hooks.c of Linux: a new file of `open`, `mkdir`, `mknod` or `symlink` needs `add_name` and `search` on the directory, `create` on the label of the new file, from the `type_transition` rule for its name or from `fscreate`, and `associate` with the file system. `link`, `unlink` and `rmdir` need `add_name` or `remove_name` and `link`, `unlink` or `rmdir`, and `rename` needs `remove_name`, `rename`, `reparent` for a directory that moves, and `add_name`. The new hooks `inode_create`, `inode_mkdir`, `inode_mknod`, `inode_symlink`, `inode_link`, `inode_unlink`, `inode_rmdir` and `inode_rename` come after the permission checks of the directories, as in Linux.
+
 ## [0.5.37] - 2026-11-20
 
 ### Added

@@ -8,7 +8,8 @@
 //! with its table of SIDs ([`sidtab`]), the text of the contexts ([`context`]), the classes of
 //! the kernel ([`classmap`]), the access vector cache ([`avc`]), the SIDs of the tasks with
 //! their change at an exec and their attributes in `/proc/PID/attr` ([`task`]), the labels of
-//! the files ([`inode`]), and the checks of the access to the files ([`file`]).
+//! the files ([`inode`]), and the checks of the access to the files ([`file`]) and of the
+//! operations on the names of the directories ([`namei`]).
 //!
 //! The module is active when the command line has `selinux=1`, when `lsm=` names it, or with
 //! `security=selinux`. With `selinux=0` it is not active. The module starts in permissive
@@ -29,6 +30,7 @@ pub mod context;
 pub mod ebitmap;
 pub mod file;
 pub mod inode;
+pub mod namei;
 pub mod policydb;
 pub mod selinuxfs;
 pub mod server;
@@ -36,6 +38,8 @@ pub mod services;
 pub mod sidtab;
 pub mod task;
 
+use crate::classmap::class;
+use crate::namei::Link;
 pub use crate::server::Policy;
 use alloc::format;
 use alloc::sync::Arc;
@@ -126,6 +130,45 @@ impl SecurityHooks for SeLinux {
 
     fn file_truncate(&self, f: &File) -> Result<()> {
         file::file_truncate(f)
+    }
+
+    fn inode_create(&self, dir: &Location, name: &[u8], _mode: u32) -> Result<()> {
+        namei::may_create(dir, name, class::FILE)
+    }
+
+    fn inode_mkdir(&self, dir: &Location, name: &[u8], _mode: u32) -> Result<()> {
+        namei::may_create(dir, name, class::DIR)
+    }
+
+    fn inode_mknod(&self, dir: &Location, name: &[u8], mode: u32, _dev: u64) -> Result<()> {
+        namei::may_create(dir, name, inode::mode_to_class(mode))
+    }
+
+    fn inode_symlink(&self, dir: &Location, name: &[u8], _target: &[u8]) -> Result<()> {
+        namei::may_create(dir, name, class::LNK_FILE)
+    }
+
+    fn inode_link(&self, old: &Location, dir: &Location, _name: &[u8]) -> Result<()> {
+        namei::may_link(dir, old, Link::Link)
+    }
+
+    fn inode_unlink(&self, dir: &Location, at: &Location) -> Result<()> {
+        namei::may_link(dir, at, Link::Unlink)
+    }
+
+    fn inode_rmdir(&self, dir: &Location, at: &Location) -> Result<()> {
+        namei::may_link(dir, at, Link::Rmdir)
+    }
+
+    fn inode_rename(
+        &self,
+        old_dir: &Location,
+        old: &Location,
+        new_dir: &Location,
+        name: &[u8],
+        new: Option<&Location>,
+    ) -> Result<()> {
+        namei::may_rename(old_dir, old, new_dir, name, new)
     }
 }
 

@@ -97,7 +97,7 @@ pub fn path_fields(at: &Location) -> impl FnOnce(&mut String) + '_ {
 /// The fields of the file `inode` at `at` in an AVC record, as `LSM_AUDIT_DATA_INODE` and
 /// `LSM_AUDIT_DATA_DENTRY` of Linux: ` name="sh" dev="vda" ino=12`. Without `at`, the record
 /// has only the inode number.
-fn inode_fields<'a>(
+pub(crate) fn inode_fields<'a>(
     inode: &'a dyn Inode,
     at: Option<&'a Location>,
 ) -> impl FnOnce(&mut String) + 'a {
