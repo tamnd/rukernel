@@ -239,6 +239,12 @@ pub mod process {
     pub const DYNTRANSITION: u32 = 1 << 23;
     /// `setcurrent`.
     pub const SETCURRENT: u32 = 1 << 24;
+    /// `execmem`.
+    pub const EXECMEM: u32 = 1 << 25;
+    /// `execstack`.
+    pub const EXECSTACK: u32 = 1 << 26;
+    /// `execheap`.
+    pub const EXECHEAP: u32 = 1 << 27;
     /// `setkeycreate`.
     pub const SETKEYCREATE: u32 = 1 << 28;
     /// `setsockcreate`.
@@ -276,6 +282,8 @@ pub mod file {
     pub const RELABELTO: u32 = 1 << 8;
     /// `append`.
     pub const APPEND: u32 = 1 << 9;
+    /// `map`.
+    pub const MAP: u32 = 1 << 10;
     /// `unlink`.
     pub const UNLINK: u32 = 1 << 11;
     /// `link`.
@@ -288,6 +296,8 @@ pub mod file {
     pub const AUDIT_ACCESS: u32 = 1 << 17;
     /// `open`.
     pub const OPEN: u32 = 1 << 18;
+    /// `execmod`.
+    pub const EXECMOD: u32 = 1 << 19;
     /// `execute_no_trans`.
     pub const EXECUTE_NO_TRANS: u32 = 1 << 26;
     /// `entrypoint`.
@@ -416,6 +426,9 @@ mod tests {
             ("noatsecure", process::NOATSECURE),
             ("dyntransition", process::DYNTRANSITION),
             ("setcurrent", process::SETCURRENT),
+            ("execmem", process::EXECMEM),
+            ("execstack", process::EXECSTACK),
+            ("execheap", process::EXECHEAP),
             ("setkeycreate", process::SETKEYCREATE),
             ("setsockcreate", process::SETSOCKCREATE),
         ] {
@@ -434,12 +447,14 @@ mod tests {
             ("relabelfrom", file::RELABELFROM),
             ("relabelto", file::RELABELTO),
             ("append", file::APPEND),
+            ("map", file::MAP),
             ("unlink", file::UNLINK),
             ("link", file::LINK),
             ("rename", file::RENAME),
             ("execute", file::EXECUTE),
             ("audit_access", file::AUDIT_ACCESS),
             ("open", file::OPEN),
+            ("execmod", file::EXECMOD),
         ] {
             assert_eq!(bit(class::FILE, perm), v, "{perm}");
             assert_eq!(bit(class::DIR, perm), v, "{perm}");
