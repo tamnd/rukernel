@@ -481,6 +481,10 @@ pub struct AddressSpace {
     /// The top of the `mmap` area, as `mmap_base` of Linux. It is [`MMAP_TOP`] less a random
     /// offset that `execve` sets.
     mmap_top: AtomicUsize,
+    /// The address where the next reclaim of anonymous memory looks first, as `swap_address` of
+    /// the mm of Linux 2.4. Each reclaim goes on from the page after the last page that it took,
+    /// so the pages at the start that cannot go are not looked at each time.
+    reclaim_at: AtomicUsize,
 }
 
 fn map_error(e: MapError) -> Errno {
@@ -611,6 +615,7 @@ impl AddressSpace {
             huge_resv: SpinLock::new(BTreeMap::new()),
             hiwater: AtomicUsize::new(0),
             mmap_top: AtomicUsize::new(MMAP_TOP),
+            reclaim_at: AtomicUsize::new(0),
         }
     }
 
@@ -1904,12 +1909,21 @@ impl AddressSpace {
     /// Writes up to `want` private anonymous pages of the space to a swap area and frees their
     /// frames, for the reclaim of a memory cgroup or of the system, as `shrink_folio_list` of
     /// Linux. The pages are the pages of [`AddressSpace::page_out`]. Gives the pages that the
-    /// reclaim looked at and the pages that went, for `pgscan_anon` and `pgsteal_anon`.
+    /// reclaim looked at and the pages that went, for `pgscan_anon` and `pgsteal_anon`. The
+    /// reclaim starts after the page where the last one stopped, and goes round to the start of
+    /// the space, as an LRU list of Linux puts a page that it looked at to the end.
     pub fn reclaim_anon(&self, want: usize) -> (usize, usize) {
         if want == 0 {
             return (0, 0);
         }
-        self.page_out_range(0, usize::MAX, want)
+        let at = self.reclaim_at.load(Ordering::Relaxed);
+        let (mut scanned, mut n, mut next) = self.page_out_range(at, usize::MAX, want);
+        if next.is_none() && at > 0 {
+            let (s, m, after) = self.page_out_range(0, at, want - n);
+            (scanned, n, next) = (scanned + s, n + m, after);
+        }
+        self.reclaim_at.store(next.unwrap_or(0), Ordering::Relaxed);
+        (scanned, n)
     }
 
     /// Reads back each page of the space that has a swap entry for which `of` gives `true`, and
@@ -1938,8 +1952,17 @@ impl AddressSpace {
     }
 
     /// Writes up to `want` pages of `start..end` to swap. See [`AddressSpace::page_out`]. Gives
-    /// the pages that it looked at and the pages that went.
-    fn page_out_range(&self, start: usize, end: usize, want: usize) -> (usize, usize) {
+    /// the pages that it looked at, the pages that went, and the page where it stopped before
+    /// the end of the range.
+    fn page_out_range(
+        &self,
+        start: usize,
+        end: usize,
+        want: usize,
+    ) -> (usize, usize, Option<usize>) {
+        if want == 0 {
+            return (0, 0, Some(start));
+        }
         let st = self.state.lock();
         let mut pages = Vec::new();
         for vma in st.vmas.iter().filter(|v| v.start < end && start < v.end) {
@@ -1953,16 +1976,18 @@ impl AddressSpace {
         drop(st);
         let (mut scanned, mut n) = (0, 0);
         for page in pages {
-            if n >= want {
-                break;
-            }
             scanned += 1;
             // A page that cannot go takes no swap entry.
             let Some(frame) = self.vm.swap_out_start(page) else { continue };
-            let Some(slot) = SwapSlot::alloc(self.memcg()) else { break };
+            let Some(slot) = SwapSlot::alloc(self.memcg()) else {
+                return (scanned, n, Some(page.get()));
+            };
             n += usize::from(self.swap_out(page, &frame, slot));
+            if n >= want {
+                return (scanned, n, Some(page.get() + PAGE_SIZE));
+            }
         }
-        (scanned, n)
+        (scanned, n, None)
     }
 
     /// Writes the page `frame` at `page`, which `swap_out_start` gave, to the swap entry `slot`,
