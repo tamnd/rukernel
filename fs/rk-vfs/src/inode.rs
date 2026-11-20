@@ -546,6 +546,19 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ESTALE)
     }
 
+    /// Gives the names of the path from this directory, the root of a mount, down to the inode
+    /// of the file handle, so that `open_by_handle_at` gives the file its path in the mount, as
+    /// `reconnect_path` of fs/exportfs/expfs.c of Linux does with `get_parent` and `get_name`.
+    /// The default gives `EOPNOTSUPP`: the file then has a path of its own under the root.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ESTALE` if the inode is not below this directory, and `EOPNOTSUPP` if the file
+    /// system cannot tell the path.
+    fn handle_path(&self, _ty: i32, _fid: &[u32]) -> Result<Vec<Vec<u8>>> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// The device of the file system, for a rename or a link across file systems.
     fn fs_id(&self) -> u64 {
         self.metadata().dev
@@ -608,6 +621,8 @@ pub mod fileid {
     pub const INO32_GEN: i32 = 1;
     /// The inode number and the generation of the file and of its parent directory.
     pub const INO32_GEN_PARENT: i32 = 2;
+    /// The 64-bit ID of a node of kernfs, as cgroup2: for a cgroup it is the ID of the cgroup.
+    pub const KERNFS: i32 = 0xfe;
     /// The handle does not fit in the buffer.
     pub const INVALID: i32 = 0xff;
 }

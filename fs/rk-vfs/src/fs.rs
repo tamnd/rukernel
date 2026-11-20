@@ -404,15 +404,30 @@ impl FsContext {
         if !self.cred.capable(cap::DAC_READ_SEARCH) {
             return Err(Errno::EPERM);
         }
+        let stale = |e| if e == Errno::ENOMEM { e } else { Errno::ESTALE };
         let root = at.mount.root();
-        let inode = root.inode().inode_by_handle(ty, fid).map_err(|e| match e {
-            Errno::ENOMEM => e,
-            _ => Errno::ESTALE,
-        })?;
-        let dentry = if inode.metadata().ino == root.inode().metadata().ino {
-            root.clone()
-        } else {
-            root.tmp_child(inode, false)
+        let top = root.inode();
+        let inode = top.inode_by_handle(ty, fid).map_err(stale)?;
+        let ino = inode.metadata().ino;
+        if ino == top.metadata().ino {
+            return Ok(Location { mount: at.mount.clone(), dentry: root.clone() });
+        }
+        // The dentry has the path of the inode in the mount of `mount_fd`, as `reconnect_path`
+        // of Linux gives it, so that `/proc/self/fd` shows it. A file system that cannot tell
+        // the path gives the file a name of its own under the root.
+        let dentry = match top.handle_path(ty, fid) {
+            Ok(names) => {
+                let mut d = root.clone();
+                for name in &names {
+                    d = d.lookup(name).map_err(stale)?;
+                }
+                if d.inode().metadata().ino != ino {
+                    return Err(Errno::ESTALE);
+                }
+                d
+            }
+            Err(Errno::EOPNOTSUPP) => root.tmp_child(inode, false),
+            Err(e) => return Err(stale(e)),
         };
         Ok(Location { mount: at.mount.clone(), dentry })
     }

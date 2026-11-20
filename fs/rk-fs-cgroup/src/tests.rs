@@ -155,3 +155,65 @@ fn a_cgroup_keeps_user_and_trusted_xattrs() {
     assert_eq!(dir.list_xattr().unwrap(), Vec::<Vec<u8>>::new());
     root.rmdir(b"fs-x").unwrap();
 }
+
+#[test]
+fn the_handle_of_a_cgroup_is_its_id_and_a_removed_cgroup_gives_estale() {
+    let root = root();
+    let dir = root.create(b"fs-fh", FileType::Directory, 0o755, 0).unwrap();
+    let id = cgroup_of(&dir).unwrap();
+    let id64 = |words: &[u32]| u64::from(words[1]) << 32 | u64::from(words[0]);
+    // The handle has the ID that `PIDFD_GET_INFO` and bpf give for the cgroup, which is the
+    // inode number of its directory, as Linux.
+    let (ty, words) = dir.file_handle().unwrap();
+    assert_eq!((ty, words.len()), (fileid::KERNFS, 2));
+    assert_eq!(id64(&words), cgroup_ino(id));
+    assert_eq!(id64(&words), dir.metadata().ino);
+    let found = root.inode_by_handle(ty, &words).unwrap();
+    assert_eq!(cgroup_of(&found), Some(id));
+    // A file of the cgroup has a handle of its own.
+    let procs = dir.lookup(b"cgroup.procs").unwrap();
+    let (fty, fwords) = procs.file_handle().unwrap();
+    assert_eq!(id64(&fwords), procs.metadata().ino);
+    assert_eq!(root.inode_by_handle(fty, &fwords).unwrap().metadata().ino, procs.metadata().ino);
+    assert_eq!(root.inode_by_handle(fileid::INO32_GEN, &words).err(), Some(Errno::ESTALE));
+    root.rmdir(b"fs-fh").unwrap();
+    assert_eq!(root.inode_by_handle(ty, &words).err(), Some(Errno::ESTALE));
+    assert_eq!(root.inode_by_handle(fty, &fwords).err(), Some(Errno::ESTALE));
+    assert_eq!(root.inode_by_handle(ty, &[u32::MAX, u32::MAX]).err(), Some(Errno::ESTALE));
+}
+
+#[test]
+fn a_handle_opens_the_cgroup_at_its_path_in_the_mount_of_mount_fd() {
+    use rk_vfs::{FsContext, MountNamespace, MountSource};
+    let fs = FsContext::new(MountNamespace::new(rk_fs_tmpfs::new(0o755)));
+    let top = fs.root().clone();
+    for dir in [&b"/sys"[..], b"/sys/fs", b"/sys/fs/cgroup", b"/b"] {
+        fs.mkdir(&top, dir, 0o755).unwrap();
+    }
+    let source = MountSource { source: b"cgroup2".to_vec(), fstype: "cgroup2", flags: 0 };
+    fs.mount(root(), &top, b"/sys/fs/cgroup", source).unwrap();
+    let mnt = fs.resolve(&top, b"/sys/fs/cgroup", true).unwrap();
+    fs.mkdir(&top, b"/sys/fs/cgroup/fs-p", 0o755).unwrap();
+    let q = fs.mkdir(&top, b"/sys/fs/cgroup/fs-p/q", 0o755).unwrap();
+    let (ty, fid) = q.inode().file_handle().unwrap();
+    let procs = fs.resolve(&top, b"/sys/fs/cgroup/fs-p/q/cgroup.procs", true).unwrap();
+    let (fty, ffid) = procs.inode().file_handle().unwrap();
+    // The file has its path in the mount of `mount_fd`, which `/proc/self/fd` shows, as Linux.
+    // Any file of the mount can be `mount_fd`.
+    let at = fs.handle_location(&mnt, ty, &fid).unwrap();
+    assert_eq!(at.absolute_path(), b"/sys/fs/cgroup/fs-p/q");
+    assert!(at.same(&q));
+    let at = fs.handle_location(&q, fty, &ffid).unwrap();
+    assert_eq!(at.absolute_path(), b"/sys/fs/cgroup/fs-p/q/cgroup.procs");
+    assert!(fs.open_at(at, rk_abi::native::open::O_RDONLY).is_ok());
+    // In a bind mount of `fs-p`, the path is in that mount, and a cgroup outside it is stale.
+    let p = fs.resolve(&top, b"/sys/fs/cgroup/fs-p", true).unwrap();
+    fs.namespace().bind(&p, &fs.resolve(&top, b"/b", true).unwrap()).unwrap();
+    let b = fs.resolve(&top, b"/b", true).unwrap();
+    assert_eq!(fs.handle_location(&b, ty, &fid).unwrap().absolute_path(), b"/b/q");
+    let (rty, rfid) = mnt.inode().file_handle().unwrap();
+    assert_eq!(fs.handle_location(&b, rty, &rfid).err(), Some(Errno::ESTALE));
+    fs.remove(&top, b"/sys/fs/cgroup/fs-p/q", true).unwrap();
+    assert_eq!(fs.handle_location(&mnt, ty, &fid).err(), Some(Errno::ESTALE));
+    fs.remove(&top, b"/sys/fs/cgroup/fs-p", true).unwrap();
+}
