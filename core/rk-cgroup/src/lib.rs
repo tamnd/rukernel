@@ -2612,8 +2612,10 @@ pub fn count_reclaim(id: CgId, who: Reclaimer, anon: bool, scanned: u64, stolen:
 /// Takes back memory from `id` and each cgroup above it whose use is over `memory.high`, as
 /// `reclaim_high` of Linux. Each of these cgroups gives the bytes that the subtree charged over
 /// the limit, and at least `RECLAIM_BATCH`. The return to user mode calls this before
-/// [`high_delay`], so the wait is for the use that the reclaim leaves.
-pub fn reclaim_high(id: CgId) {
+/// [`high_delay`], so the wait is for the use that the reclaim leaves. The reclaim counts as a
+/// memory stall of the cgroup `stall` of the thread in the pressure, as `psi_memstall_enter` of
+/// Linux around the reclaim.
+pub fn reclaim_high(id: CgId, stall: CgId) {
     if id == 0 || !shared().any_over_high.load(Ordering::Relaxed) {
         return;
     }
@@ -2630,9 +2632,15 @@ pub fn reclaim_high(id: CgId) {
             .collect();
         (over, Changed::default())
     });
-    for (cg, bytes) in over.unwrap_or_default() {
+    let over = over.unwrap_or_default();
+    if over.is_empty() {
+        return;
+    }
+    psi_change(stall, |c| c.memstall += 1);
+    for (cg, bytes) in over {
         reclaim_swap(cg, bytes);
     }
+    psi_change(stall, |c| c.memstall = c.memstall.saturating_sub(1));
 }
 
 /// Charges a page of memory to `id`. A charge past a `memory.max` first takes back page cache

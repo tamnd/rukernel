@@ -72,6 +72,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
+- The reclaim of a thread for `memory.high`, for `memory.max` and for a system that is short of memory now counts as a memory stall in the pressure (PSI) of its cgroup, as `psi_memstall_enter` of Linux around a reclaim. Before, only the wait after the reclaim counted, so the pressure stayed low while a cgroup did a lot of reclaim, and systemd-oomd did not kill it. TEST-55-OOMD of systemd needs this. (#752)
 - tools/systemd/integration.py: a `--match-subtest` or `--match-testcase` pattern with a backslash, a quote or a percent sign now works. systemd reads C escapes and specifiers in `Environment=`, and it did not apply the pattern `\.(a|b)\.sh$`, so the test ran all subtests. A test that made /testok and then stopped with SIGTERM in the stop of the system after `systemctl --no-block exit 123` now passes. tools/systemd/integration.md has the new runs of TEST-07-PID1 and TEST-19-CGROUP, and TEST-55-OOMD waits for #752 (#536).
 - `BPF_LINK_CREATE`, `BPF_PROG_ATTACH`, `BPF_PROG_DETACH` and `BPF_PROG_QUERY` take an `O_PATH` descriptor of a cgroup, as `cgroup_v1v2_get_from_fd` of Linux. systemd opens the cgroup with `O_PATH` for `RestrictNetworkInterfaces=`, and the attach gave `EBADF` (#762).
 - A program of `BPF_PROG_TYPE_CGROUP_SKB` reads the device of the packet in `ifindex` of `struct __sk_buff`, and a packet that comes in also has it in `ingress_ifindex`, as Linux. Before, both were 0, so `RestrictNetworkInterfaces=` of systemd dropped each packet (#762).
