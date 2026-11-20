@@ -21,7 +21,7 @@ use rk_abi::native::netlink::{NLM_F_APPEND, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPL
 use rk_abi::native::rtnetlink::{
     RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL,
     RT_TABLE_MAIN, RTN_BLACKHOLE, RTN_BROADCAST, RTN_LOCAL, RTN_PROHIBIT, RTN_THROW, RTN_UNICAST,
-    RTN_UNREACHABLE, RTNH_F_ONLINK, RTPROT_BOOT, RTPROT_KERNEL,
+    RTN_UNREACHABLE, RTNH_F_DEAD, RTNH_F_LINKDOWN, RTNH_F_ONLINK, RTPROT_BOOT, RTPROT_KERNEL,
 };
 use rk_vfs::inode::Result;
 
@@ -52,6 +52,86 @@ pub const RTAX_FEATURE_MASK: u32 = 0x1f;
 /// The metrics of a route, as `fib_metrics` of Linux: the value of `RTAX_n` is at `n - 1`, and
 /// 0 means no value.
 pub type Metrics = [u32; RTAX_MAX as usize];
+
+/// The gateway of a path of a route or of a nexthop object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gateway {
+    /// No gateway: the destination is on the link.
+    None,
+    /// An IPv4 gateway.
+    V4(Addr),
+    /// An IPv6 gateway.
+    V6(Ip),
+}
+
+impl Gateway {
+    /// The gateway of a route with the IPv4 gateway `gw` or the IPv6 gateway `via6`.
+    pub fn of(gw: Option<Addr>, via6: Option<Ip>) -> Self {
+        match (gw, via6) {
+            (Some(a), _) => Self::V4(a),
+            (None, Some(a)) => Self::V6(a),
+            (None, None) => Self::None,
+        }
+    }
+
+    /// The IPv4 gateway and the IPv6 gateway of a route with this gateway.
+    pub fn split(self) -> (Option<Addr>, Option<Ip>) {
+        match self {
+            Self::V4(a) => (Some(a), None),
+            Self::V6(a) => (None, Some(a)),
+            Self::None => (None, None),
+        }
+    }
+}
+
+/// A path of a multipath route or of a nexthop object, as `struct fib_nh` of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Path {
+    /// The gateway.
+    pub gateway: Gateway,
+    /// The interface.
+    pub ifindex: u32,
+    /// The flags `RTNH_F_*` of the path.
+    pub flags: u8,
+    /// The weight, from 1.
+    pub weight: u32,
+}
+
+/// The hash of a flow for the choice of a path of a multipath route, from the addresses and the
+/// IPv6 flow label, as the policy 0 of `fib_multipath_hash_policy` of Linux. A flow keeps its
+/// path, so its packets stay in order.
+pub fn flow_hash(fl: &Flow) -> u32 {
+    // FNV-1a, then the last mix of murmur3.
+    let mut h: u32 = 0x811c_9dc5;
+    let src = fl.src.unwrap_or([0; 16]);
+    for b in fl.dst.iter().chain(src.iter()).chain(fl.flowlabel.to_ne_bytes().iter()) {
+        h = (h ^ u32::from(*b)).wrapping_mul(0x0100_0193);
+    }
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^ (h >> 16)
+}
+
+/// The index of the path for the hash `hash` among paths with the weights `weights`, as
+/// `fib_select_multipath` of Linux: each path takes a part of the values of the hash that is
+/// as large as its weight.
+pub fn pick(hash: u32, weights: &[u32]) -> usize {
+    let total: u64 = weights.iter().map(|w| u64::from(*w)).sum();
+    if total == 0 {
+        return 0;
+    }
+    let at = (u64::from(hash) * total) >> 32;
+    let mut sum = 0;
+    for (i, w) in weights.iter().enumerate() {
+        sum += u64::from(*w);
+        if at < sum {
+            return i;
+        }
+    }
+    weights.len() - 1
+}
 
 /// An address of an interface, as `struct in_ifaddr` of Linux.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +261,10 @@ pub struct Route {
     /// Tells if the nexthop object of the route is a blackhole. The route then rejects its
     /// packets as a route of the type `blackhole`.
     pub blackhole: bool,
+    /// The paths of a multipath route of `RTA_MULTIPATH`, or nothing for a route with one
+    /// path. The gateway, the IPv6 gateway and the interface of the route are then a copy of
+    /// the first path, as the first `fib_nh` of Linux.
+    pub paths: Vec<Path>,
 }
 
 impl Route {
@@ -204,6 +288,7 @@ impl Route {
             metrics: [0; RTAX_MAX as usize],
             nhid: 0,
             blackhole: false,
+            paths: Vec::new(),
         }
     }
 
@@ -227,6 +312,57 @@ impl Route {
             _ if self.blackhole => Some(Errno::EINVAL),
             _ => None,
         }
+    }
+
+    /// The paths of the route: the paths of a multipath route, or the one path of the route.
+    pub fn all_paths(&self) -> Vec<Path> {
+        if !self.paths.is_empty() {
+            return self.paths.clone();
+        }
+        let gateway = Gateway::of(self.gateway, self.via6);
+        let flags = (self.flags & 0xff) as u8;
+        Vec::from([Path { gateway, ifindex: self.ifindex, flags, weight: 1 }])
+    }
+
+    /// Tells if a path of the route goes out of the interface `ifindex`, as
+    /// `fib_info_nh_uses_dev` of Linux.
+    pub fn uses_dev(&self, ifindex: u32) -> bool {
+        self.ifindex == ifindex || self.paths.iter().any(|p| p.ifindex == ifindex)
+    }
+
+    /// The interface, the gateway and the IPv6 gateway of the path of the flow `fl`. A
+    /// multipath route takes a path that is not dead: the path of the output interface of the
+    /// flow, or else the path of the hash of the flow, as `fib_select_path` of Linux.
+    fn path_of(&self, fl: &Flow) -> (u32, Option<Addr>, Option<Ip>) {
+        if self.paths.is_empty() {
+            return (self.ifindex, self.gateway, self.via6);
+        }
+        let alive: Vec<&Path> =
+            self.paths.iter().filter(|p| u32::from(p.flags) & RTNH_F_DEAD == 0).collect();
+        let p = if fl.oif != 0 {
+            alive.iter().find(|p| p.ifindex == fl.oif).copied()
+        } else if alive.is_empty() {
+            None
+        } else {
+            let weights: Vec<u32> = alive.iter().map(|p| p.weight).collect();
+            Some(alive[pick(flow_hash(fl), &weights)])
+        };
+        let p = p.unwrap_or(&self.paths[0]);
+        let (gateway, via6) = p.gateway.split();
+        (p.ifindex, gateway, via6)
+    }
+
+    /// Marks the paths of the interface `ifindex` as dead, as `fib_sync_down_dev` of Linux, and
+    /// tells if the route goes away: a route with one path on the interface, or a multipath
+    /// route with all of its paths dead.
+    fn dev_down(&mut self, ifindex: u32) -> bool {
+        if self.paths.is_empty() {
+            return self.ifindex == ifindex;
+        }
+        for p in self.paths.iter_mut().filter(|p| p.ifindex == ifindex) {
+            p.flags |= (RTNH_F_DEAD | RTNH_F_LINKDOWN) as u8;
+        }
+        self.paths.iter().all(|p| u32::from(p.flags) & RTNH_F_DEAD != 0)
     }
 }
 
@@ -260,9 +396,26 @@ pub struct Match {
     pub priority: Option<u32>,
     /// The nexthop object.
     pub nhid: Option<u32>,
+    /// The paths of `RTA_MULTIPATH`, or nothing. A path with the interface 0 or without a
+    /// gateway takes each value.
+    pub paths: Vec<Path>,
 }
 
 impl Match {
+    /// Tells if the paths of `RTA_MULTIPATH` match the paths of `r`, as `fib_nh_match` of
+    /// Linux: each path of the route needs a path of the request at the same place.
+    fn paths_match(&self, r: &Route) -> bool {
+        if self.paths.is_empty() {
+            return true;
+        }
+        let have = r.all_paths();
+        have.len() <= self.paths.len()
+            && have.iter().zip(&self.paths).all(|(h, w)| {
+                (w.ifindex == 0 || w.ifindex == h.ifindex)
+                    && (w.gateway == Gateway::None || w.gateway == h.gateway)
+            })
+    }
+
     fn matches(&self, r: &Route) -> bool {
         let opt = |want: Option<u8>, have: u8| want.is_none_or(|w| w == have);
         r.table == self.table
@@ -283,9 +436,18 @@ impl Match {
                 Some(id) => r.nhid == id,
                 None => {
                     r.nhid == 0
-                        || (self.gateway.is_none() && self.via6.is_none() && self.ifindex.is_none())
+                        || (self.gateway.is_none()
+                            && self.via6.is_none()
+                            && self.ifindex.is_none()
+                            && self.paths.is_empty())
                 }
             }
+            // A gateway or an interface of the request is for the first path, and then Linux
+            // does not look at `RTA_MULTIPATH`.
+            && (self.gateway.is_some()
+                || self.via6.is_some()
+                || self.ifindex.is_some()
+                || self.paths_match(r))
     }
 }
 
@@ -498,7 +660,9 @@ impl Table {
     /// objects go away with their nexthops.
     pub fn remove_iface(&mut self, ifindex: u32) {
         self.addrs.retain(|a| a.ifindex != ifindex);
-        self.routes.retain(|r| r.ifindex != ifindex || r.nhid != 0);
+        // A multipath route with a path on the interface goes away too, as the
+        // `NETDEV_UNREGISTER` case of `fib_sync_down_dev`.
+        self.routes.retain(|r| !r.uses_dev(ifindex) || r.nhid != 0);
     }
 
     /// The routes that the addresses of an interface need, as `fib_add_ifaddr` of Linux.
@@ -534,6 +698,7 @@ impl Table {
                 metrics: [0; RTAX_MAX as usize],
                 nhid: 0,
                 blackhole: false,
+                paths: Vec::new(),
             };
             out.push(magic(RTN_LOCAL, a.local, 32, 0));
             if !link.up {
@@ -571,11 +736,18 @@ impl Table {
         let locals: Vec<Addr> = self.addrs.iter().map(|a| a.local).collect();
         let mut i = 0;
         while i < self.routes.len() {
+            let r = &mut self.routes[i];
+            if link.up {
+                // The paths of the interface live again, as `fib_sync_up` of Linux.
+                for p in r.paths.iter_mut().filter(|p| p.ifindex == link.ifindex) {
+                    p.flags &= !((RTNH_F_DEAD | RTNH_F_LINKDOWN) as u8);
+                }
+            }
+            let flush = no_addrs && r.nhid == 0 && r.dev_down(link.ifindex);
             let r = &self.routes[i];
             let stale_kernel =
                 r.ifindex == link.ifindex && r.protocol == RTPROT_KERNEL as u8 && !want.contains(r);
             let stale_src = r.prefsrc.is_some_and(|s| !locals.contains(&s));
-            let flush = no_addrs && r.ifindex == link.ifindex && r.nhid == 0;
             if stale_kernel || stale_src || flush {
                 let r = self.routes.remove(i);
                 // Linux sends no notification for a flush of the routes of a device.
@@ -597,10 +769,11 @@ impl Table {
 
     /// Removes the routes of an interface that goes down, as `fib_sync_down_dev` of Linux
     /// without force: the routes with the scope `host` stay. Linux sends no notification. The
-    /// routes through nexthop objects go away with their nexthops.
+    /// routes through nexthop objects go away with their nexthops. A multipath route marks
+    /// the paths of the interface as dead, and goes away when all of its paths are dead.
     pub fn link_down(&mut self, ifindex: u32) {
         self.routes
-            .retain(|r| r.ifindex != ifindex || r.scope == RT_SCOPE_HOST as u8 || r.nhid != 0);
+            .retain_mut(|r| r.scope == RT_SCOPE_HOST as u8 || r.nhid != 0 || !r.dev_down(ifindex));
     }
 
     /// Changes the routes through nexthop objects. `f` gives `None` for a route that does not
@@ -755,7 +928,7 @@ impl Table {
         self.routes
             .iter()
             .filter(|r| r.table == table && ipv4::same_net(r.dst, dst, r.prefix))
-            .filter(|r| r.scope >= scope && (oif == 0 || r.ifindex == oif))
+            .filter(|r| r.scope >= scope && (oif == 0 || r.uses_dev(oif)))
             .min_by_key(|r| (32 - r.prefix, r.priority))
     }
 
@@ -964,17 +1137,18 @@ impl Table {
             let next = Next { ifindex, hop: dst, via6: None, src, local: true, broadcast: false };
             return Ok((next, Some(r)));
         }
-        let hop = r.gateway.unwrap_or(dst);
+        let (ifindex, gateway, via6) = r.path_of(fl);
+        let hop = gateway.unwrap_or(dst);
         let src = match r.prefsrc {
             Some(s) => s,
             None => {
                 // The address of the next hop, as `fib_info_update_nhc_saddr` of Linux.
-                self.select_addr(r.ifindex, r.gateway.unwrap_or(ipv4::ANY), r.scope)
+                self.select_addr(ifindex, gateway.unwrap_or(ipv4::ANY), r.scope)
                     .ok_or(Errno::ENETUNREACH)?
             }
         };
         let broadcast = kind == RTN_BROADCAST || self.is_broadcast(dst);
-        Ok((Next { ifindex: r.ifindex, hop, via6: r.via6, src, local: false, broadcast }, Some(r)))
+        Ok((Next { ifindex, hop, via6, src, local: false, broadcast }, Some(r)))
     }
 
     /// Finds the route of a received packet to `dst`, as `ip_route_input_slow` of Linux. The
@@ -1007,10 +1181,11 @@ impl Table {
             return Err(e);
         }
         let kind = u32::from(r.kind);
+        let (ifindex, gateway, via6) = r.path_of(fl);
         let next = Next {
-            ifindex: r.ifindex,
-            hop: r.gateway.unwrap_or(dst),
-            via6: r.via6,
+            ifindex,
+            hop: gateway.unwrap_or(dst),
+            via6,
             src: r.prefsrc.unwrap_or(ipv4::ANY),
             local: kind == RTN_LOCAL,
             broadcast: kind == RTN_BROADCAST || self.is_broadcast(dst),

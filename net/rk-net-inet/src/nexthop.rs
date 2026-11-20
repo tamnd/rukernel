@@ -22,9 +22,10 @@
 use crate::addrconf;
 use crate::fib;
 use crate::ip::{self, Ip};
-use crate::ipv4::{self, Addr};
+use crate::ipv4;
 use crate::ipv6;
 use crate::route::Route;
+pub(crate) use crate::route::{Gateway, Path};
 use crate::route6::Route6;
 use crate::stack::ROUTES;
 use crate::stack6::ROUTES6;
@@ -159,17 +160,6 @@ static DUMP_POLICY: [Policy; 15] = {
     p[NHA_OP_FLAGS as usize] = Policy::of(Pt::U32).check(Check::Mask(NHA_OP_FLAGS_DUMP_ALL));
     p
 };
-
-/// The gateway of a nexthop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Gateway {
-    /// No gateway: the destination is on the link.
-    None,
-    /// An IPv4 gateway.
-    V4(Addr),
-    /// An IPv6 gateway.
-    V6(Ip),
-}
 
 /// A nexthop that is not a group, as `struct nh_info` of Linux.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -312,17 +302,6 @@ impl Table {
 /// The nexthops of each namespace.
 pub(crate) static NEXTHOPS: PerNet<SpinLock<Table>> = PerNet::new(|| SpinLock::new(Table::new()));
 
-/// A path of a route through a nexthop, for the route messages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Path {
-    pub gateway: Gateway,
-    pub ifindex: u32,
-    /// The flags `RTNH_F_*` of the path.
-    pub flags: u8,
-    /// The weight, from 1.
-    pub weight: u32,
-}
-
 /// The nexthop of a route for its messages, as the compat mode of Linux.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Compat {
@@ -338,6 +317,47 @@ pub(crate) fn compat(id: u32) -> Option<Compat> {
     let t = NEXTHOPS.lock();
     let nh = t.map.get(&id)?;
     Some(Compat { blackhole: nh.is_blackhole(), group: nh.group().is_some(), paths: t.paths(nh) })
+}
+
+/// A path of an `RTA_MULTIPATH` attribute of a request: a `struct rtnexthop` and its
+/// attributes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Hop<'a> {
+    /// The flags `RTNH_F_*`.
+    pub flags: u8,
+    /// The weight less one, `rtnh_hops`.
+    pub hops: u8,
+    /// The interface, or 0.
+    pub ifindex: u32,
+    /// The attributes of the path.
+    pub attrs: &'a [u8],
+}
+
+impl Hop<'_> {
+    /// The attribute `ty` of the path, as `nla_find` of Linux.
+    pub fn get(&self, ty: u32) -> Option<&[u8]> {
+        rk_net::netlink::msg::attrs(self.attrs).find(|(t, _)| u32::from(*t) == ty).map(|(_, v)| v)
+    }
+}
+
+/// The paths of an `RTA_MULTIPATH` attribute, as `rtnh_ok` and `rtnh_next` of Linux. Tells
+/// too if the data after the last path is empty, as `fib_count_nexthops` of Linux wants.
+pub(crate) fn hops(mut b: &[u8]) -> (Vec<Hop<'_>>, bool) {
+    let mut out = Vec::new();
+    while b.len() >= 8 {
+        let len = usize::from(u16::from_ne_bytes([b[0], b[1]]));
+        if len < 8 || len > b.len() {
+            break;
+        }
+        out.push(Hop {
+            flags: b[2],
+            hops: b[3],
+            ifindex: u32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
+            attrs: &b[8..len],
+        });
+        b = &b[len.next_multiple_of(4).min(b.len())..];
+    }
+    (out, b.is_empty())
 }
 
 /// Adds the paths of a route as `RTA_MULTIPATH`, as `nexthop_mpath_fill_node` of Linux: a

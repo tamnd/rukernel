@@ -464,6 +464,7 @@ fn rt_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<()> {
             ifindex: (r.ifindex != 0).then_some(r.ifindex),
             priority: (r.priority != 0).then_some(r.priority),
             nhid: None,
+            paths: alloc::vec::Vec::new(),
         };
         return fib::del_route(&m, Origin::KERNEL);
     }

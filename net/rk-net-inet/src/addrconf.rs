@@ -27,7 +27,7 @@ use crate::ip::{self, Ip};
 use crate::ipv6;
 use crate::mcast6;
 use crate::nexthop;
-use crate::route::{INFINITY, RTAX_MAX};
+use crate::route::{Gateway, INFINITY, Path, RTAX_MAX};
 use crate::route6::{Addr6, Changes6, Match6, PRIO_USER, Route6};
 use crate::rules::Flow;
 use crate::stack;
@@ -135,8 +135,29 @@ pub(crate) fn is_prefix_route(r: &Route6) -> bool {
     r.addrconf && r.gateway.is_none()
 }
 
-/// Builds the message of a route, as `rt6_fill_node` of Linux.
-pub(crate) fn fill_route(r: &Route6, ty: u32, portid: u32, seq: u32, flags: u32) -> Vec<u8> {
+/// The path of a route of a multipath route.
+fn path6(r: &Route6) -> Path {
+    Path {
+        gateway: Gateway::of(None, r.gateway),
+        ifindex: r.ifindex,
+        flags: r.nh_flags,
+        weight: r.weight,
+    }
+}
+
+/// The paths of the route `r` and of its siblings, for `RTA_MULTIPATH`, or nothing if the
+/// route has no sibling.
+fn paths6(t: &crate::route6::Table6, r: &Route6) -> Vec<Path> {
+    let mut v: Vec<Path> = t.siblings(r).map(path6).collect();
+    if !v.is_empty() {
+        v.insert(0, path6(r));
+    }
+    v
+}
+
+/// Builds the message of a route, as `rt6_fill_node` of Linux. A route with siblings has
+/// `RTA_MULTIPATH` with the paths `mp`: the route first, then its siblings.
+fn fill_route_mp(r: &Route6, mp: &[Path], ty: u32, portid: u32, seq: u32, flags: u32) -> Vec<u8> {
     let mut b = Builder::new(ty as u16, flags as u16, seq, portid);
     let mut h = [0u8; RTMSG_LEN];
     h[0] = AF_INET6 as u8;
@@ -146,6 +167,10 @@ pub(crate) fn fill_route(r: &Route6, ty: u32, portid: u32, seq: u32, flags: u32)
     h[6] = RT_SCOPE_UNIVERSE as u8;
     h[7] = r.kind;
     let mut rflags = if is_prefix_route(r) { RTM_F_PREFIX } else { 0 };
+    // A dead path without its siblings has the flags in the header, as `fib_nexthop_info`.
+    if mp.len() <= 1 {
+        rflags |= u32::from(r.nh_flags);
+    }
     // A route through a nexthop object shows the nexthop, as the compat mode of Linux.
     let nh = (r.nhid != 0).then(|| nexthop::compat(r.nhid)).flatten();
     if let Some(c) = &nh {
@@ -177,6 +202,7 @@ pub(crate) fn fill_route(r: &Route6, ty: u32, portid: u32, seq: u32, flags: u32)
                 nexthop::put_path(&mut b, p, AF_INET6);
             }
         }
+        None if mp.len() > 1 => nexthop::put_multipath(&mut b, mp, AF_INET6),
         None => {
             if let Some(gw) = r.gateway {
                 b.put(RTA_GATEWAY as u16, &gw);
@@ -213,8 +239,13 @@ fn notify_addr(a: &Addr6, ty: u32, origin: Origin) {
 
 /// Sends the notification of a route to `RTNLGRP_IPV6_ROUTE`, as `inet6_rt_notify`.
 pub(crate) fn notify_route(r: &Route6, ty: u32, origin: Origin, flags: u32) {
+    notify_route_mp(r, &[], ty, origin, flags);
+}
+
+/// Sends the notification of a route with the paths `mp` as `notify_route`.
+fn notify_route_mp(r: &Route6, mp: &[Path], ty: u32, origin: Origin, flags: u32) {
     if netlink::has_listeners(RTNLGRP_IPV6_ROUTE) || origin.echo {
-        let m = fill_route(r, ty, origin.portid, origin.seq, flags);
+        let m = fill_route_mp(r, mp, ty, origin.portid, origin.seq, flags);
         netlink::notify(RTNLGRP_IPV6_ROUTE, m, origin);
     }
 }
@@ -699,8 +730,10 @@ fn dump_addrs(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
         .collect())
 }
 
-/// A route of a request, as `rtm_to_fib6_config` of Linux.
-fn to_route(req: &Request<'_>) -> Result<Route6> {
+/// A route of a request, as `rtm_to_fib6_config` of Linux, with a route for each path of
+/// `RTA_MULTIPATH`, as `ip6_route_multipath_add` of Linux. A path takes the interface of its
+/// `rtnexthop`, and its `RTA_GATEWAY` if it has one. Other values come from the request.
+fn to_route(req: &Request<'_>) -> Result<(Route6, Option<Vec<Route6>>)> {
     let (h, a) = req.parse(RTMSG_LEN, RTA_MAX)?;
     if a.has(RTA_VIA) {
         return Err(req.error("IPv6 does not support RTA_VIA attribute", Errno::EINVAL));
@@ -748,7 +781,31 @@ fn to_route(req: &Request<'_>) -> Result<Route6> {
     {
         r.expires = Some(stack::now_ms() + u64::from(secs) * 1000);
     }
-    Ok(r)
+    let mut paths = None;
+    if let Some(m) = a.get(RTA_MULTIPATH) {
+        // The policy of Linux: one `struct rtnexthop` at least.
+        if m.len() < 8 {
+            return Err(Errno::EINVAL);
+        }
+        let mut v = Vec::new();
+        for hop in nexthop::hops(m).0 {
+            let mut p = r.clone();
+            p.ifindex = hop.ifindex;
+            p.weight = u32::from(hop.hops) + 1;
+            if hop.get(RTA_VIA).is_some() {
+                return Err(req.error("IPv6 does not support RTA_VIA attribute", Errno::EINVAL));
+            }
+            if let Some(g) = hop.get(RTA_GATEWAY) {
+                let g: Ip = g.get(..16).and_then(|g| g.try_into().ok()).ok_or_else(|| {
+                    req.error("Invalid IPv6 address in RTA_GATEWAY", Errno::EINVAL)
+                })?;
+                p.gateway = (g != ip::ANY).then_some(g);
+            }
+            v.push(p);
+        }
+        paths = Some(v);
+    }
+    Ok((r, paths))
 }
 
 /// Checks the next hop of a new route and sets its interface, as `ip6_route_info_create` and
@@ -865,7 +922,10 @@ pub(crate) fn check_gateway(gw: &Ip, ifindex: u32, flags: u32) -> Result<u32> {
 
 /// `RTM_NEWROUTE`, as `inet6_rtm_newroute` of Linux.
 fn newroute(req: &Request<'_>) -> Result<()> {
-    let mut r = to_route(req)?;
+    let (mut r, paths) = to_route(req)?;
+    if let Some(paths) = paths {
+        return newroute_mp(req, paths);
+    }
     if r.nhid != 0 {
         nexthop::check_route6(req, &mut r)?;
     }
@@ -883,25 +943,74 @@ fn newroute(req: &Request<'_>) -> Result<()> {
     Ok(())
 }
 
-/// `RTM_DELROUTE`, as `inet6_rtm_delroute` and `ip6_route_del` of Linux.
+/// `RTM_NEWROUTE` with `RTA_MULTIPATH`, as `ip6_route_multipath_add` of Linux: a route for
+/// each path. The paths become siblings, and one notification shows them all.
+fn newroute_mp(req: &Request<'_>, paths: Vec<Route6>) -> Result<()> {
+    let mut rs: Vec<Route6> = Vec::new();
+    for mut p in paths {
+        check_route(&mut p)?;
+        if !p.ecmp() {
+            return Err(req.error(
+                "Device only routes can not be added for IPv6 using the multipath API.",
+                Errno::EINVAL,
+            ));
+        }
+        if rs.iter().any(|o| o.same(&p)) {
+            return Err(Errno::EEXIST);
+        }
+        rs.push(p);
+    }
+    let Some(first) = rs.first().cloned() else {
+        return Err(req.error("Invalid nexthop configuration - no valid nexthops", Errno::EINVAL));
+    };
+    let flags = u32::from(req.hdr.flags);
+    let mp = {
+        let mut t = ROUTES6.lock();
+        t.insert_routes(&rs, flags)?;
+        paths6(&t, &first)
+    };
+    notify_route_mp(&first, &mp, RTM_NEWROUTE, req.origin(), flags & (NLM_F_CREATE | NLM_F_EXCL));
+    Ok(())
+}
+
+/// `RTM_DELROUTE`, as `inet6_rtm_delroute` and `ip6_route_del` of Linux. With
+/// `RTA_MULTIPATH`, each path goes away as a route, and the error is the error of the last path
+/// that failed, as `ip6_route_multipath_del` of Linux.
 fn delroute(req: &Request<'_>) -> Result<()> {
     let (h, a) = req.parse(RTMSG_LEN, RTA_MAX)?;
-    let r = to_route(req)?;
+    let (r, paths) = to_route(req)?;
     if r.nhid != 0 {
         nexthop::exists(req, r.nhid)?;
     }
-    let m = Match6 {
+    let priority = a.u32(RTA_PRIORITY)?.filter(|p| *p != 0);
+    let to_match = |r: &Route6| Match6 {
         table: r.table,
         dst: r.dst,
         prefix: r.prefix,
         gateway: r.gateway,
         ifindex: (r.ifindex != 0).then_some(r.ifindex),
-        priority: a.u32(RTA_PRIORITY)?.filter(|p| *p != 0),
+        priority,
         protocol: (h[5] != 0).then_some(h[5]),
         nhid: (r.nhid != 0).then_some(r.nhid),
     };
-    let gone = ROUTES6.lock().delete_route(&m)?;
-    notify_route(&gone, RTM_DELROUTE, req.origin(), 0);
+    if let Some(paths) = paths {
+        let mut last = Ok(());
+        for p in &paths {
+            if let Err(e) = delete_routes(req, &to_match(p)) {
+                last = Err(e);
+            }
+        }
+        return last;
+    }
+    delete_routes(req, &to_match(&r))
+}
+
+/// Removes the route that `m` takes, with its siblings if `m` has no gateway, and sends one
+/// notification for them, as `__ip6_del_rt_siblings` of Linux.
+fn delete_routes(req: &Request<'_>, m: &Match6) -> Result<()> {
+    let gone = ROUTES6.lock().delete_routes(m)?;
+    let mp: Vec<Path> = if gone.len() > 1 { gone.iter().map(path6).collect() } else { Vec::new() };
+    notify_route_mp(&gone[0], &mp, RTM_DELROUTE, req.origin(), 0);
     Ok(())
 }
 
@@ -970,7 +1079,7 @@ fn getroute(req: &Request<'_>) -> Result<()> {
     let (next, route) = t.lookup_flow(&fl)?;
     if rflags & RTM_F_FIB_MATCH != 0 {
         let r = route.ok_or(Errno::ENETUNREACH)?;
-        let m = fill_route(r, RTM_NEWROUTE, req.portid, req.hdr.seq, 0);
+        let m = fill_route_mp(r, &paths6(&t, r), RTM_NEWROUTE, req.portid, req.hdr.seq, 0);
         drop(t);
         req.reply(m);
         return Ok(());
@@ -1066,13 +1175,18 @@ fn dump_routes(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
             Ok(Vec::new())
         };
     }
+    // A multipath route shows once, at its first path, with all of its paths. The filter of
+    // the device takes a route if one of its paths uses the device, as `fib6_info_uses_dev`.
     Ok(t.routes()
         .iter()
-        .filter(|r| table == 0 || r.table == table)
-        .filter(|r| protocol == 0 || r.protocol == protocol)
-        .filter(|r| kind == 0 || r.kind == kind)
-        .filter(|r| oif == 0 || r.ifindex == oif)
-        .filter(|r| rflags & RTM_F_PREFIX == 0 || is_prefix_route(r))
-        .map(|r| fill_route(r, RTM_NEWROUTE, req.portid, req.hdr.seq, flags))
+        .enumerate()
+        .filter(|(i, _)| !t.has_earlier_sibling(*i))
+        .map(|(_, r)| (r, paths6(&t, r)))
+        .filter(|(r, _)| table == 0 || r.table == table)
+        .filter(|(r, _)| protocol == 0 || r.protocol == protocol)
+        .filter(|(r, _)| kind == 0 || r.kind == kind)
+        .filter(|(r, mp)| oif == 0 || r.ifindex == oif || mp.iter().any(|p| p.ifindex == oif))
+        .filter(|(r, _)| rflags & RTM_F_PREFIX == 0 || is_prefix_route(r))
+        .map(|(r, mp)| fill_route_mp(r, &mp, RTM_NEWROUTE, req.portid, req.hdr.seq, flags))
         .collect())
 }
