@@ -2611,10 +2611,11 @@ pub fn count_reclaim(id: CgId, who: Reclaimer, anon: bool, scanned: u64, stolen:
 
 /// Takes back memory from `id` and each cgroup above it whose use is over `memory.high`, as
 /// `reclaim_high` of Linux. Each of these cgroups gives the bytes that the subtree charged over
-/// the limit, and at least `RECLAIM_BATCH`. The return to user mode calls this before
-/// [`high_delay`], so the wait is for the use that the reclaim leaves. The reclaim counts as a
-/// memory stall of the cgroup `stall` of the thread in the pressure, as `psi_memstall_enter` of
-/// Linux around the reclaim.
+/// the limit since the last wait, as Linux takes back the `memcg_nr_pages_over_high` pages of
+/// the task. A cgroup with no such charge gives nothing. The return to user mode calls this
+/// before [`high_delay`], so the wait is for the use that the reclaim leaves. The reclaim counts
+/// as a memory stall of the cgroup `stall` of the thread in the pressure, as `psi_memstall_enter`
+/// of Linux around the reclaim.
 pub fn reclaim_high(id: CgId, stall: CgId) {
     if id == 0 || !shared().any_over_high.load(Ordering::Relaxed) {
         return;
@@ -2626,8 +2627,8 @@ pub fn reclaim_high(id: CgId, stall: CgId) {
                 let high = a.mem.high.load(Ordering::Relaxed);
                 let current = a.mem.current.load(Ordering::Relaxed);
                 let charged = a.mem.over_high.load(Ordering::Relaxed);
-                (a.on(MEMORY) && high != MAX && current > high)
-                    .then(|| (a.id, charged.max(RECLAIM_BATCH)))
+                (a.on(MEMORY) && high != MAX && current > high && charged > 0)
+                    .then_some((a.id, charged))
             })
             .collect();
         (over, Changed::default())
