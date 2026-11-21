@@ -225,8 +225,32 @@ pub mod class {
 pub mod process {
     /// `transition`.
     pub const TRANSITION: u32 = 1 << 1;
+    /// `sigchld`.
+    pub const SIGCHLD: u32 = 1 << 2;
+    /// `sigkill`.
+    pub const SIGKILL: u32 = 1 << 3;
+    /// `sigstop`.
+    pub const SIGSTOP: u32 = 1 << 4;
+    /// `signull`.
+    pub const SIGNULL: u32 = 1 << 5;
+    /// `signal`.
+    pub const SIGNAL: u32 = 1 << 6;
     /// `ptrace`.
     pub const PTRACE: u32 = 1 << 7;
+    /// `getsched`.
+    pub const GETSCHED: u32 = 1 << 8;
+    /// `setsched`.
+    pub const SETSCHED: u32 = 1 << 9;
+    /// `getsession`.
+    pub const GETSESSION: u32 = 1 << 10;
+    /// `getpgid`.
+    pub const GETPGID: u32 = 1 << 11;
+    /// `setpgid`.
+    pub const SETPGID: u32 = 1 << 12;
+    /// `getcap`.
+    pub const GETCAP: u32 = 1 << 13;
+    /// `setcap`.
+    pub const SETCAP: u32 = 1 << 14;
     /// `getattr`.
     pub const GETATTR: u32 = 1 << 16;
     /// `setexec`.
@@ -235,6 +259,8 @@ pub mod process {
     pub const SETFSCREATE: u32 = 1 << 18;
     /// `noatsecure`.
     pub const NOATSECURE: u32 = 1 << 19;
+    /// `setrlimit`.
+    pub const SETRLIMIT: u32 = 1 << 21;
     /// `dyntransition`.
     pub const DYNTRANSITION: u32 = 1 << 23;
     /// `setcurrent`.
@@ -249,6 +275,8 @@ pub mod process {
     pub const SETKEYCREATE: u32 = 1 << 28;
     /// `setsockcreate`.
     pub const SETSOCKCREATE: u32 = 1 << 29;
+    /// `getrlimit`.
+    pub const GETRLIMIT: u32 = 1 << 30;
 }
 
 /// The permissions of the class `process2`, `PROCESS2__*` of Linux.
@@ -419,11 +447,24 @@ mod tests {
         assert_eq!(value("cap2_userns"), Some(class::CAP2_USERNS));
         for (perm, v) in [
             ("transition", process::TRANSITION),
+            ("sigchld", process::SIGCHLD),
+            ("sigkill", process::SIGKILL),
+            ("sigstop", process::SIGSTOP),
+            ("signull", process::SIGNULL),
+            ("signal", process::SIGNAL),
             ("ptrace", process::PTRACE),
+            ("getsched", process::GETSCHED),
+            ("setsched", process::SETSCHED),
+            ("getsession", process::GETSESSION),
+            ("getpgid", process::GETPGID),
+            ("setpgid", process::SETPGID),
+            ("getcap", process::GETCAP),
+            ("setcap", process::SETCAP),
             ("getattr", process::GETATTR),
             ("setexec", process::SETEXEC),
             ("setfscreate", process::SETFSCREATE),
             ("noatsecure", process::NOATSECURE),
+            ("setrlimit", process::SETRLIMIT),
             ("dyntransition", process::DYNTRANSITION),
             ("setcurrent", process::SETCURRENT),
             ("execmem", process::EXECMEM),
@@ -431,6 +472,7 @@ mod tests {
             ("execheap", process::EXECHEAP),
             ("setkeycreate", process::SETKEYCREATE),
             ("setsockcreate", process::SETSOCKCREATE),
+            ("getrlimit", process::GETRLIMIT),
         ] {
             assert_eq!(bit(class::PROCESS, perm), v, "{perm}");
         }

@@ -1,6 +1,8 @@
 //! The SIDs of the tasks, `struct task_security_struct` of security/selinux of Linux: the SID
 //! of a task in its credentials, the change of the SID at an exec, and the attributes of
-//! `/proc/PID/attr` and of `lsm_get_self_attr` and `lsm_set_self_attr`.
+//! `/proc/PID/attr` and of `lsm_get_self_attr` and `lsm_set_self_attr`, and the checks of the
+//! operations on other tasks: signals, `ptrace`, the scheduler, the process group, the
+//! session, the limits and the capabilities.
 
 use crate::classmap::{class, file, key, process, process2};
 use crate::sidtab::sid;
@@ -10,6 +12,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use rk_abi::Errno;
 use rk_abi::native::mount::MS_NOSUID;
+use rk_abi::native::signal::{SIGCHLD, SIGKILL, SIGSTOP};
 use rk_vfs::cred::{Cred, cap};
 use rk_vfs::dentry::Location;
 use rk_vfs::inode::Result;
@@ -349,6 +352,129 @@ pub fn setattr(attr: u64, value: &[u8]) -> Result<usize> {
     Ok(size)
 }
 
+/// The `PTRACE_MODE_READ` bit of the mode of `ptrace_access_check`, as include/linux/ptrace.h
+/// of Linux.
+const PTRACE_MODE_READ: u32 = 0x01;
+
+/// The `LSM_PRLIMIT_*` bits of `task_prlimit`, as include/linux/security.h of Linux.
+const LSM_PRLIMIT_READ: u32 = 1;
+const LSM_PRLIMIT_WRITE: u32 = 2;
+
+/// Checks the permission `perm` of the class `process` of the SID `ssid` on the task with the
+/// credentials `tcred`, as `avc_has_perm` with `task_sid_obj` of Linux. The record has no
+/// fields of the object.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies the permission in enforcing mode.
+fn task_has_perm(ssid: u32, tcred: &Cred, perm: u32) -> Result<()> {
+    if !crate::initialized() {
+        return Ok(());
+    }
+    avc::has_perm(ssid, cred_sid(tcred), class::PROCESS, perm, |_| {})
+}
+
+/// Checks a permission of the class `process` of the current task on `target`, as the task
+/// hooks of hooks.c of Linux: `getpgid`, `setpgid`, `getsession`, `getsched`, `setsched`,
+/// `getcap` and the other permissions on one task.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies the permission in enforcing mode.
+pub fn current_has_perm(target: &Task<'_>, perm: u32) -> Result<()> {
+    task_has_perm(crate::current_sid(), target.cred, perm)
+}
+
+/// The permission of the class `process` for the signal `sig`, as `signal_to_av` of Linux:
+/// `sigchld`, `sigkill` and `sigstop` for their signals, and `signal` for each other signal.
+fn signal_to_av(sig: u32) -> u32 {
+    match sig {
+        SIGCHLD => process::SIGCHLD,
+        SIGKILL => process::SIGKILL,
+        SIGSTOP => process::SIGSTOP,
+        _ => process::SIGNAL,
+    }
+}
+
+/// Checks the signal `sig` that the task with `cred` sends to `target`, as
+/// `selinux_task_kill` of Linux. The signal 0 tests only if the task is there, and needs
+/// `signull`.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies the permission in enforcing mode.
+pub fn task_kill(target: &Task<'_>, sig: u32, cred: &Cred) -> Result<()> {
+    let perm = if sig == 0 { process::SIGNULL } else { signal_to_av(sig) };
+    task_has_perm(cred_sid(cred), target.cred, perm)
+}
+
+/// Checks a read or a change of the limits of the task with `tcred` by the task with `cred`,
+/// as `selinux_task_prlimit` of Linux: `getrlimit` for a read and `setrlimit` for a change.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies a permission in enforcing mode.
+pub fn task_prlimit(cred: &Cred, tcred: &Cred, flags: u32) -> Result<()> {
+    let mut av = 0;
+    if flags & LSM_PRLIMIT_WRITE != 0 {
+        av |= process::SETRLIMIT;
+    }
+    if flags & LSM_PRLIMIT_READ != 0 {
+        av |= process::GETRLIMIT;
+    }
+    if av == 0 {
+        return Ok(());
+    }
+    task_has_perm(cred_sid(cred), tcred, av)
+}
+
+/// Checks that the task with `cred` traces or examines `child`, as
+/// `selinux_ptrace_access_check` of Linux: `read` of the class `file` for `PTRACE_MODE_READ`,
+/// else `ptrace`.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies the permission in enforcing mode.
+pub fn ptrace_access_check(cred: &Cred, child: &Task<'_>, mode: u32) -> Result<()> {
+    if !crate::initialized() {
+        return Ok(());
+    }
+    let (sid, csid) = (cred_sid(cred), cred_sid(child.cred));
+    if mode & PTRACE_MODE_READ != 0 {
+        return avc::has_perm(sid, csid, class::FILE, file::READ, |_| {});
+    }
+    avc::has_perm(sid, csid, class::PROCESS, process::PTRACE, |_| {})
+}
+
+/// Checks that `parent` becomes the tracer of the current task, as `selinux_ptrace_traceme`
+/// of Linux: `ptrace` of the parent on the current task.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies the permission in enforcing mode.
+pub fn ptrace_traceme(parent: &Task<'_>) -> Result<()> {
+    if !crate::initialized() {
+        return Ok(());
+    }
+    avc::has_perm(
+        cred_sid(parent.cred),
+        crate::current_sid(),
+        class::PROCESS,
+        process::PTRACE,
+        |_| {},
+    )
+}
+
+/// Checks a change of the capabilities from `old` to `new`, as `selinux_capset` of Linux:
+/// `setcap` of the old SID on the new SID.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies the permission in enforcing mode.
+pub fn capset(new: &Cred, old: &Cred) -> Result<()> {
+    task_has_perm(cred_sid(old), new, process::SETCAP)
+}
+
 /// The state of the task that runs now.
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod sys {
@@ -494,6 +620,56 @@ mod tests {
         assert_eq!(r, Err(Errno::EACCES));
         // kernel_t has no execute_no_trans on unlabeled_t.
         assert_eq!(plain, Err(Errno::EACCES));
+    }
+
+    #[test]
+    fn the_operations_on_tasks_need_the_permissions_of_the_class_process() {
+        let _guard = setup();
+        // The test runs with the credentials of root, which have the SID kernel.
+        let me = Cred::root();
+        let init = Cred::root();
+        store(&init, slot::SID, sid_of("system_u:system_r:init_t:s0"));
+        let free = Cred::root();
+        store(&free, slot::SID, sid_of("system_u:system_r:unconfined_t:s0"));
+        let t = Task { pid: 2, cred: &me, security: None };
+        let o = Task { pid: 3, cred: &init, security: None };
+        let read = LSM_PRLIMIT_READ;
+        crate::set_enforcing(true);
+        // The policy gives each domain sigchld and signal on itself, and nothing more.
+        assert_eq!(task_kill(&t, 10, &me), Ok(()));
+        assert_eq!(task_kill(&t, SIGCHLD, &me), Ok(()));
+        for sig in [0, SIGKILL, SIGSTOP] {
+            assert_eq!(task_kill(&t, sig, &me), Err(Errno::EACCES), "{sig}");
+        }
+        assert_eq!(task_kill(&o, 10, &me), Err(Errno::EACCES));
+        assert_eq!(task_kill(&o, 10, &init), Ok(()));
+        // unconfined_t is a permissive domain.
+        assert_eq!(task_kill(&t, SIGKILL, &free), Ok(()));
+        for perm in [
+            process::GETPGID,
+            process::SETPGID,
+            process::GETSESSION,
+            process::GETSCHED,
+            process::SETSCHED,
+            process::GETCAP,
+        ] {
+            assert_eq!(current_has_perm(&t, perm), Err(Errno::EACCES), "{perm:#x}");
+        }
+        assert_eq!(task_prlimit(&me, &init, 0), Ok(()));
+        assert_eq!(task_prlimit(&me, &init, read), Err(Errno::EACCES));
+        assert_eq!(task_prlimit(&me, &init, LSM_PRLIMIT_WRITE), Err(Errno::EACCES));
+        assert_eq!(ptrace_access_check(&me, &o, 0x02), Err(Errno::EACCES));
+        assert_eq!(ptrace_access_check(&me, &o, PTRACE_MODE_READ), Err(Errno::EACCES));
+        assert_eq!(ptrace_traceme(&o), Err(Errno::EACCES));
+        assert_eq!(capset(&me, &me), Err(Errno::EACCES));
+        crate::set_enforcing(false);
+        // Permissive mode only makes the records.
+        assert_eq!(task_kill(&o, SIGKILL, &me), Ok(()));
+        assert_eq!(current_has_perm(&o, process::SETSCHED), Ok(()));
+        assert_eq!(task_prlimit(&me, &init, read | LSM_PRLIMIT_WRITE), Ok(()));
+        assert_eq!(ptrace_access_check(&me, &o, 0x02), Ok(()));
+        assert_eq!(ptrace_traceme(&o), Ok(()));
+        assert_eq!(capset(&init, &me), Ok(()));
     }
 
     #[test]

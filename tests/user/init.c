@@ -16960,6 +16960,10 @@ static void test_selinux(void)
 	unsigned long long size64;
 	int bsz, zero = 0;
 	void *ms, *mx, *mw, *ma, *mt;
+	pid_t tpid = -1, cpid = -1;
+	int status;
+	struct rlimit rl;
+	unsigned int caphdr[2] = { 0x20080522, 0 }, capdata[6];
 
 	n = klogctl(3, buf, sizeof(buf) - 1);
 	buf[n > 0 ? n : 0] = 0;
@@ -17165,6 +17169,30 @@ static void test_selinux(void)
 	check("selinux: a map of a file of tmpfs_t gives EACCES in enforcing mode", mt == MAP_FAILED && errno == EACCES);
 	if (fd >= 0)
 		close(fd);
+	/*
+	 * The checks of the operations on tasks, as selinux_task_kill, selinux_task_getpgid, selinux_task_getsid, selinux_task_setnice,
+	 * selinux_task_getscheduler, selinux_task_getioprio, selinux_task_prlimit, selinux_capget, selinux_ptrace_access_check and
+	 * selinux_ptrace_traceme of Linux. The policy gives kernel_t only fork, sigchld and signal on itself. getpgid and getsid of the PID 0
+	 * and prlimit of init itself need no permission, as on Linux.
+	 */
+	check("selinux: a signal works and the signal 0 gives EACCES in enforcing mode", kill(getpid(), SIGWINCH) == 0 && kill(getpid(), 0) < 0 && errno == EACCES);
+	check("selinux: getpgid and getsid of a PID give EACCES and of the PID 0 work in enforcing mode", getpgid(getpid()) < 0 && errno == EACCES && getsid(getpid()) < 0 && errno == EACCES && getpgid(0) >= 0 && getsid(0) >= 0);
+	check("selinux: setpriority, sched_getscheduler and ioprio_get give EACCES in enforcing mode", setpriority(PRIO_PROCESS, 0, 0) < 0 && errno == EACCES && syscall(SYS_sched_getscheduler, 0) < 0 && errno == EACCES && syscall(SYS_ioprio_get, 1, 0) < 0 && errno == EACCES);
+	check("selinux: getrlimit and prlimit of init itself work in enforcing mode", getrlimit(RLIMIT_NOFILE, &rl) == 0 && prlimit(getpid(), RLIMIT_NOFILE, NULL, &rl) == 0);
+	check("selinux: capget gives EACCES in enforcing mode", syscall(SYS_capget, caphdr, capdata) < 0 && errno == EACCES);
+	/* The child waits for a signal. SIGUSR1 needs only signal, and it ends the child. */
+	cpid = fork();
+	if (cpid == 0) {
+		for (;;)
+			pause();
+	}
+	check("selinux: SIGKILL and SIGSTOP to a child give EACCES and SIGCHLD works in enforcing mode", cpid > 0 && kill(cpid, SIGKILL) < 0 && errno == EACCES && kill(cpid, SIGSTOP) < 0 && errno == EACCES && kill(cpid, SIGCHLD) == 0);
+	check("selinux: PTRACE_ATTACH to a child gives EACCES in enforcing mode", cpid > 0 && ptrace(PTRACE_ATTACH, cpid, NULL, NULL) < 0 && errno == EACCES);
+	check("selinux: SIGUSR1 to a child works in enforcing mode", cpid > 0 && kill(cpid, SIGUSR1) == 0 && waitpid(cpid, &status, 0) == cpid && WIFSIGNALED(status) && WTERMSIG(status) == SIGUSR1);
+	tpid = fork();
+	if (tpid == 0)
+		_exit(ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0 && errno == EACCES ? 0 : 1);
+	check("selinux: PTRACE_TRACEME of a child gives EACCES in enforcing mode", tpid > 0 && waitpid(tpid, &status, 0) == tpid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	close(rfd);
 	close(wfd);
 	close(afd);
@@ -17231,6 +17259,12 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the denial of the map", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "avc:  denied  { execmem } for  pid=1 comm=\"init\" scontext=%s tcontext=%s tclass=process permissive=0", kernel, kernel);
 	check("selinux: the kernel log has the denial of execmem", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { signull } for  pid=1 comm=\"init\" scontext=%s tcontext=%s tclass=process permissive=0", kernel, kernel);
+	check("selinux: the kernel log has the denial of the signal 0", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { getpgid } for  pid=1 comm=\"init\" scontext=%s tcontext=%s tclass=process permissive=0", kernel, kernel);
+	check("selinux: the kernel log has the denial of getpgid", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { ptrace } for  pid=%d comm=\"init\" scontext=%s tcontext=%s tclass=process permissive=0", (int)tpid, kernel, kernel);
+	check("selinux: the kernel log has the denial of PTRACE_TRACEME in the child", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "tcontext=%s tclass=fd permissive=1", kernel);
 	check("selinux: the kernel log has the denial of the use of the pipe of init by init_t", strstr(buf, "avc:  denied  { use } for  pid=") != NULL && strstr(buf, "scontext=system_u:system_r:init_t:s0 ") != NULL && strstr(buf, want) != NULL);
 	unlink("/tmp/rk-aa-w");
