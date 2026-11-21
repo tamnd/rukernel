@@ -6,6 +6,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
+- SELinux checks the mounts, as `selinux_mount`, `selinux_move_mount` and `selinux_umount` of Linux. A new mount and a move of a mount need `mounton` on the place of the mount, a remount needs `remount` of the file system, and an unmount needs `unmount` of the file system (#540).
 - SELinux checks the operations on other tasks, as the task, `ptrace` and `capget` hooks of hooks.c of Linux. A signal needs `sigkill`, `sigstop`, `sigchld`, `signull` for the signal 0, or `signal` for another signal. `getpgid` and `getsid` of a PID need `getpgid` and `getsession`, `setpgid` needs `setpgid`, a change of the nice value, of the I/O priority or of the scheduler needs `setsched`, and a read of them needs `getsched`. `prlimit` on another process needs `getrlimit` or `setrlimit`, `capget` needs `getcap` and `capset` needs `setcap`. `PTRACE_ATTACH` and `PTRACE_TRACEME` need `ptrace`. `prlimit` on the caller itself does not call the hook `task_prlimit`, as `check_prlimit_permission` of Linux (#540).
 - SELinux checks the maps of files and of anonymous memory, as `selinux_mmap_file` and `file_map_prot_check` of Linux. A map of a file needs `map`, `read`, `write` if the map is shared and can write, and `execute` if it can run code. A map that can run code needs `execmem` of the process if it is anonymous memory, a file without an inode, or a private map that can also write (#540).
 

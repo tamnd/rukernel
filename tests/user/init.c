@@ -17081,6 +17081,7 @@ static void test_selinux(void)
 	int status;
 	struct rlimit rl;
 	unsigned int caphdr[2] = { 0x20080522, 0 }, capdata[6];
+	unsigned long ino_tmp = 0;
 
 	n = klogctl(3, buf, sizeof(buf) - 1);
 	buf[n > 0 ? n : 0] = 0;
@@ -17310,6 +17311,15 @@ static void test_selinux(void)
 	if (tpid == 0)
 		_exit(ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0 && errno == EACCES ? 0 : 1);
 	check("selinux: PTRACE_TRACEME of a child gives EACCES in enforcing mode", tpid > 0 && waitpid(tpid, &status, 0) == tpid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	/*
+	 * The checks of the mounts, as selinux_mount and selinux_umount of Linux: mounton on the place, and remount and unmount of the file
+	 * system. The policy gives kernel_t none of them.
+	 */
+	if (stat("/tmp", &st) == 0)
+		ino_tmp = (unsigned long)st.st_ino;
+	check("selinux: a mount on /tmp gives EACCES in enforcing mode", mount("tmpfs", "/tmp", "tmpfs", 0, NULL) < 0 && errno == EACCES);
+	check("selinux: a remount of /tmp gives EACCES in enforcing mode", mount(NULL, "/tmp", NULL, MS_REMOUNT, NULL) < 0 && errno == EACCES);
+	check("selinux: an unmount of /tmp gives EACCES in enforcing mode", umount("/tmp") < 0 && errno == EACCES);
 	close(rfd);
 	close(wfd);
 	close(afd);
@@ -17382,6 +17392,12 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the denial of getpgid", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "avc:  denied  { ptrace } for  pid=%d comm=\"init\" scontext=%s tcontext=%s tclass=process permissive=0", (int)tpid, kernel, kernel);
 	check("selinux: the kernel log has the denial of PTRACE_TRACEME in the child", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { mounton } for  pid=1 comm=\"init\" path=\"/tmp\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=dir permissive=0", ino_tmp, kernel);
+	check("selinux: the kernel log has the denial of mounton", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { remount } for  pid=1 comm=\"init\" scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=filesystem permissive=0", kernel);
+	check("selinux: the kernel log has the denial of remount", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { unmount } for  pid=1 comm=\"init\" scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=filesystem permissive=0", kernel);
+	check("selinux: the kernel log has the denial of unmount", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "tcontext=%s tclass=fd permissive=1", kernel);
 	check("selinux: the kernel log has the denial of the use of the pipe of init by init_t", strstr(buf, "avc:  denied  { use } for  pid=") != NULL && strstr(buf, "scontext=system_u:system_r:init_t:s0 ") != NULL && strstr(buf, want) != NULL);
 	unlink("/tmp/rk-aa-w");
