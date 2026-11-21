@@ -24,11 +24,11 @@ pub(crate) use self::nf_tables_core::{NftLog, nft_log_eval};
 
 use self::nf_tables_core::{
     ETH_P_IP, ETH_P_IPV6, NFT_OBJECT_MAX, NFTA_FLOWTABLE_MAX, NFTA_OBJ_MAX, NftDynset, NftExpr,
-    NftFlowtable, NftObj, NftObjState, NftProg, nf_tables_dump_flowtable, nf_tables_dump_obj,
-    nf_tables_expr_parse, nf_tables_getflowtable, nf_tables_getobj, nft_check_loops, nft_do_chain,
-    nft_expr_dump, nft_expr_dump_state, nft_expr_needs_validate, nft_expr_targets,
-    nft_expr_validate, nft_obj_commit, nft_prog, nft_rule_needs_ct, nft_set_exprs_dump,
-    nft_set_exprs_parse, nft_setelem_parse_obj, nft_table_validate, nla_raw,
+    NftFlowtable, NftObj, NftObjState, NftProg, ProgCache, nf_tables_dump_flowtable,
+    nf_tables_dump_obj, nf_tables_expr_parse, nf_tables_getflowtable, nf_tables_getobj,
+    nft_check_loops, nft_do_chain, nft_expr_dump, nft_expr_dump_state, nft_expr_needs_validate,
+    nft_expr_targets, nft_expr_validate, nft_obj_commit, nft_prog, nft_rule_needs_ct,
+    nft_set_exprs_dump, nft_set_exprs_parse, nft_setelem_parse_obj, nft_table_validate, nla_raw,
 };
 use crate::buf::NetBuf;
 use crate::consts::IFNAMSIZ;
@@ -653,9 +653,15 @@ struct NftSet {
     gc_int: u32,
     /// The stateful expressions of the set, that each new element gets a copy of.
     exprs: Vec<NftObjState>,
-    elems: BTreeMap<ElemKey, NftElem>,
+    /// The elements. The copies of the set in a batch share them, and the first change of the
+    /// elements in a batch copies them (`elems_mut`). So a batch copies only the sets that it
+    /// changes.
+    elems: Arc<BTreeMap<ElemKey, NftElem>>,
     /// The elements of `dynset` since the last commit.
     dynamic: DynElems,
+    /// The elements of the set in the programs of the base chains, for the commits that do not
+    /// change the set.
+    prog: ProgCache,
     /// The keys of the elements that the batch adds or removes, and if the batch removes all
     /// of them: the commit keeps the batch's change of these over the one of `dynset`.
     touched: BTreeSet<Vec<u8>>,
@@ -719,8 +725,21 @@ impl NftSet {
         }
         #[cfg(test)]
         work::add(&work::SCANNED, self.elems.len());
-        self.elems.retain(|_, e| !e.expired(now));
+        if self.elems.values().any(|e| e.expired(now)) {
+            self.elems_mut().retain(|_, e| !e.expired(now));
+        }
         self.collected = true;
+    }
+
+    /// The elements, to change them. If a copy of the set shares them, this copies them first.
+    /// The programs do not keep the old elements in `prog` after a change.
+    fn elems_mut(&mut self) -> &mut BTreeMap<ElemKey, NftElem> {
+        self.prog.forget(&self.elems);
+        #[cfg(test)]
+        if Arc::strong_count(&self.elems) > 1 {
+            work::add(&work::COPIED, self.elems.len());
+        }
+        Arc::make_mut(&mut self.elems)
     }
 
     /// The elements that have not expired.
@@ -736,8 +755,10 @@ impl NftSet {
 
     /// Puts the elements of `dynset` in `elems`, apart from the keys that the batch changed.
     fn merge_dynamic(&mut self, d: &NftDynElems) {
-        if !self.flushed {
-            nft_dyn_apply(&mut self.elems, d, &self.touched);
+        if !self.flushed && !d.elems.is_empty() {
+            let touched = core::mem::take(&mut self.touched);
+            nft_dyn_apply(self.elems_mut(), d, &touched);
+            self.touched = touched;
         }
     }
 
@@ -755,7 +776,7 @@ impl NftSet {
     /// the ones of `dynset` if it changed some since the last commit.
     fn get_view(&self) -> Cow<'_, BTreeMap<ElemKey, NftElem>> {
         if self.dynamic.0.lock().elems.is_empty() {
-            Cow::Borrowed(&self.elems)
+            Cow::Borrowed(&*self.elems)
         } else {
             Cow::Owned(self.view())
         }
@@ -773,6 +794,8 @@ mod work {
     std::thread_local! {
         pub(super) static SCANNED: Cell<usize> = const { Cell::new(0) };
         pub(super) static COPIED: Cell<usize> = const { Cell::new(0) };
+        /// The elements of the sets that the commits put in the programs.
+        pub(super) static BUILT: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn add(counter: &'static LocalKey<Cell<usize>>, n: usize) {
@@ -782,6 +805,11 @@ mod work {
     /// Gives the counts and sets them back to 0.
     pub(super) fn take() -> (usize, usize) {
         (SCANNED.with(|c| c.replace(0)), COPIED.with(|c| c.replace(0)))
+    }
+
+    /// Gives the count of `BUILT` and sets it back to 0.
+    pub(super) fn take_built() -> usize {
+        BUILT.with(|c| c.replace(0))
     }
 }
 
@@ -3118,8 +3146,9 @@ impl NftBatch {
             timeout,
             gc_int,
             exprs,
-            elems: BTreeMap::new(),
+            elems: Arc::default(),
             dynamic: DynElems::default(),
+            prog: ProgCache::default(),
             touched: BTreeSet::new(),
             flushed: false,
             collected: false,
@@ -3298,7 +3327,7 @@ impl NftBatch {
         let seq = nft_elem_seq();
         let elem = NftElem { key_end, data, flags, udata, timeout, expires, exprs, seq };
         let set = &mut self.tables[t].sets[s];
-        set.elems.insert(key.clone(), elem);
+        set.elems_mut().insert(key.clone(), elem);
         set.touched.insert(key.key.clone());
         self.notify_setelem(ctx, NFT_MSG_NEWSETELEM, t, s, &key);
         Ok(())
@@ -3319,10 +3348,11 @@ impl NftBatch {
             // No list removes all of the elements, as `nft_set_flush`.
             let keys: Vec<ElemKey> = self.tables[t].sets[s].elems.keys().cloned().collect();
             self.tables[t].sets[s].flushed = true;
-            for k in keys {
-                self.notify_setelem(&ctx, NFT_MSG_DELSETELEM, t, s, &k);
-                self.tables[t].sets[s].elems.remove(&k);
+            for k in &keys {
+                self.notify_setelem(&ctx, NFT_MSG_DELSETELEM, t, s, k);
             }
+            // The set gets new elements, and the copies of the set keep theirs.
+            self.tables[t].sets[s].elems = Arc::default();
             return Ok(());
         };
         for (_, attr) in msg::attrs(list) {
@@ -3349,7 +3379,7 @@ impl NftBatch {
         }
         self.notify_setelem(ctx, NFT_MSG_DELSETELEM, t, s, &key);
         let set = &mut self.tables[t].sets[s];
-        set.elems.remove(&key);
+        set.elems_mut().remove(&key);
         set.touched.insert(key.key);
         Ok(())
     }
@@ -3645,7 +3675,7 @@ pub fn nft_release_portid(portid: u32) {
 mod tests {
     use super::*;
 
-    fn table() -> NftTable {
+    pub(super) fn table() -> NftTable {
         NftTable {
             name: b"t".to_vec(),
             family: NFPROTO_IPV4,
@@ -3661,7 +3691,7 @@ mod tests {
         }
     }
 
-    fn set(name: &[u8]) -> NftSet {
+    pub(super) fn set(name: &[u8]) -> NftSet {
         NftSet {
             name: name.to_vec(),
             handle: 1,
@@ -3678,8 +3708,9 @@ mod tests {
             timeout: 0,
             gc_int: 0,
             exprs: Vec::new(),
-            elems: BTreeMap::new(),
+            elems: Arc::default(),
             dynamic: DynElems::default(),
+            prog: ProgCache::default(),
             touched: BTreeSet::new(),
             flushed: false,
             collected: false,
@@ -3808,7 +3839,7 @@ mod tests {
             exprs: Vec::new(),
             seq: 0,
         };
-        m.elems.insert(key, elem);
+        m.elems_mut().insert(key, elem);
         t.sets.push(m);
         let vmap = NftExpr::Lookup { set: 1, sreg: 8, len: 4, invert: false, dreg: Some(0) };
         // c10: vmap to c11, jump c12. c11: jump c13. c12 and c13 accept.
@@ -3872,7 +3903,7 @@ mod tests {
             exprs: Vec::new(),
             seq: 0,
         };
-        m.elems.insert(key, elem);
+        m.elems_mut().insert(key, elem);
         t.sets.push(m);
         let vmap = NftExpr::Lookup { set: 1, sreg: 8, len: 4, invert: false, dreg: Some(0) };
         assert!(nft_expr_needs_validate(&vmap));
@@ -4126,8 +4157,8 @@ mod tests {
             seq: 0,
         };
         let mut s = set(b"d");
-        s.elems.insert(k(1), elem(0));
-        s.elems.insert(k(2), elem(u64::MAX - 1));
+        s.elems_mut().insert(k(1), elem(0));
+        s.elems_mut().insert(k(2), elem(u64::MAX - 1));
         {
             let mut d = s.dynamic.0.lock();
             d.elems.insert(k(1).key, DynElem::Del);
@@ -4171,7 +4202,7 @@ mod tests {
         s.klen = 2;
         let ranges = [(10, 11), (20, 31), (40, 50), (50, 60)];
         for (key, end) in ranges.into_iter().flat_map(|(a, b)| [(a, false), (b, true)]) {
-            s.elems.insert(k(key, end), elem(None));
+            s.elems_mut().insert(k(key, end), elem(None));
         }
         let v = s.view();
         let get =
@@ -4195,7 +4226,7 @@ mod tests {
         c.field_len = alloc::vec![4, 2];
         let key = |a: u8, p: u8| alloc::vec![10, 1, a, 0, 0, p, 0, 0];
         let start = ElemKey { catchall: false, key: key(0, 1), end: false };
-        c.elems.insert(start.clone(), elem(Some(key(255, 100))));
+        c.elems_mut().insert(start.clone(), elem(Some(key(255, 100))));
         let v = c.view();
         let get = |a, p| {
             let k = ElemKey { catchall: false, key: key(a, p), end: false };
@@ -4226,7 +4257,7 @@ mod tests {
         s.flags = NFT_SET_TIMEOUT;
         for i in 0..20_000u32 {
             let expires = if i % 2 == 0 { 1_000_000_000 } else { 2_000_000_000 };
-            s.elems.insert(k(i), NftElem { expires, ..e.clone() });
+            s.elems_mut().insert(k(i), NftElem { expires, ..e.clone() });
         }
         let get = |s: &NftSet, i, now| nft_setelem_get(s, &s.elems, &k(i), now).map(|(k, _)| k);
         // A get on the elements of the set does not see one that expired, before the garbage
@@ -4247,7 +4278,7 @@ mod tests {
         assert_eq!(s.nelems(), 0);
         // A set with no timeouts has nothing to collect.
         let mut n = set(b"n");
-        n.elems.insert(k(1), e);
+        n.elems_mut().insert(k(1), e);
         n.gc(u64::MAX);
         assert_eq!(n.nelems(), 1);
     }
@@ -4271,7 +4302,7 @@ mod tests {
         };
         let mut s = NftSet { flags: NFT_SET_TIMEOUT, size: 65_536, ..set(b"m") };
         for i in 0..n {
-            s.elems.insert(key(i), e.clone());
+            s.elems_mut().insert(key(i), e.clone());
         }
         let mut t = table();
         t.sets.push(s);
@@ -4359,7 +4390,7 @@ mod tests {
             let mut n = s.clone();
             let mut add = |key: ElemKey| {
                 nft_set_overlap(&n, &key, None)?;
-                n.elems.insert(key, elem(None));
+                n.elems_mut().insert(key, elem(None));
                 Ok::<(), Errno>(())
             };
             let r = add(k(a, false)).and_then(|()| add(k(b + 1, true)));
@@ -4395,7 +4426,7 @@ mod tests {
                 "{a1}-{a2} . {b1}-{b2}"
             );
             if ok && !c.elems.contains_key(&start) {
-                c.elems.insert(start, NftElem { seq: seq as u64, ..elem(Some(end)) });
+                c.elems_mut().insert(start, NftElem { seq: seq as u64, ..elem(Some(end)) });
             }
         }
     }

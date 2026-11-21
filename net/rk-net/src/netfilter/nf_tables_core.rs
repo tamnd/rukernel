@@ -48,6 +48,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::netlink::NLA_TYPE_MASK;
+use rk_frame::sync::SpinLock;
 use rk_vfs::inode::Result;
 
 #[path = "nft_exprs.rs"]
@@ -1310,21 +1311,21 @@ enum ProgData {
     None,
     /// The value of an element of a map.
     Value(Vec<u8>),
-    /// The verdict of an element of a verdict map, with the chain as an index in the program.
+    /// The verdict of an element of a verdict map. The chain of a jump or a goto is an index
+    /// in the chains of `ProgElems::jumps`.
     Verdict { code: u32, chain: usize },
     /// The object of an element of a map of objects.
     Obj(NftObjState),
 }
 
-/// The elements of a set, for `lookup` and `dynset`.
+/// The elements of a set in the programs, for `lookup` and `dynset`. The programs share them,
+/// and a commit makes them again only for a set whose elements changed (`ProgCache`).
 #[derive(Debug, Default)]
-struct ProgSet {
+struct ProgElems {
     keys: BTreeMap<Vec<u8>, ProgData>,
     /// The ranges of a set with `NFT_SET_INTERVAL`: the start, the end, if the range has its
     /// end, and the data.
     ranges: Vec<(Vec<u8>, Vec<u8>, bool, ProgData)>,
-    /// The lengths of the fields of a concatenated key, for the ranges with their end.
-    fields: Vec<usize>,
     /// The catch-all element, for a key that no other element has.
     catchall: Option<ProgData>,
     /// The stateful expressions of the elements that have them, by the start of their key,
@@ -1337,6 +1338,28 @@ struct ProgSet {
     catchall_expires: u64,
     /// The timeouts in milliseconds of the elements that have one.
     timeouts: BTreeMap<Vec<u8>, u64>,
+    /// The times of expiration of the elements of `keys` that have one, in order, for the
+    /// count of the elements at a commit.
+    keys_expire: Vec<u64>,
+    /// The handles of the chains that the verdicts of the elements jump to.
+    jumps: Vec<u64>,
+}
+
+impl ProgElems {
+    /// The number of elements of `keys` that have not expired at the time `now`.
+    fn count(&self, now: u64) -> usize {
+        self.keys.len() - self.keys_expire.partition_point(|&x| x <= now)
+    }
+}
+
+/// The elements of a set in a program, with the parts that belong to the program.
+#[derive(Debug, Default)]
+struct ProgSet {
+    elems: Arc<ProgElems>,
+    /// The index in the program of each chain of `elems.jumps`.
+    jumps: Vec<usize>,
+    /// The lengths of the fields of a concatenated key, for the ranges with their end.
+    fields: Vec<usize>,
     /// The changes of `dynset` since the commit, for a set that `dynset` changes or that has
     /// `NFT_SET_EVAL`.
     dynamic: Option<super::DynElems>,
@@ -1345,6 +1368,39 @@ struct ProgSet {
     size: usize,
     count: usize,
     timeout: u64,
+}
+
+/// The elements of a set in the programs, and the elements of the set that they come from. The
+/// copies of the set share it. A commit makes the elements of the programs again only if the
+/// elements of the set are not the same (`Arc::ptr_eq`): the elements of a set that a batch
+/// changes are a new copy (`NftSet::elems_mut`).
+#[derive(Clone)]
+pub(super) struct ProgCache(Arc<SpinLock<Option<ProgCached>>>);
+
+type ProgCached = (Arc<BTreeMap<super::ElemKey, super::NftElem>>, Arc<ProgElems>);
+
+impl ProgCache {
+    /// Removes the cached elements if they come from `from`, before a change of `from`. The
+    /// cache then does not keep the old elements of the set, and if no copy of the set shares
+    /// `from`, the change does not copy it.
+    pub(super) fn forget(&self, from: &Arc<BTreeMap<super::ElemKey, super::NftElem>>) {
+        let mut g = self.0.lock();
+        let old = if matches!(&*g, Some((f, _)) if Arc::ptr_eq(f, from)) { g.take() } else { None };
+        drop(g);
+        drop(old);
+    }
+}
+
+impl Default for ProgCache {
+    fn default() -> Self {
+        Self(Arc::new(SpinLock::new(None)))
+    }
+}
+
+impl core::fmt::Debug for ProgCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ProgCache")
+    }
 }
 
 /// The data of an element of `dynset`.
@@ -1364,24 +1420,35 @@ impl ProgSet {
 
     /// The expressions of the element with the start `start`.
     fn exprs_of(&self, start: &[u8]) -> Vec<NftObjState> {
-        self.exprs.get(start).cloned().unwrap_or_default()
+        self.elems.exprs.get(start).cloned().unwrap_or_default()
+    }
+
+    /// The data of an element of `elems`, with the chain of a verdict as an index in the
+    /// program.
+    fn in_prog(&self, d: &ProgData) -> ProgData {
+        match *d {
+            ProgData::Verdict { code, chain } => {
+                ProgData::Verdict { code, chain: self.jumps.get(chain).copied().unwrap_or(0) }
+            }
+            _ => d.clone(),
+        }
     }
 
     /// The data and the stateful expressions of the element of `key`.
     fn find_elem(&self, key: &[u8]) -> Option<(ProgData, Vec<NftObjState>)> {
-        let now = if self.expires.is_empty() && self.catchall_expires == 0 && self.dynamic.is_none()
-        {
+        let p = &*self.elems;
+        let now = if p.expires.is_empty() && p.catchall_expires == 0 && self.dynamic.is_none() {
             0
         } else {
             super::nft_now_ns()
         };
         let catchall = || {
-            self.catchall
-                .clone()
-                .filter(|_| self.catchall_expires == 0 || now < self.catchall_expires)
-                .map(|d| (d, self.catchall_exprs.clone()))
+            p.catchall
+                .as_ref()
+                .filter(|_| p.catchall_expires == 0 || now < p.catchall_expires)
+                .map(|d| (self.in_prog(d), p.catchall_exprs.clone()))
         };
-        let committed = |k: &[u8]| self.keys.get(k).map(|d| (d.clone(), self.exprs_of(k)));
+        let committed = |k: &[u8]| p.keys.get(k).map(|d| (self.in_prog(d), self.exprs_of(k)));
         if let Some(d) = &self.dynamic {
             match d.0.lock().elems.get(key) {
                 Some(DynElem::Add(e)) if !e.expired(now) => {
@@ -1394,17 +1461,17 @@ impl ProgSet {
                 None => {}
             }
         }
-        let live = |k: &[u8]| self.expires.get(k).is_none_or(|&t| now < t);
+        let live = |k: &[u8]| p.expires.get(k).is_none_or(|&t| now < t);
         committed(key)
             .filter(|_| live(key))
             .or_else(|| {
-                self.ranges.iter().find_map(|(s, e, with_end, d)| {
+                p.ranges.iter().find_map(|(s, e, with_end, d)| {
                     let inside = if *with_end {
                         super::nft_range_has(&self.fields, s, e, key)
                     } else {
                         s.as_slice() <= key && key < e.as_slice()
                     };
-                    (inside && live(s)).then(|| (d.clone(), self.exprs_of(s)))
+                    (inside && live(s)).then(|| (self.in_prog(d), self.exprs_of(s)))
                 })
             })
             .or_else(catchall)
@@ -1421,15 +1488,14 @@ fn nft_dynset_eval(d: &NftDynset, set: &ProgSet, regs: &mut NftRegs) -> Vec<NftO
     let now = super::nft_now_ns();
     let mut g = dy.0.lock();
     // The timeout of the element of the key, if it is there.
+    let p = &*set.elems;
     let committed = || {
-        let live = set.expires.get(&key).is_none_or(|&t| now < t);
-        (set.keys.contains_key(&key) && live).then(|| set.timeouts.get(&key).copied().unwrap_or(0))
+        let live = p.expires.get(&key).is_none_or(|&t| now < t);
+        (p.keys.contains_key(&key) && live).then(|| p.timeouts.get(&key).copied().unwrap_or(0))
     };
     let present = match g.elems.get(&key) {
         Some(DynElem::Add(e)) => (!e.expired(now)).then_some(e.timeout),
-        Some(&DynElem::Refresh(x)) => {
-            (now < x).then(|| set.timeouts.get(&key).copied().unwrap_or(0))
-        }
+        Some(&DynElem::Refresh(x)) => (now < x).then(|| p.timeouts.get(&key).copied().unwrap_or(0)),
         Some(DynElem::Del) => None,
         None => committed(),
     };
@@ -1525,7 +1591,9 @@ impl ProgChains {
     }
 }
 
-/// The elements of the set `s` of `table`.
+/// The set `s` of `table` in a program. The elements come from `ProgCache` if the elements of
+/// the set did not change since a commit made them. A map of objects has the state of the
+/// objects, so it gets its elements again at each commit.
 fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
     let set = &table.sets[s];
     let changed = table
@@ -1534,13 +1602,35 @@ fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
         .flat_map(|c| &c.rules)
         .flat_map(|r| &r.parsed)
         .any(|e| matches!(e, NftExpr::Dynset(d) if d.set == set.handle));
-    let mut p = ProgSet {
+    let objects = set.flags & NFT_SET_OBJECT != 0;
+    let cached = set.prog.0.lock().clone();
+    let elems = match cached {
+        Some((from, elems)) if !objects && Arc::ptr_eq(&from, &set.elems) => elems,
+        _ => {
+            let elems = Arc::new(prog_elems(table, set));
+            if !objects {
+                *set.prog.0.lock() = Some((set.elems.clone(), elems.clone()));
+            }
+            elems
+        }
+    };
+    ProgSet {
+        jumps: elems.jumps.iter().map(|&h| chains.index(h)).collect(),
         dynamic: (changed || set.flags & NFT_SET_EVAL != 0).then(|| set.dynamic.clone()),
         size: set.size as usize,
+        count: elems.count(super::nft_now_ns()),
         timeout: set.timeout,
         fields: super::nft_set_fields(set),
-        ..ProgSet::default()
-    };
+        elems,
+    }
+}
+
+/// Makes the elements of `set` of `table` for the programs. The elements that have expired
+/// are not there.
+fn prog_elems(table: &NftTable, set: &super::NftSet) -> ProgElems {
+    #[cfg(test)]
+    super::work::add(&super::work::BUILT, set.elems.len());
+    let mut p = ProgElems::default();
     let now = super::nft_now_ns();
     for (k, e) in set.elems.iter().filter(|(k, e)| e.timeout != 0 && !k.catchall) {
         p.timeouts.insert(k.key.clone(), e.timeout);
@@ -1559,10 +1649,19 @@ fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
             p.exprs.insert(k.key.clone(), e.exprs.clone());
         }
     }
+    // The index of each chain in `p.jumps`.
+    let mut jump_at: BTreeMap<u64, usize> = BTreeMap::new();
+    let jumps = &mut p.jumps;
     let mut data = |e: &super::NftElem| match &e.data {
         Some(NftData::Value(v)) => ProgData::Value(v.clone()),
         Some(NftData::Verdict { code, chain }) => {
-            ProgData::Verdict { code: *code, chain: chain.map_or(0, |h| chains.index(h)) }
+            let chain = chain.map_or(0, |h| {
+                *jump_at.entry(h).or_insert_with(|| {
+                    jumps.push(h);
+                    jumps.len() - 1
+                })
+            });
+            ProgData::Verdict { code: *code, chain }
         }
         Some(NftData::Obj(h)) => table
             .objs
@@ -1571,6 +1670,7 @@ fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
             .map_or(ProgData::None, |o| ProgData::Obj(o.state().clone())),
         None => ProgData::None,
     };
+    let (mut keys, mut ranges, mut catchall) = (BTreeMap::new(), Vec::new(), None);
     if set.flags & NFT_SET_INTERVAL != 0 {
         // The elements are in the order of the keys: a start, then the element with
         // `NFT_SET_ELEM_INTERVAL_END` that ends the range. A start with `NFTA_SET_ELEM_KEY_END`
@@ -1578,13 +1678,13 @@ fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
         let mut start: Option<(&Vec<u8>, ProgData)> = None;
         for (k, e) in set.elems.iter().filter(|(_, e)| !e.expired(now)) {
             if k.catchall {
-                p.catchall = Some(data(e));
+                catchall = Some(data(e));
             } else if k.end || e.flags & NFT_SET_ELEM_INTERVAL_END != 0 {
                 if let Some((s, d)) = start.take() {
-                    p.ranges.push((s.clone(), k.key.clone(), false, d));
+                    ranges.push((s.clone(), k.key.clone(), false, d));
                 }
             } else if let Some(end) = &e.key_end {
-                p.ranges.push((k.key.clone(), end.clone(), true, data(e)));
+                ranges.push((k.key.clone(), end.clone(), true, data(e)));
                 start = None;
             } else {
                 start = Some((&k.key, data(e)));
@@ -1592,19 +1692,20 @@ fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
         }
         // A start with no end goes to the last key.
         if let Some((s, d)) = start {
-            p.ranges.push((s.clone(), alloc::vec![0xff; s.len()], true, d));
+            ranges.push((s.clone(), alloc::vec![0xff; s.len()], true, d));
         }
     } else {
         for (k, e) in set.elems.iter().filter(|(_, e)| !e.expired(now)) {
             if k.catchall {
-                p.catchall = Some(data(e));
+                catchall = Some(data(e));
             } else {
-                p.keys.insert(k.key.clone(), data(e));
+                keys.insert(k.key.clone(), data(e));
             }
         }
     }
-    p.count = p.keys.len();
-    p
+    let mut keys_expire: Vec<u64> = keys.keys().filter_map(|k| p.expires.get(k).copied()).collect();
+    keys_expire.sort_unstable();
+    ProgElems { keys, ranges, catchall, keys_expire, ..p }
 }
 
 /// Makes the program of the chain `c` of `table`, as the rules of `nf_tables_commit_chain`
@@ -2141,6 +2242,10 @@ mod tests {
         ProgExpr::Verdict { code, chain }
     }
 
+    fn pset(elems: ProgElems) -> ProgSet {
+        ProgSet { elems: Arc::new(elems), ..ProgSet::default() }
+    }
+
     #[test]
     fn a_rule_drops_the_packets_that_match_and_the_rest_get_the_policy() {
         let mut r = dport(9);
@@ -2365,19 +2470,19 @@ mod tests {
         assert_eq!((packets.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed)), (1, 28));
 
         // udp dport in { 5-9 }, and not in { 7 } with NFT_LOOKUP_F_INV.
-        let range = ProgSet {
+        let range = pset(ProgElems {
             ranges: vec![(
                 5u16.to_be_bytes().to_vec(),
                 9u16.to_be_bytes().to_vec(),
                 true,
                 ProgData::None,
             )],
-            ..ProgSet::default()
-        };
-        let seven = ProgSet {
+            ..ProgElems::default()
+        });
+        let seven = pset(ProgElems {
             keys: [(7u16.to_be_bytes().to_vec(), ProgData::None)].into(),
-            ..ProgSet::default()
-        };
+            ..ProgElems::default()
+        });
         let mut r = dport(0);
         r.pop();
         r.push(ProgExpr::Lookup { set: 0, sreg: R1, len: 2, invert: false, dreg: None });
@@ -2396,26 +2501,33 @@ mod tests {
         let s = state(NFPROTO_IPV4);
         const R2: usize = 2 * NFT_REG_SIZE;
         // udp dport map { 7 : 70, 8 : 80 } in R2, R2 == 80: drop.
-        let map = ProgSet {
+        let map = pset(ProgElems {
             keys: [
                 (7u16.to_be_bytes().to_vec(), ProgData::Value(70u16.to_be_bytes().to_vec())),
                 (8u16.to_be_bytes().to_vec(), ProgData::Value(80u16.to_be_bytes().to_vec())),
             ]
             .into(),
-            ..ProgSet::default()
-        };
-        // udp dport vmap { 1-3 : jump c1, 9 : accept, * : goto c2 }.
+            ..ProgElems::default()
+        });
+        // udp dport vmap { 1-3 : jump c1, 9 : accept, * : goto c2 }. The chains of the elements
+        // are c1 and c2 of `jumps`, and they are the chains 1 and 2 of the program.
         let vmap = ProgSet {
-            keys: [(9u16.to_be_bytes().to_vec(), ProgData::Verdict { code: NF_ACCEPT, chain: 0 })]
+            jumps: vec![1, 2],
+            ..pset(ProgElems {
+                keys: [(
+                    9u16.to_be_bytes().to_vec(),
+                    ProgData::Verdict { code: NF_ACCEPT, chain: 0 },
+                )]
                 .into(),
-            ranges: vec![(
-                1u16.to_be_bytes().to_vec(),
-                3u16.to_be_bytes().to_vec(),
-                true,
-                ProgData::Verdict { code: NFT_JUMP, chain: 1 },
-            )],
-            catchall: Some(ProgData::Verdict { code: NFT_GOTO, chain: 2 }),
-            ..ProgSet::default()
+                ranges: vec![(
+                    1u16.to_be_bytes().to_vec(),
+                    3u16.to_be_bytes().to_vec(),
+                    true,
+                    ProgData::Verdict { code: NFT_JUMP, chain: 0 },
+                )],
+                catchall: Some(ProgData::Verdict { code: NFT_GOTO, chain: 1 }),
+                ..ProgElems::default()
+            })
         };
         let mut r0 = dport(0);
         r0.pop();
@@ -2442,18 +2554,107 @@ mod tests {
         assert_eq!(v, [NF_DROP, NF_DROP, NF_ACCEPT, NF_DROP, NF_ACCEPT, NF_DROP]);
     }
 
+    /// Two programs share the elements of a verdict map, and each has the chains of the jumps
+    /// at its own indexes. A batch copies only the set that it changes, and the commit makes
+    /// the elements of the programs again only for that set.
+    #[test]
+    fn the_programs_share_the_elements_of_a_set_that_did_not_change() {
+        use super::super::tests::{set, table};
+        use super::super::{ElemKey, NftChain, NftElem, NftRule, work};
+        let rule =
+            |parsed| NftRule { handle: 1, exprs: Vec::new(), parsed, udata: None, txn_id: None };
+        let chain = |handle, rules| NftChain {
+            name: alloc::format!("c{handle}").into_bytes(),
+            handle,
+            flags: 0,
+            udata: None,
+            base: None,
+            rules,
+            txn_id: None,
+        };
+        let load =
+            || NftExpr::Payload { base: NFT_PAYLOAD_TRANSPORT_HEADER, offset: 2, len: 2, dreg: R1 };
+        let lookup = |set, dreg| NftExpr::Lookup { set, sreg: R1, len: 2, invert: false, dreg };
+        let imm =
+            |code, chain| NftExpr::Immediate { dreg: 0, data: NftImm::Verdict { code, chain } };
+        let elem = |data| NftElem {
+            key_end: None,
+            data,
+            flags: 0,
+            udata: None,
+            timeout: 0,
+            expires: 0,
+            exprs: Vec::new(),
+            seq: 0,
+        };
+        let jump = |h| Some(NftData::Verdict { code: NFT_JUMP, chain: Some(h) });
+        let k = |p: u16| ElemKey { catchall: false, key: p.to_be_bytes().to_vec(), end: false };
+        // m: udp dport vmap { 1 : jump c11, 2 : jump c12 }. s: the ports 1000 to 10999.
+        let mut m = set(b"m");
+        (m.handle, m.flags, m.dtype, m.klen) = (1, NFT_SET_MAP, NFT_DATA_VERDICT, 2);
+        m.elems_mut().insert(k(1), elem(jump(11)));
+        m.elems_mut().insert(k(2), elem(jump(12)));
+        let mut s = set(b"s");
+        (s.handle, s.klen) = (2, 2);
+        for p in 1000..11000 {
+            s.elems_mut().insert(k(p), elem(None));
+        }
+        // c1: the vmap. c2: a port of s jumps to c12, then the vmap. c11 drops, c12 accepts.
+        // In the program of c1, c11 is the chain 1, and in the one of c2 it is the chain 2.
+        let mut t = table();
+        t.sets.extend([m, s]);
+        t.chains.push(chain(1, vec![rule(vec![load(), lookup(1, Some(0))])]));
+        t.chains.push(chain(
+            2,
+            vec![
+                rule(vec![load(), lookup(2, None), imm(NFT_JUMP, Some(12))]),
+                rule(vec![load(), lookup(1, Some(0))]),
+            ],
+        ));
+        t.chains.push(chain(11, vec![rule(vec![imm(NF_DROP, None)])]));
+        t.chains.push(chain(12, vec![rule(vec![imm(NF_ACCEPT, None)])]));
+        let st = state(NFPROTO_IPV4);
+        let run = |prog: &NftProg, ports: &[u16]| -> Vec<u32> {
+            ports.iter().map(|&p| nft_do_chain(prog, NF_ACCEPT, &mut udp4(p), &st)).collect()
+        };
+        work::take();
+        work::take_built();
+        let (p1, p2) = (nft_prog(&t, 0), nft_prog(&t, 1));
+        // The program of c2 takes the elements of m from the one of c1.
+        assert_eq!(work::take_built(), 10_002);
+        assert!(Arc::ptr_eq(&p1.sets[0].elems, &p2.sets[1].elems));
+        assert_eq!(
+            (p1.sets[0].jumps.as_slice(), p2.sets[1].jumps.as_slice()),
+            (&[1, 2][..], &[2, 1][..])
+        );
+        assert_eq!(run(&p1, &[1, 2, 3]), [NF_DROP, NF_ACCEPT, NF_ACCEPT]);
+        assert_eq!(run(&p2, &[1, 2, 1000]), [NF_DROP, NF_ACCEPT, NF_ACCEPT]);
+        // A batch adds 3 : jump c11 to m. Its copy of the tables shares the elements until then.
+        let mut b = t.clone();
+        assert_eq!(work::take(), (0, 0));
+        b.sets[0].elems_mut().insert(k(3), elem(jump(11)));
+        assert_eq!(work::take(), (0, 2));
+        let (q1, q2) = (nft_prog(&b, 0), nft_prog(&b, 1));
+        assert_eq!(work::take_built(), 3);
+        assert!(Arc::ptr_eq(&p2.sets[0].elems, &q2.sets[0].elems));
+        assert_eq!(run(&q1, &[1, 2, 3]), [NF_DROP, NF_ACCEPT, NF_DROP]);
+        assert_eq!(run(&q2, &[3, 2, 10_999]), [NF_DROP, NF_ACCEPT, NF_ACCEPT]);
+        // The old programs still have the old elements.
+        assert_eq!(run(&p1, &[3]), [NF_ACCEPT]);
+    }
+
     #[test]
     fn an_element_matches_until_it_expires() {
         use core::sync::atomic::Ordering;
         let k = |p: u16| p.to_be_bytes().to_vec();
-        let set = ProgSet {
+        let set = pset(ProgElems {
             keys: [(k(1), ProgData::None), (k(2), ProgData::None)].into(),
             ranges: vec![(k(10), k(20), true, ProgData::None)],
             catchall: Some(ProgData::Value(k(7))),
             expires: [(k(1), 5_000), (k(10), 8_000)].into(),
             catchall_expires: 9_000,
-            ..ProgSet::default()
-        };
+            ..ProgElems::default()
+        });
         super::super::NFT_TEST_NS.store(4_999, Ordering::Relaxed);
         assert!(matches!(set.find(&k(1)), Some(ProgData::None)));
         assert!(matches!(set.find(&k(15)), Some(ProgData::None)));
@@ -2524,17 +2725,15 @@ mod tests {
         r3.extend([dynset(1, 0, true), verdict(NF_DROP, 0)]);
         let k = |p: u16| p.to_be_bytes().to_vec();
         let set0 = ProgSet {
-            keys: [(k(6), ProgData::None)].into(),
             count: 1,
             dynamic: Some(Default::default()),
-            ..ProgSet::default()
+            ..pset(ProgElems { keys: [(k(6), ProgData::None)].into(), ..ProgElems::default() })
         };
         let set1 = ProgSet {
-            keys: [(k(9), ProgData::None)].into(),
             size: 1,
             count: 1,
             dynamic: Some(Default::default()),
-            ..ProgSet::default()
+            ..pset(ProgElems { keys: [(k(9), ProgData::None)].into(), ..ProgElems::default() })
         };
         let prog =
             NftProg { chains: vec![vec![r2, r0, r1, r3]], sets: vec![set0, set1], nat: false };
