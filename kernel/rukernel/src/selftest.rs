@@ -321,10 +321,10 @@ fn timer_test() -> bool {
     println!("rk.test: {got} ticks in {waits} waits, timer at {} Hz", time::timer_frequency());
     ok &= check("the timer interrupts arrive", got >= want);
     ok &= check("interrupts are off again", !irq::enabled());
-    #[cfg(target_arch = "x86_64")]
     {
-        // The kernel keeps interrupts off for a tenth of a second, so the APIC keeps only one
-        // interrupt of the timer. The tick count must still add each tick of that time.
+        // The kernel keeps interrupts off for a tenth of a second, so the APIC or the GIC keeps
+        // only one interrupt of the timer. The tick count must still add each tick of that time.
+        // On arm64 the counter gives the ticks (#813).
         let start = time::ticks();
         let until = time::nanos() + 100_000_000;
         while time::nanos() < until {

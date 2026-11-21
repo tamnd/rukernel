@@ -9,12 +9,13 @@ use core::sync::atomic::{Ordering, compiler_fence};
 /// `rk_frame::vdso`.
 #[repr(C)]
 pub struct Data {
-    ticks: u64,
+    base_ns: u64,
     ns_per_tick: u64,
     seq: u64,
-    tick_counter: u64,
+    base_counter: u64,
     counter_mult: u64,
     realtime_offset: u64,
+    max_part: u64,
 }
 
 #[repr(C)]
@@ -33,7 +34,9 @@ pub const NSEC_PER_SEC: u64 = 1_000_000_000;
 pub const PAGE_SIZE: usize = 4096;
 
 /// The nanoseconds since boot and the offset of `CLOCK_REALTIME`. This is the calculation of
-/// `clock_ns` in the kernel. The two values come from the same version of the page.
+/// `clock_ns` in the kernel: the base time plus the time of the counter since the base, with the
+/// limit `max_part`. The limit is less than one tick on x86-64, and there is no limit on arm64. The
+/// two values come from the same version of the page.
 fn now_and_offset() -> (u64, u64) {
     let d = data();
     // SAFETY: the kernel maps the data page below the vDSO, and it writes each field with one
@@ -42,18 +45,18 @@ fn now_and_offset() -> (u64, u64) {
         loop {
             let seq = core::ptr::addr_of!((*d).seq).read_volatile();
             compiler_fence(Ordering::SeqCst);
-            let ticks = core::ptr::addr_of!((*d).ticks).read_volatile();
-            let ns_per_tick = core::ptr::addr_of!((*d).ns_per_tick).read_volatile();
-            let base = core::ptr::addr_of!((*d).tick_counter).read_volatile();
+            let base_ns = core::ptr::addr_of!((*d).base_ns).read_volatile();
+            let base = core::ptr::addr_of!((*d).base_counter).read_volatile();
             let mult = core::ptr::addr_of!((*d).counter_mult).read_volatile();
             let offset = core::ptr::addr_of!((*d).realtime_offset).read_volatile();
+            let max_part = core::ptr::addr_of!((*d).max_part).read_volatile();
             let now = counter();
             compiler_fence(Ordering::SeqCst);
             if seq & 1 == 0 && core::ptr::addr_of!((*d).seq).read_volatile() == seq {
                 let cycles = now.saturating_sub(base);
-                let part = ((u128::from(cycles) * u128::from(mult)) >> 32)
-                    .min(u128::from(ns_per_tick.saturating_sub(1)));
-                return (ticks.wrapping_mul(ns_per_tick).wrapping_add(part as u64), offset);
+                let part =
+                    ((u128::from(cycles) * u128::from(mult)) >> 32).min(u128::from(max_part));
+                return (base_ns.wrapping_add(part as u64), offset);
             }
         }
     }

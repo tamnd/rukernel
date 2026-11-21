@@ -157,6 +157,11 @@ pub(crate) mod timer {
     pub(crate) fn clock_ns() -> u64 {
         nanos()
     }
+
+    /// The timer ticks since boot.
+    pub(crate) fn ticks() -> u64 {
+        TICKS.load(core::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Interrupt control. These architectures take no interrupts yet.

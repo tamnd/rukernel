@@ -19,6 +19,8 @@ pub mod arch;
 #[cfg(any(test, all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 pub(crate) mod blocks;
 pub mod boot;
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) mod clocksource;
 pub mod console;
 pub mod cpu;
 pub mod date;
