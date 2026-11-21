@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- SELinux checks the maps of files and of anonymous memory, as `selinux_mmap_file` and `file_map_prot_check` of Linux. A map of a file needs `map`, `read`, `write` if the map is shared and can write, and `execute` if it can run code. A map that can run code needs `execmem` of the process if it is anonymous memory, a file without an inode, or a private map that can also write (#540).
+
 ## [0.5.38] - 2026-11-21
 
 ### Added

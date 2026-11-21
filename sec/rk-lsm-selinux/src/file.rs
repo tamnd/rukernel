@@ -1,9 +1,10 @@
 //! The checks of the access to files, the inode and file hooks of security/selinux/hooks.c of
 //! Linux: the permissions of a path walk and of `access`, of an open, of a `stat`, of a change
 //! of the attributes or of the size, and of a read, a write, a lock, an `fcntl` or an `ioctl`
-//! of an open file, with the extended permissions of the `ioctl` commands.
+//! of an open file, with the extended permissions of the `ioctl` commands, and of a map of a
+//! file or of anonymous memory.
 
-use crate::classmap::{class, dir, fd, file};
+use crate::classmap::{class, dir, fd, file, process};
 use crate::inode::inode_label;
 use crate::services::ext;
 use crate::sidtab::sid;
@@ -15,6 +16,7 @@ use rk_abi::native::fcntl::{
     F_SETFL, F_SETLK, F_SETLKW, F_SETOWN, F_SETSIG,
 };
 use rk_abi::native::ioctls::{FIOASYNC, FIOCLEX, FIONBIO, FIONCLEX, FIONREAD};
+use rk_abi::native::mman::{MAP_SHARED, MAP_TYPE, PROT_EXEC, PROT_WRITE};
 use rk_abi::native::open::{O_ACCMODE, O_APPEND, O_RDONLY, O_RDWR, O_WRONLY};
 use rk_vfs::cred::{Cred, may};
 use rk_vfs::dentry::Location;
@@ -55,6 +57,10 @@ const KDSKBENT: u32 = 0x4B47;
 const KDSKBSENT: u32 = 0x4B49;
 /// The capability `CAP_SYS_TTY_CONFIG`, for a change of the keyboard map.
 const CAP_SYS_TTY_CONFIG: u32 = 26;
+
+/// Tells that memory without `PROT_EXEC` cannot run code, so a map that can run code needs
+/// more checks, as `default_noexec` of Linux. It is true on x86_64 and on arm64.
+const DEFAULT_NOEXEC: bool = true;
 
 /// The type bits of a mode, `S_IFMT`, and the type of a directory, `S_IFDIR`.
 const S_IFMT: u32 = 0o170_000;
@@ -452,6 +458,54 @@ pub fn file_ioctl(f: &File, cmd: u32) -> Result<()> {
     }
 }
 
+/// Checks the protection `prot` of a map of the file `f`, or of anonymous memory if `f` is
+/// `None`, as `file_map_prot_check` of Linux. A map that can run code needs `execmem` of the
+/// process if it is anonymous memory, a file without an inode, or a private map that can also
+/// write. A map of a file needs `read`, `write` if it is shared and can write, and `execute`
+/// if it can run code.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies a permission in enforcing mode.
+fn file_map_prot_check(f: Option<&File>, prot: u64, shared: bool) -> Result<()> {
+    let exec = prot & u64::from(PROT_EXEC) != 0;
+    let write = prot & u64::from(PROT_WRITE) != 0;
+    if DEFAULT_NOEXEC && exec && f.is_none_or(|f| f.inode().is_none() || (!shared && write)) {
+        let sid = crate::current_sid();
+        avc::has_perm(sid, sid, class::PROCESS, process::EXECMEM, |_| {})?;
+    }
+    let Some(f) = f else { return Ok(()) };
+    let mut av = file::READ;
+    if shared && write {
+        av |= file::WRITE;
+    }
+    if exec {
+        av |= file::EXECUTE;
+    }
+    file_has_perm(f, av)
+}
+
+/// Checks a map of the file `f`, or of anonymous memory if `f` is `None`, with the protection
+/// `prot` and the flags `flags`, as `selinux_mmap_file` of Linux: `map` on the file, then the
+/// checks of [`file_map_prot_check`]. Only `MAP_SHARED` makes a shared map here, not
+/// `MAP_SHARED_VALIDATE`, as in Linux.
+///
+/// # Errors
+///
+/// `EACCES` if the policy denies a permission in enforcing mode.
+pub fn mmap_file(f: Option<&File>, prot: u64, flags: u64) -> Result<()> {
+    if !crate::initialized() {
+        return Ok(());
+    }
+    if let Some(f) = f
+        && let Some(inode) = f.inode()
+    {
+        let (isid, sclass) = inode_label(&**inode, f.location());
+        avc::has_perm(crate::current_sid(), isid, sclass, file::MAP, file_fields(f))?;
+    }
+    file_map_prot_check(f, prot, flags & u64::from(MAP_TYPE) == u64::from(MAP_SHARED))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +674,47 @@ mod tests {
         crate::set_enforcing(false);
         assert_eq!(file_ioctl(&f, 0x4321), Ok(()));
         assert_eq!(file_ioctl(&f, KDSKBENT), Ok(()));
+    }
+
+    #[test]
+    fn a_map_needs_map_and_the_permissions_of_its_protection() {
+        use rk_abi::native::mman::{MAP_PRIVATE, MAP_SHARED_VALIDATE, PROT_READ};
+        let _guard = setup();
+        let (_, at) = selinuxfs();
+        let f = File::open_inode(at, O_RDWR);
+        let (r, w, x) = (u64::from(PROT_READ), u64::from(PROT_WRITE), u64::from(PROT_EXEC));
+        let (shared, private) = (u64::from(MAP_SHARED), u64::from(MAP_PRIVATE));
+        crate::set_enforcing(true);
+        // The policy gives kernel_t map, read and execute on security_t, but not write. Only a
+        // shared map needs write.
+        assert_eq!(mmap_file(Some(&f), r, shared), Ok(()));
+        assert_eq!(mmap_file(Some(&f), r | x, private), Ok(()));
+        assert_eq!(mmap_file(Some(&f), r | w, private), Ok(()));
+        assert_eq!(mmap_file(Some(&f), r | w, shared), Err(Errno::EACCES));
+        assert_eq!(mmap_file(Some(&f), r | w, u64::from(MAP_SHARED_VALIDATE)), Ok(()));
+        // A private map that can write and run code, and anonymous memory that can run code,
+        // need execmem, which the policy does not give.
+        assert_eq!(mmap_file(Some(&f), r | w | x, private), Err(Errno::EACCES));
+        assert_eq!(mmap_file(None, r | w, private), Ok(()));
+        assert_eq!(mmap_file(None, r | x, shared), Err(Errno::EACCES));
+        // The policy does not give kernel_t map on sysfs_t.
+        let source = MountSource { source: b"sysfs".to_vec(), fstype: "sysfs", flags: 0 };
+        let root = Dentry::new_root(Arc::new(Node(0o040_755)));
+        let inode: InodeRef = Arc::new(Node(0o100_644));
+        let at = Location {
+            mount: MountNamespace::detached(root.clone(), source),
+            dentry: root.add_child(b"kernel", inode),
+        };
+        let g = File::open_inode(at, O_RDONLY);
+        assert_eq!(mmap_file(Some(&g), r, private), Err(Errno::EACCES));
+        // A file of init_t needs use of the class fd.
+        let init = crate::server::context_to_sid(b"system_u:system_r:init_t:s0", 0, false).unwrap();
+        store(&f, slot::SID, init);
+        assert_eq!(mmap_file(Some(&f), r, shared), Err(Errno::EACCES));
+        crate::set_enforcing(false);
+        assert_eq!(mmap_file(Some(&f), r | w | x, private), Ok(()));
+        assert_eq!(mmap_file(Some(&g), r, private), Ok(()));
+        assert_eq!(mmap_file(None, x, private), Ok(()));
     }
 
     #[test]

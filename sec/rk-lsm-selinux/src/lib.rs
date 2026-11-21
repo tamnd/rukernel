@@ -133,6 +133,10 @@ impl SecurityHooks for SeLinux {
         file::file_ioctl(f, cmd)
     }
 
+    fn mmap_file(&self, f: Option<&File>, _reqprot: u64, prot: u64, flags: u64) -> Result<()> {
+        file::mmap_file(f, prot, flags)
+    }
+
     fn inode_getattr(&self, at: &Location) -> Result<()> {
         file::inode_getattr(at)
     }

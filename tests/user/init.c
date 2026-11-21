@@ -16951,7 +16951,7 @@ static void test_selinux(void)
 	static char want[512];
 	struct statfs sfs;
 	struct stat st;
-	unsigned long ino_w = 0, ino_e = 0, ino_n = 0, ino_d = 0, ino_f = 0;
+	unsigned long ino_w = 0, ino_e = 0, ino_n = 0, ino_d = 0, ino_f = 0, ino_s = 0;
 	int n, fd, len, efd, xfd, cfd, rfd, wfd, afd;
 	struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
 	struct termios tios;
@@ -16959,6 +16959,7 @@ static void test_selinux(void)
 	struct fsxattr fsx;
 	unsigned long long size64;
 	int bsz, zero = 0;
+	void *ms, *mx, *mw, *ma, *mt;
 
 	n = klogctl(3, buf, sizeof(buf) - 1);
 	buf[n > 0 ? n : 0] = 0;
@@ -17138,6 +17139,32 @@ static void test_selinux(void)
 	check("selinux: an ioctl command that the extended permissions allow goes to the file in enforcing mode", ioctl(wfd, TCGETS, &tios) < 0 && errno == ENOTTY && ioctl(wfd, BLKGETSIZE64, &size64) < 0 && errno == ENOTTY);
 	check("selinux: an ioctl command that the extended permissions do not allow gives EACCES in enforcing mode", ioctl(wfd, TIOCGWINSZ, &ws) < 0 && errno == EACCES && ioctl(wfd, FS_IOC_FSGETXATTR, &fsx) < 0 && errno == EACCES && ioctl(wfd, FIOCLEX) < 0 && errno == EACCES);
 	check("selinux: FIGETBSZ and FIONBIO work and FS_IOC_SETFLAGS gives EACCES in enforcing mode", ioctl(wfd, FIGETBSZ, &bsz) == 0 && bsz > 0 && ioctl(wfd, FIONBIO, &zero) == 0 && ioctl(wfd, FS_IOC_SETFLAGS, &zero) < 0 && errno == EACCES);
+	/*
+	 * The checks of a map, as selinux_mmap_file and file_map_prot_check of Linux. The policy gives kernel_t map, read and execute on etc_t, so a shared
+	 * map that reads and a private map that runs code work. A private map that can write and run code and anonymous memory that can run code need
+	 * execmem, and the policy does not give map on tmpfs_t.
+	 */
+	fd = open("/tmp/rk-aa-w", O_RDONLY);
+	ms = fd < 0 ? MAP_FAILED : mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+	mx = fd < 0 ? MAP_FAILED : mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+	check("selinux: a shared map that reads and a private map that runs code work in enforcing mode", ms != MAP_FAILED && mx != MAP_FAILED);
+	mw = fd < 0 ? NULL : mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE, fd, 0);
+	check("selinux: a private map that can write and run code gives EACCES in enforcing mode", mw == MAP_FAILED && errno == EACCES);
+	ma = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	check("selinux: anonymous memory that can run code gives EACCES in enforcing mode", ma == MAP_FAILED && errno == EACCES);
+	if (ms != MAP_FAILED)
+		munmap(ms, 4096);
+	if (mx != MAP_FAILED)
+		munmap(mx, 4096);
+	if (fd >= 0)
+		close(fd);
+	if (stat("/tmp/rk-sub", &st) == 0)
+		ino_s = st.st_ino;
+	fd = open("/tmp/rk-sub", O_RDONLY);
+	mt = fd < 0 ? NULL : mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+	check("selinux: a map of a file of tmpfs_t gives EACCES in enforcing mode", mt == MAP_FAILED && errno == EACCES);
+	if (fd >= 0)
+		close(fd);
 	close(rfd);
 	close(wfd);
 	close(afd);
@@ -17200,6 +17227,10 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the denial of the F_SETFL", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "avc:  denied  { ioctl } for  pid=1 comm=\"init\" path=\"/tmp/rk-aa-w\" dev=\"tmpfs\" ino=%lu ioctlcmd=0x5413 scontext=%s tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0", ino_w, kernel);
 	check("selinux: the kernel log has the denial of the ioctl command with its number", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { map } for  pid=1 comm=\"init\" path=\"/tmp/rk-sub\" dev=\"tmpfs\" ino=%lu scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=file permissive=0", ino_s, kernel);
+	check("selinux: the kernel log has the denial of the map", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { execmem } for  pid=1 comm=\"init\" scontext=%s tcontext=%s tclass=process permissive=0", kernel, kernel);
+	check("selinux: the kernel log has the denial of execmem", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "tcontext=%s tclass=fd permissive=1", kernel);
 	check("selinux: the kernel log has the denial of the use of the pipe of init by init_t", strstr(buf, "avc:  denied  { use } for  pid=") != NULL && strstr(buf, "scontext=system_u:system_r:init_t:s0 ") != NULL && strstr(buf, want) != NULL);
 	unlink("/tmp/rk-aa-w");
