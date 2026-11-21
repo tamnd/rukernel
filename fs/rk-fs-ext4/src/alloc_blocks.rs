@@ -20,6 +20,29 @@ pub(crate) fn test_bit(bitmap: &[u8], bit: usize) -> bool {
     bitmap[bit / 8] & (1 << (bit % 8)) != 0
 }
 
+/// Gives the first clear bit of `bitmap` from `from` to before `end`, as `find_next_zero_bit` of
+/// Linux: the words of 64 bits with all bits set go by in one step.
+pub(crate) fn next_zero_bit(bitmap: &[u8], from: usize, end: usize) -> Option<usize> {
+    let end = end.min(bitmap.len() * 8);
+    let mut bit = from;
+    while bit < end {
+        if bit % 64 == 0 && bit + 64 <= end {
+            let at = bit / 8;
+            let word = u64::from_le_bytes(bitmap[at..at + 8].try_into().ok()?);
+            if word == u64::MAX {
+                bit += 64;
+                continue;
+            }
+            return Some(bit + word.trailing_ones() as usize);
+        }
+        if !test_bit(bitmap, bit) {
+            return Some(bit);
+        }
+        bit += 1;
+    }
+    None
+}
+
 pub(crate) fn set_bit(bitmap: &mut [u8], bit: usize, on: bool) {
     if on {
         bitmap[bit / 8] |= 1 << (bit % 8);
@@ -393,8 +416,9 @@ impl Tx<'_> {
                 continue;
             }
             let mut bitmap = self.inode_bitmap(group)?;
-            let used = |b: usize| test_bit(&bitmap, b) || group * ipg + b as u32 + 1 < first_ino;
-            let Some(bit) = (0..ipg as usize).find(|&b| !used(b)) else { continue };
+            // The inodes before `first_ino` are reserved.
+            let from = first_ino.saturating_sub(1).saturating_sub(group * ipg) as usize;
+            let Some(bit) = next_zero_bit(&bitmap, from, ipg as usize) else { continue };
             set_bit(&mut bitmap, bit, true);
             // A group with a block bitmap that is not on the disk gets it now, as Linux.
             if self.desc_flags(group) & bg::BLOCK_UNINIT != 0 {

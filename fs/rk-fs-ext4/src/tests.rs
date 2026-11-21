@@ -2675,3 +2675,21 @@ fn a_delayed_write_on_a_full_disk_allocates_at_once() {
     assert!(ram.free().0 < free as u32);
     assert!(file.fiemap(0, u64::MAX).unwrap().iter().all(|e| !e.delalloc));
 }
+
+#[test]
+fn the_first_clear_bit_is_the_same_as_in_a_scan_of_each_bit() {
+    use alloc_blocks::{next_zero_bit, set_bit, test_bit};
+    let mut bitmap = vec![0xffu8; 64];
+    assert_eq!(next_zero_bit(&bitmap, 0, 512), None);
+    // A clear bit after full words, before and after `from`, and at the end.
+    for clear in [0, 7, 63, 64, 200, 300, 511] {
+        set_bit(&mut bitmap, clear, false);
+        for from in [0, 1, 63, 64, 65, 199, 201, 400] {
+            for end in [100, 256, 300, 301, 512, 9999] {
+                let scan = (from..end.min(512)).find(|&b| !test_bit(&bitmap, b));
+                assert_eq!(next_zero_bit(&bitmap, from, end), scan, "{clear} {from} {end}");
+            }
+        }
+    }
+    assert_eq!(next_zero_bit(&[0u8; 8], 3, 64), Some(3));
+}

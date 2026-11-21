@@ -2,8 +2,8 @@
 //! `/proc/sys` and the directory of each process.
 
 use crate::node::{
-    FindFn, WriteFn, data_file, dir, file, join, jump_link, link, net_sysctl_access, ops_file,
-    rw_file, set_access, set_check, set_gone, set_owner, sysctl_file,
+    Entries, FindFn, WriteFn, data_file, dir, file, join, jump_link, link, net_sysctl_access,
+    ops_file, rw_file, set_access, set_check, set_gone, set_owner, sysctl_file, table_dir,
 };
 use crate::options::{
     HIDEPID_INVISIBLE, HIDEPID_NO_ACCESS, HIDEPID_OFF, HIDEPID_PTRACEABLE, Options,
@@ -2436,15 +2436,14 @@ fn read_text(text: &[u8], offset: u64, buf: &mut [u8]) -> usize {
 /// The files of the user namespace of the process: `uid_map`, `gid_map`, `projid_map` and
 /// `setgroups`, as fs/proc/base.c and kernel/user_namespace.c of Linux. The writer is the
 /// process that calls `write`.
-fn user_ns_files(w: &Weak<Process>, base: &[u8], out: &mut Vec<(Vec<u8>, InodeRef)>) {
+fn user_ns_files(w: &Weak<Process>, base: &[u8], out: &mut Entries<'_>) {
     use rk_vfs::user_ns::{self, IdKind};
     let me = rk_vfs::cred::current;
     for (name, kind) in
         [(&b"uid_map"[..], IdKind::Uid), (b"gid_map", IdKind::Gid), (b"projid_map", IdKind::Projid)]
     {
         let (p_, p2) = (w.clone(), w.clone());
-        out.push((
-            name.to_vec(),
+        out.add(name, || {
             data_file(
                 &join(base, name),
                 0o644,
@@ -2458,12 +2457,11 @@ fn user_ns_files(w: &Weak<Process>, base: &[u8], out: &mut Vec<(Vec<u8>, InodeRe
                     user_ns::write_map(&ns, kind, &me(), offset, data)?;
                     Ok(data.len())
                 },
-            ),
-        ));
+            )
+        });
     }
     let (p_, p2) = (w.clone(), w.clone());
-    out.push((
-        b"setgroups".to_vec(),
+    out.add(b"setgroups", || {
         data_file(
             &join(base, b"setgroups"),
             0o644,
@@ -2476,8 +2474,8 @@ fn user_ns_files(w: &Weak<Process>, base: &[u8], out: &mut Vec<(Vec<u8>, InodeRe
                 user_ns::write_setgroups(&ns, &me(), offset, data)?;
                 Ok(data.len())
             },
-        ),
-    ));
+        )
+    });
 }
 
 fn process_files(
@@ -2485,34 +2483,32 @@ fn process_files(
     t: Option<Weak<Thread>>,
     base: &[u8],
     ns: &PidNs,
+    want: Option<&[u8]>,
 ) -> Vec<(Vec<u8>, InodeRef)> {
-    let mut out: Vec<(Vec<u8>, InodeRef)> = Vec::new();
+    let mut out = Entries::new(want);
     let p_ = w.clone();
     let t_ = t.clone();
     let ns_ = ns.clone();
-    out.push((
-        b"stat".to_vec(),
+    out.add(b"stat", || {
         file(&join(base, b"stat"), move || {
             let p = alive(&p_)?;
             let t = t_.as_ref().map(alive).transpose()?;
             Ok(text::stat(&stat_of(&p, t.as_deref(), &ns_)))
-        }),
-    ));
+        })
+    });
     let p_ = w.clone();
     let t_ = t.clone();
     let ns_ = ns.clone();
-    out.push((
-        b"status".to_vec(),
+    out.add(b"status", || {
         file(&join(base, b"status"), move || {
             let p = alive(&p_)?;
             let t = t_.as_ref().map(alive).transpose()?;
             Ok(status_of(&p, t.as_deref(), &ns_))
-        }),
-    ));
+        })
+    });
     let p_ = w.clone();
     let p2 = w.clone();
-    out.push((
-        b"comm".to_vec(),
+    out.add(b"comm", || {
         rw_file(
             &join(base, b"comm"),
             move || {
@@ -2525,8 +2521,8 @@ fn process_files(
                 alive(&p2)?.set_comm(name);
                 Ok(())
             },
-        ),
-    ));
+        )
+    });
     // As `timerslack_ns` in fs/proc/base.c of Linux: the slack of the thread of the directory, or
     // of the main thread. Another process needs `CAP_SYS_NICE` to change it, and 0 sets the
     // default again.
@@ -2534,8 +2530,7 @@ fn process_files(
     let t_ = t.clone();
     let p2 = w.clone();
     let t2 = t.clone();
-    out.push((
-        b"timerslack_ns".to_vec(),
+    out.add(b"timerslack_ns", || {
         rw_file(
             &join(base, b"timerslack_ns"),
             move || Ok(alloc::format!("{}\n", slack_thread(&p_, &t_)?.timer_slack()).into_bytes()),
@@ -2552,15 +2547,14 @@ fn process_files(
                 thread.set_timer_slack(ns);
                 Ok(())
             },
-        ),
-    ));
+        )
+    });
     if t.is_none() {
         // As `timens_offsets` in fs/proc/base.c of Linux: the offsets of the time namespace for
         // the children of the process.
         let p_ = w.clone();
         let p2 = w.clone();
-        out.push((
-            b"timens_offsets".to_vec(),
+        out.add(b"timens_offsets", || {
             rw_file(
                 &join(base, b"timens_offsets"),
                 move || {
@@ -2573,32 +2567,27 @@ fn process_files(
                     let may = me.process().cred().capable(rk_vfs::cred::cap::SYS_TIME);
                     rk_proc::timens::write_offsets(&ns, data, rk_frame::time::clock_ns(), may)
                 },
-            ),
-        ));
+            )
+        });
     }
     user_ns_files(w, base, &mut out);
     let p_ = w.clone();
     let t_ = t.clone();
-    out.push((
-        b"syscall".to_vec(),
+    out.add(b"syscall", || {
         file(&join(base, b"syscall"), move || {
             let p = alive(&p_)?;
             let t = t_.as_ref().map(alive).transpose()?;
             Ok(syscall_of(&p, t.as_deref()))
-        }),
-    ));
+        })
+    });
     let p_ = w.clone();
-    out.push((
-        b"cmdline".to_vec(),
-        file(&join(base, b"cmdline"), move || Ok(alive(&p_)?.cmdline())),
-    ));
-    out.push((b"environ".to_vec(), file(&join(base, b"environ"), || Ok(Vec::new()))));
+    out.add(b"cmdline", || file(&join(base, b"cmdline"), move || Ok(alive(&p_)?.cmdline())));
+    out.add(b"environ", || file(&join(base, b"environ"), || Ok(Vec::new())));
     let p_ = w.clone();
-    out.push((b"auxv".to_vec(), file(&join(base, b"auxv"), move || Ok(alive(&p_)?.auxv()))));
+    out.add(b"auxv", || file(&join(base, b"auxv"), move || Ok(alive(&p_)?.auxv())));
     let p_ = w.clone();
     let p2 = w.clone();
-    out.push((
-        b"mem".to_vec(),
+    out.add(b"mem", || {
         data_file(
             &join(base, b"mem"),
             0o600,
@@ -2608,81 +2597,73 @@ fn process_files(
             move |addr, buf| {
                 mem_access(&p2, addr, buf.len(), |vm, at, range| vm.write_force(at, &buf[range]))
             },
-        ),
-    ));
+        )
+    });
     let (p_, p2) = (w.clone(), w.clone());
-    out.push((
-        b"maps".to_vec(),
+    out.add(b"maps", || {
         ops_file(
             &join(base, b"maps"),
             0o444,
             move || maps_of(&*alive(&p_)?),
             move || Some(Arc::new(MapsFile { p: p2.clone() })),
-        ),
-    ));
+        )
+    });
     let p_ = w.clone();
-    out.push((
-        b"pagemap".to_vec(),
+    out.add(b"pagemap", || {
         data_file(
             &join(base, b"pagemap"),
             0o400,
             move |offset, buf| pagemap_read(&*alive(&p_)?, offset, buf),
             |_, _| Err(Errno::EINVAL),
-        ),
-    ));
+        )
+    });
     let p_ = w.clone();
-    out.push((
-        b"clear_refs".to_vec(),
+    out.add(b"clear_refs", || {
         data_file(
             &join(base, b"clear_refs"),
             0o200,
             |_, _| Err(Errno::EINVAL),
             move |_, data| clear_refs_write(&*alive(&p_)?, data),
-        ),
-    ));
+        )
+    });
     let p_ = w.clone();
-    out.push((b"smaps".to_vec(), file(&join(base, b"smaps"), move || smaps_of(&*alive(&p_)?))));
+    out.add(b"smaps", || file(&join(base, b"smaps"), move || smaps_of(&*alive(&p_)?)));
     let (p_, p2) = (w.clone(), w.clone());
-    out.push((
-        b"mounts".to_vec(),
+    out.add(b"mounts", || {
         ops_file(
             &join(base, b"mounts"),
             0o444,
             move || mounts_of(&*alive(&p_)?),
             move || MountsFile::open(&*p2.upgrade()?),
-        ),
-    ));
-    out.push((b"net".to_vec(), net_dir(base)));
+        )
+    });
+    out.add(b"net", || net_dir(base));
     let (p_, p2) = (w.clone(), w.clone());
-    out.push((
-        b"mountinfo".to_vec(),
+    out.add(b"mountinfo", || {
         ops_file(
             &join(base, b"mountinfo"),
             0o444,
             move || mountinfo_of(&*alive(&p_)?),
             move || MountsFile::open(&*p2.upgrade()?),
-        ),
-    ));
+        )
+    });
     let p_ = w.clone();
-    out.push((
-        b"statm".to_vec(),
-        file(&join(base, b"statm"), move || Ok(text::statm(&statm_of(&*alive(&p_)?)))),
-    ));
+    out.add(b"statm", || {
+        file(&join(base, b"statm"), move || Ok(text::statm(&statm_of(&*alive(&p_)?))))
+    });
     let p_ = w.clone();
     let t_ = t.clone();
-    out.push((
-        b"cgroup".to_vec(),
+    out.add(b"cgroup", || {
         file(&join(base, b"cgroup"), move || {
             let t = t_.as_ref().map(alive).transpose()?;
             Ok(cgroup_of(&*alive(&p_)?, t.as_deref()))
-        }),
-    ));
-    out.push((b"ns".to_vec(), ns_dir(base, w.clone(), t.clone())));
-    out.push((b"attr".to_vec(), attr_dir(base, w.clone(), t.clone())));
+        })
+    });
+    out.add(b"ns", || ns_dir(base, w.clone(), t.clone()));
+    out.add(b"attr", || attr_dir(base, w.clone(), t.clone()));
     let p_ = w.clone();
     let p2 = w.clone();
-    out.push((
-        b"oom_score_adj".to_vec(),
+    out.add(b"oom_score_adj", || {
         rw_file(
             &join(base, b"oom_score_adj"),
             move || Ok(text::number(i64::from(alive(&p_)?.oom_score_adj()))),
@@ -2694,13 +2675,12 @@ fn process_files(
                 alive(&p2)?.set_oom_score_adj(v as i32);
                 Ok(())
             },
-        ),
-    ));
-    out.push((b"oom_score".to_vec(), file(&join(base, b"oom_score"), || Ok(b"0\n".to_vec()))));
+        )
+    });
+    out.add(b"oom_score", || file(&join(base, b"oom_score"), || Ok(b"0\n".to_vec())));
     // As `proc_pid_limits` in fs/proc/base.c of Linux.
     let p_ = w.clone();
-    out.push((
-        b"limits".to_vec(),
+    out.add(b"limits", || {
         file(&join(base, b"limits"), move || {
             let p = alive(&p_)?;
             let l: [(u64, u64); 16] = core::array::from_fn(|r| {
@@ -2708,14 +2688,13 @@ fn process_files(
                 (l.cur, l.max)
             });
             Ok(text::limits(&l).into_bytes())
-        }),
-    ));
+        })
+    });
     // As `proc_loginuid_read` and `proc_loginuid_write` in fs/proc/base.c of Linux: only the
     // process itself sets its login UID, and the text has no new line.
     let p_ = w.clone();
     let p2 = w.clone();
-    out.push((
-        b"loginuid".to_vec(),
+    out.add(b"loginuid", || {
         rw_file(
             &join(base, b"loginuid"),
             move || Ok(format!("{}", alive(&p_)?.audit_ids().0).into_bytes()),
@@ -2729,48 +2708,44 @@ fn process_files(
                 let uid: u32 = text.trim().parse().map_err(|_| Errno::EINVAL)?;
                 p.set_loginuid(uid)
             },
-        ),
-    ));
+        )
+    });
     let p_ = w.clone();
-    out.push((
-        b"sessionid".to_vec(),
+    out.add(b"sessionid", || {
         file(&join(base, b"sessionid"), move || {
             Ok(format!("{}", alive(&p_)?.audit_ids().1).into_bytes())
-        }),
-    ));
+        })
+    });
     let p_ = w.clone();
-    out.push((
-        b"personality".to_vec(),
+    out.add(b"personality", || {
         ops_file(
             &join(base, b"personality"),
             0o400,
             move || Ok(format!("{:08x}\n", alive(&p_)?.personality()).into_bytes()),
             || None,
-        ),
-    ));
+        )
+    });
     // The kernel has no symbol names, so the text is `0`, as `proc_pid_wchan` of Linux gives
     // without `kallsyms`.
-    out.push((b"wchan".to_vec(), file(&join(base, b"wchan"), || Ok(b"0".to_vec()))));
+    out.add(b"wchan", || file(&join(base, b"wchan"), || Ok(b"0".to_vec())));
     // As `proc_pid_schedstat` in fs/proc/base.c of Linux: the CPU time of the thread in ns, the
     // time it waited on a run queue, and the count of its runs. The kernel does not count the
     // last two yet.
     let p_ = w.clone();
     let t_ = t.clone();
-    out.push((
-        b"schedstat".to_vec(),
+    out.add(b"schedstat", || {
         file(&join(base, b"schedstat"), move || {
             let t = slack_thread(&p_, &t_)?;
             let ns = (t.user_ticks() + t.sys_ticks()) * (1_000_000_000 / rk_frame::time::HZ);
             Ok(format!("{ns} 0 0\n").into_bytes())
-        }),
-    ));
+        })
+    });
     // As `proc_sched_show_task` in kernel/sched/debug.c of Linux, with the values that rukernel
     // keeps. TEST-07-PID1 of systemd reads `policy` and `prio` there.
     let p_ = w.clone();
     let t_ = t.clone();
     let ns_ = ns.clone();
-    out.push((
-        b"sched".to_vec(),
+    out.add(b"sched", || {
         file(&join(base, b"sched"), move || {
             let p = alive(&p_)?;
             let t = slack_thread(&p_, &t_)?;
@@ -2790,19 +2765,17 @@ fn process_files(
                 policy: sp.policy,
                 prio,
             }))
-        }),
-    ));
+        })
+    });
     let p_ = w.clone();
-    out.push((
-        b"mountstats".to_vec(),
-        ops_file(&join(base, b"mountstats"), 0o400, move || mountstats_of(&*alive(&p_)?), || None),
-    ));
+    out.add(b"mountstats", || {
+        ops_file(&join(base, b"mountstats"), 0o400, move || mountstats_of(&*alive(&p_)?), || None)
+    });
     // As `proc_coredump_filter_write` in fs/proc/base.c of Linux: the number takes the base of
     // its prefix, and only the bits of the filter stay.
     let p_ = w.clone();
     let p2 = w.clone();
-    out.push((
-        b"coredump_filter".to_vec(),
+    out.add(b"coredump_filter", || {
         rw_file(
             &join(base, b"coredump_filter"),
             move || Ok(text::coredump_filter(alive(&p_)?.coredump_filter())),
@@ -2812,29 +2785,26 @@ fn process_files(
                 alive(&p2)?.set_coredump_filter(v);
                 Ok(())
             },
-        ),
-    ));
+        )
+    });
     // The files of KSM are empty for a process without an address space, as in Linux.
     let p_ = w.clone();
-    out.push((
-        b"ksm_stat".to_vec(),
+    out.add(b"ksm_stat", || {
         file(&join(base, b"ksm_stat"), move || {
             Ok(alive(&p_)?.vm().map(|vm| rk_mm::ksm::stat(&vm)).unwrap_or_default())
-        }),
-    ));
+        })
+    });
     let p_ = w.clone();
-    out.push((
-        b"ksm_merging_pages".to_vec(),
+    out.add(b"ksm_merging_pages", || {
         file(&join(base, b"ksm_merging_pages"), move || {
             Ok(alive(&p_)?.vm().map(|vm| rk_mm::ksm::merging_pages(&vm)).unwrap_or_default())
-        }),
-    ));
+        })
+    });
     let p_ = w.clone();
     let p_j = w.clone();
-    out.push((
-        b"exe".to_vec(),
-        // A magic link, as `proc_exe_link` of Linux: a walk goes to the file itself, and
-        // `RESOLVE_NO_MAGICLINKS` stops it.
+    // A magic link, as `proc_exe_link` of Linux: a walk goes to the file itself, and
+    // `RESOLVE_NO_MAGICLINKS` stops it.
+    out.add(b"exe", || {
         jump_link(
             &join(base, b"exe"),
             0o777,
@@ -2845,27 +2815,25 @@ fn process_files(
                 Ok(fs.and_then(|fs| fs.path_of(&exe).ok()).unwrap_or_else(|| exe.absolute_path()))
             },
             move || alive(&p_j)?.exe().ok_or(Errno::ENOENT),
-        ),
-    ));
+        )
+    });
     let p_ = w.clone();
-    out.push((
-        b"cwd".to_vec(),
+    out.add(b"cwd", || {
         link(&join(base, b"cwd"), 0o777, move || {
             let fs = alive(&p_)?.fs().ok_or(Errno::ENOENT)?.lock().clone();
             fs.getcwd()
-        }),
-    ));
+        })
+    });
     let p_ = w.clone();
-    out.push((
-        b"root".to_vec(),
+    out.add(b"root", || {
         link(&join(base, b"root"), 0o777, move || {
             let fs = alive(&p_)?.fs().ok_or(Errno::ENOENT)?.lock().clone();
             fs.path_of(fs.root())
-        }),
-    ));
-    out.push((b"fd".to_vec(), fd_dir(w.clone(), base)));
-    out.push((b"fdinfo".to_vec(), fdinfo_dir(w.clone(), base)));
-    out.into_iter().map(|(name, node)| (name, owned(w, node))).collect()
+        })
+    });
+    out.add(b"fd", || fd_dir(w.clone(), base));
+    out.add(b"fdinfo", || fdinfo_dir(w.clone(), base));
+    out.into_vec().into_iter().map(|(name, node)| (name, owned(w, node))).collect()
 }
 
 /// Gives the files of a process the effective user and group of the process, as
@@ -2889,18 +2857,14 @@ fn process_dir(p: &Arc<Process>, ns: &PidNs, opts: Options) -> InodeRef {
     let list_base = base.clone();
     let owner = w.clone();
     let ns = ns.clone();
-    let node = dir(
-        &base,
-        b"/",
-        0o555,
-        move || {
-            alive(&w)?;
-            let mut out = process_files(&w, None, &list_base, &ns);
+    let node = table_dir(&base, b"/", 0o555, move |want| {
+        alive(&w)?;
+        let mut out = process_files(&w, None, &list_base, &ns, want);
+        if want.is_none_or(|name| name == b"task") {
             out.push((b"task".to_vec(), owned(&w, task_dir(w.clone(), &list_base, ns.clone()))));
-            Ok(out)
-        },
-        None,
-    );
+        }
+        Ok(out)
+    });
     // The directory is gone when the process is not in the table of processes: after the wait
     // that reaped it, also when a new process has the PID now, as `pid_revalidate` of Linux. It
     // is gone too for a caller that does not see it because of `hidepid`, so that the lookup
@@ -2947,14 +2911,8 @@ fn thread_dir(t: &Arc<Thread>, path: &[u8], parent: &[u8], ns: &PidNs) -> InodeR
     let pw = Arc::downgrade(t.process());
     let base = path.to_vec();
     let ns = ns.clone();
-    dir(
-        path,
-        parent,
-        0o555,
-        move || {
-            alive(&tw)?;
-            Ok(process_files(&pw, Some(tw.clone()), &base, &ns))
-        },
-        None,
-    )
+    table_dir(path, parent, 0o555, move |want| {
+        alive(&tw)?;
+        Ok(process_files(&pw, Some(tw.clone()), &base, &ns, want))
+    })
 }
