@@ -7,10 +7,11 @@
 //! ([`ebitmap`]) and its rules ([`avtab`]), the security server ([`server`] and [`services`])
 //! with its table of SIDs ([`sidtab`]), the text of the contexts ([`context`]), the classes of
 //! the kernel ([`classmap`]), the access vector cache ([`avc`]), the SIDs of the tasks with
-//! their change at an exec and their attributes in `/proc/PID/attr` ([`task`]), the labels of
-//! the files ([`inode`]), the checks of the access to the files and to the open files
-//! ([`file`]) and of the operations on the names of the directories ([`namei`]), and the
-//! labels of the new files and the changes of the labels ([`xattr`]).
+//! their change at an exec, their attributes in `/proc/PID/attr` and the checks of the
+//! operations on other tasks ([`task`]), the labels of the files ([`inode`]), the checks of
+//! the access to the files and to the open files ([`file`]) and of the operations on the
+//! names of the directories ([`namei`]), and the labels of the new files and the changes of
+//! the labels ([`xattr`]).
 //!
 //! The module is active when the command line has `selinux=1`, when `lsm=` names it, or with
 //! `security=selinux`. With `selinux=0` it is not active. The module starts in permissive
@@ -40,7 +41,7 @@ pub mod sidtab;
 pub mod task;
 pub mod xattr;
 
-use crate::classmap::class;
+use crate::classmap::{class, process};
 use crate::namei::Link;
 pub use crate::server::Policy;
 use alloc::format;
@@ -62,6 +63,62 @@ use rk_vfs::security::{
 struct SeLinux;
 
 impl SecurityHooks for SeLinux {
+    fn capget(&self, target: &Task<'_>) -> Result<()> {
+        task::current_has_perm(target, process::GETCAP)
+    }
+
+    fn capset(&self, new: &Cred, old: &Cred) -> Result<()> {
+        task::capset(new, old)
+    }
+
+    fn ptrace_access_check(&self, cred: &Cred, child: &Task<'_>, mode: u32) -> Result<()> {
+        task::ptrace_access_check(cred, child, mode)
+    }
+
+    fn ptrace_traceme(&self, parent: &Task<'_>) -> Result<()> {
+        task::ptrace_traceme(parent)
+    }
+
+    fn task_setpgid(&self, target: &Task<'_>, _pgid: u32) -> Result<()> {
+        task::current_has_perm(target, process::SETPGID)
+    }
+
+    fn task_getpgid(&self, target: &Task<'_>) -> Result<()> {
+        task::current_has_perm(target, process::GETPGID)
+    }
+
+    fn task_getsid(&self, target: &Task<'_>) -> Result<()> {
+        task::current_has_perm(target, process::GETSESSION)
+    }
+
+    fn task_setnice(&self, target: &Task<'_>, _nice: i32) -> Result<()> {
+        task::current_has_perm(target, process::SETSCHED)
+    }
+
+    fn task_setioprio(&self, target: &Task<'_>, _ioprio: i32) -> Result<()> {
+        task::current_has_perm(target, process::SETSCHED)
+    }
+
+    fn task_getioprio(&self, target: &Task<'_>) -> Result<()> {
+        task::current_has_perm(target, process::GETSCHED)
+    }
+
+    fn task_prlimit(&self, cred: &Cred, tcred: &Cred, flags: u32) -> Result<()> {
+        task::task_prlimit(cred, tcred, flags)
+    }
+
+    fn task_setscheduler(&self, target: &Task<'_>) -> Result<()> {
+        task::current_has_perm(target, process::SETSCHED)
+    }
+
+    fn task_getscheduler(&self, target: &Task<'_>) -> Result<()> {
+        task::current_has_perm(target, process::GETSCHED)
+    }
+
+    fn task_kill(&self, target: &Task<'_>, sig: u32, cred: &Cred) -> Result<()> {
+        task::task_kill(target, sig, cred)
+    }
+
     fn bprm_creds_for_exec(&self, bprm: &mut Bprm<'_>) -> Result<()> {
         task::bprm_creds_for_exec(bprm)
     }
