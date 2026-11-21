@@ -320,6 +320,8 @@ pub mod file {
     pub const RENAME: u32 = 1 << 13;
     /// `execute`.
     pub const EXECUTE: u32 = 1 << 14;
+    /// `mounton`.
+    pub const MOUNTON: u32 = 1 << 16;
     /// `audit_access`.
     pub const AUDIT_ACCESS: u32 = 1 << 17;
     /// `open`.
@@ -355,6 +357,10 @@ pub mod dir {
 
 /// The permissions of the class `filesystem`, `FILESYSTEM__*` of Linux.
 pub mod filesystem {
+    /// `remount`.
+    pub const REMOUNT: u32 = 1 << 1;
+    /// `unmount`.
+    pub const UNMOUNT: u32 = 1 << 2;
     /// `associate`.
     pub const ASSOCIATE: u32 = 1 << 6;
 }
@@ -494,6 +500,7 @@ mod tests {
             ("link", file::LINK),
             ("rename", file::RENAME),
             ("execute", file::EXECUTE),
+            ("mounton", file::MOUNTON),
             ("audit_access", file::AUDIT_ACCESS),
             ("open", file::OPEN),
             ("execmod", file::EXECMOD),
@@ -511,6 +518,8 @@ mod tests {
         ] {
             assert_eq!(bit(class::DIR, perm), v, "{perm}");
         }
+        assert_eq!(bit(class::FILESYSTEM, "remount"), filesystem::REMOUNT);
+        assert_eq!(bit(class::FILESYSTEM, "unmount"), filesystem::UNMOUNT);
         assert_eq!(bit(class::FILESYSTEM, "associate"), filesystem::ASSOCIATE);
         assert_eq!(bit(class::KEY, "create"), key::CREATE);
     }

@@ -9,9 +9,9 @@
 //! the kernel ([`classmap`]), the access vector cache ([`avc`]), the SIDs of the tasks with
 //! their change at an exec, their attributes in `/proc/PID/attr` and the checks of the
 //! operations on other tasks ([`task`]), the labels of the files ([`inode`]), the checks of
-//! the access to the files and to the open files ([`file`]) and of the operations on the
-//! names of the directories ([`namei`]), and the labels of the new files and the changes of
-//! the labels ([`xattr`]).
+//! the access to the files and to the open files ([`file`]), of the mounts ([`mount`]) and of
+//! the operations on the names of the directories ([`namei`]), and the labels of the new files
+//! and the changes of the labels ([`xattr`]).
 //!
 //! The module is active when the command line has `selinux=1`, when `lsm=` names it, or with
 //! `security=selinux`. With `selinux=0` it is not active. The module starts in permissive
@@ -32,6 +32,7 @@ pub mod context;
 pub mod ebitmap;
 pub mod file;
 pub mod inode;
+pub mod mount;
 pub mod namei;
 pub mod policydb;
 pub mod selinuxfs;
@@ -55,8 +56,8 @@ use rk_vfs::file::File;
 use rk_vfs::inode::{Inode, Result, SetAttr};
 use rk_vfs::security::blob::Blob;
 use rk_vfs::security::{
-    BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks, Task,
-    id,
+    BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, MountReq, Order,
+    SecurityHooks, Task, id,
 };
 
 /// The hooks of SELinux.
@@ -192,6 +193,18 @@ impl SecurityHooks for SeLinux {
 
     fn mmap_file(&self, f: Option<&File>, _reqprot: u64, prot: u64, flags: u64) -> Result<()> {
         file::mmap_file(f, prot, flags)
+    }
+
+    fn sb_mount(&self, req: &MountReq<'_>) -> Result<()> {
+        mount::sb_mount(req)
+    }
+
+    fn sb_umount(&self, root: &Location, _flags: u32) -> Result<()> {
+        mount::sb_umount(root)
+    }
+
+    fn move_mount(&self, _from: &Location, to: &Location) -> Result<()> {
+        mount::move_mount(to)
     }
 
     fn inode_getattr(&self, at: &Location) -> Result<()> {
