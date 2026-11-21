@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.38] - 2026-11-21
+
 ### Added
 
 - SELinux checks the `ioctl` commands with the extended permissions, as `selinux_file_ioctl`, `ioctl_has_perm` and `avc_has_extended_perms` of Linux. A command needs `ioctl` and, if the policy has `allowxperm` rules for the source, the target and the class, a rule for the driver (the high byte of the command) and for the function (its low byte). The access vector cache keeps the drivers of the rules and the decisions of each driver, and `dontauditxperm` and `auditallowxperm` rules control the records, which have the field `ioctlcmd`. `FIONREAD`, `FIBMAP`, `FIGETBSZ` and the commands that read the flags or the version of an inode need `getattr`, the commands that change them need `setattr`, `FIONBIO` and `FIOASYNC` need only `use` of the descriptor, and `KDSKBENT` and `KDSKBSENT` need the capability `sys_tty_config`, as `cred_has_capability` of Linux. `FIOCLEX` and `FIONCLEX` need no permission if the policy has the capability `ioctl_skip_cloexec` (#540).
@@ -1816,6 +1818,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.38]: https://github.com/tamnd/rukernel/compare/v0.5.37...v0.5.38
 [0.5.37]: https://github.com/tamnd/rukernel/compare/v0.5.36...v0.5.37
 [0.5.36]: https://github.com/tamnd/rukernel/compare/v0.5.35...v0.5.36
 [0.5.35]: https://github.com/tamnd/rukernel/compare/v0.5.34...v0.5.35
