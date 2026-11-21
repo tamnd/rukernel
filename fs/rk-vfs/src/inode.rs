@@ -589,6 +589,12 @@ pub trait Inode: Any + Send + Sync {
         0
     }
 
+    /// Tells if the file system allows the pre-content events of fanotify, as `SB_I_ALLOW_HSM`
+    /// of Linux. The default gives `false`.
+    fn fs_allows_pre_content(&self) -> bool {
+        false
+    }
+
     /// Gives the options of the file system of the inode for `/proc/PID/mountinfo` and
     /// `/proc/mounts`, as `show_options` of Linux. Each option has a comma before it, and the
     /// value has the escapes of the file system. The default is empty.

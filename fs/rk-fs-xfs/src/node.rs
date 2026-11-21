@@ -442,6 +442,11 @@ impl Inode for Node {
         XFS_MAGIC
     }
 
+    /// xfs allows the pre-content events of fanotify, as `xfs_fs_fill_super` of Linux.
+    fn fs_allows_pre_content(&self) -> bool {
+        true
+    }
+
     fn fs_stat(&self) -> Option<rk_vfs::inode::FsStat> {
         Some(self.fs.stat())
     }

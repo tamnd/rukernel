@@ -443,11 +443,15 @@ impl FsContext {
             file.set_nonotify();
             return Err(e);
         }
-        // As `fsnotify_open_perm` and `fsnotify_open` of Linux. A file of `O_PATH` has no
-        // events. A file that a group denies closes without an event.
+        // As `fsnotify_open_perm_and_set_mode` and `fsnotify_open` of Linux. A file of `O_PATH`
+        // has no events. A file that a group denies closes without an event. The open decides if
+        // the file gets the pre-content events.
         if !file.flags().is_path()
             && let Some(at) = file.location()
         {
+            if crate::notify::pre_content_watched(at) {
+                file.set_hsm();
+            }
             if let Err(e) = crate::notify::open_perm(at, false) {
                 file.set_nonotify();
                 return Err(e);

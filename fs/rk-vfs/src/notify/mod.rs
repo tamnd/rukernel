@@ -72,6 +72,9 @@ pub mod mask {
     pub const OPEN_EXEC_PERM: u32 = 0x4_0000;
     /// The permission events.
     pub const PERM_EVENTS: u32 = OPEN_PERM | ACCESS_PERM | OPEN_EXEC_PERM;
+    /// A pre-content event before an access of the data of a file, `FS_PRE_ACCESS`. A group can
+    /// fill the data of the range before it answers.
+    pub const PRE_ACCESS: u32 = 0x10_0000;
     /// A mount was attached to the mount namespace, `FS_MNT_ATTACH`.
     pub const MNT_ATTACH: u32 = 0x0100_0000;
     /// A mount was detached from the mount namespace, `FS_MNT_DETACH`.
@@ -119,6 +122,9 @@ pub struct FsEvent<'a> {
     pub name: Option<&'a [u8]>,
     /// The new directory and the new name of a rename, for `RENAME`.
     pub moved: Option<(&'a InodeRef, &'a [u8])>,
+    /// The offset and the length of the data of a pre-content event, aligned to pages, as
+    /// `FSNOTIFY_EVENT_FILE_RANGE` of Linux.
+    pub range: Option<(u64, u64)>,
 }
 
 impl FsEvent<'_> {
@@ -431,6 +437,7 @@ fn fan_dentry(dentry: &Dentry, path: Option<&Location>, mask: u32) -> Result<()>
         dir: parent.as_ref().map(|p| p.inode()),
         name: name.as_deref(),
         moved: None,
+        range: None,
     })
 }
 
@@ -450,6 +457,7 @@ fn fan_name(dir: &InodeRef, mask: u32, name: &[u8], inode: &InodeRef) {
         dir: Some(dir),
         name: Some(name),
         moved: None,
+        range: None,
     });
 }
 
@@ -525,6 +533,7 @@ pub fn inode_event(inode: &InodeRef, mask: u32) {
         dir: None,
         name: None,
         moved: None,
+        range: None,
     });
 }
 
@@ -604,6 +613,91 @@ pub fn access_perm(at: &Location) -> Result<()> {
         return Ok(());
     }
     path_event(at, mask::ACCESS_PERM)
+}
+
+/// The size of the pages that the range of a pre-content event is aligned to.
+const RANGE_PAGE: u64 = 4096;
+
+/// The pages of the access of `count` bytes at `pos`, as the offset and the length, as
+/// `fsnotify_pre_content` of Linux.
+pub(crate) fn page_range(pos: u64, count: u64) -> (u64, u64) {
+    let start = pos & !(RANGE_PAGE - 1);
+    let end = pos.saturating_add(count);
+    let end = end.checked_next_multiple_of(RANGE_PAGE).unwrap_or(end);
+    (start, end - start)
+}
+
+/// Tells if a group gets the pre-content events of the file at `at`, as the part of
+/// `fsnotify_open_perm_and_set_mode` of Linux that sets `FMODE_FSNOTIFY_HSM`. The file must be a
+/// regular file of a file system that allows the events, and a mark on the file, on its parent
+/// for the children, on its mount or on its file system must want them. An open file keeps the
+/// answer.
+pub fn pre_content_watched(at: &Location) -> bool {
+    if PATH_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let inode = at.inode();
+    if !inode.fs_allows_pre_content()
+        || inode.metadata().file_type() != Some(crate::inode::FileType::Regular)
+    {
+        return false;
+    }
+    let parent = at.dentry.parent().filter(|p| !core::ptr::eq(&**p, &*at.dentry));
+    let marks = MARKS.lock();
+    let wants = |k: (u8, usize), child: bool| {
+        marks.get(&k).into_iter().flatten().any(|m| {
+            let mask = m.mask();
+            m.alive()
+                && m.group.wants_paths()
+                && mask & mask::PRE_ACCESS != 0
+                && (!child || mask & mask::EVENT_ON_CHILD != 0)
+        })
+    };
+    wants((0, key(inode)), false)
+        || parent.is_some_and(|p| wants((0, key(p.inode())), true))
+        || wants((1, Arc::as_ptr(&at.mount) as usize), false)
+        || wants((2, inode.fs_id() as usize), false)
+}
+
+/// The pre-content event before an access of the data of the file at `at`, as
+/// `fsnotify_pre_content` of Linux. `range` is the offset and the length of the access. The event
+/// has the pages of the range, and no range if the offset is not known. The caller checked that
+/// the file gets the events.
+///
+/// # Errors
+///
+/// Gives `EPERM` or the error of the answer if a group denies the access.
+pub fn pre_access(at: &Location, range: Option<(u64, u64)>) -> Result<()> {
+    if PATH_COUNT.load(Ordering::Acquire) == 0 {
+        return Ok(());
+    }
+    let range = range.map(|(pos, count)| page_range(pos, count));
+    let dentry = &at.dentry;
+    let inode = dentry.inode();
+    let parent = dentry.parent().filter(|p| !core::ptr::eq(&**p, &**dentry));
+    let name = parent.as_ref().map(|_| dentry.name());
+    fan_event(&FsEvent {
+        mask: mask::PRE_ACCESS,
+        path: Some(at),
+        inode: Some(inode),
+        dir: parent.as_ref().map(|p| p.inode()),
+        name: name.as_deref(),
+        moved: None,
+        range,
+    })
+}
+
+/// The pre-content event before a truncate of the file at `at` to `size` bytes, as
+/// `fsnotify_truncate_perm` of Linux. The event has the page of the new end.
+///
+/// # Errors
+///
+/// Gives `EPERM` or the error of the answer if a group denies the truncate.
+pub fn truncate_perm(at: &Location, size: u64) -> Result<()> {
+    if !pre_content_watched(at) {
+        return Ok(());
+    }
+    pre_access(at, Some((size, 0)))
 }
 
 /// A read of a file, as `fsnotify_access` of Linux.
@@ -741,6 +835,7 @@ pub fn rename(
         dir: Some(old_dir),
         name: Some(old_name),
         moved: Some((new_dir, new_name)),
+        range: None,
     });
     name_event(old_dir, mask::MOVED_FROM | isdir, old_name, cookie);
     fan_name(old_dir, mask::MOVED_FROM | isdir, old_name, moved);

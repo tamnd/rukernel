@@ -35,11 +35,12 @@ use rk_abi::native::fanotify::{
     FAN_ALLOW, FAN_AUDIT, FAN_DENY, FAN_ENABLE_AUDIT, FAN_EPIDFD, FAN_ERRNO_MASK, FAN_ERRNO_SHIFT,
     FAN_EVENT_INFO_TYPE_DFID, FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_FID,
     FAN_EVENT_INFO_TYPE_MNT, FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, FAN_EVENT_INFO_TYPE_OLD_DFID_NAME,
-    FAN_EVENT_INFO_TYPE_PIDFD, FAN_EVENT_METADATA_LEN, FAN_INFO, FAN_MARK_EVICTABLE,
-    FAN_MARK_IGNORE, FAN_MARK_IGNORED_MASK, FAN_MARK_IGNORED_SURV_MODIFY, FAN_NOFD, FAN_NOPIDFD,
-    FAN_ONDIR, FAN_PRE_ACCESS, FAN_REPORT_DFID_NAME_TARGET, FAN_REPORT_DIR_FID,
-    FAN_REPORT_FD_ERROR, FAN_REPORT_FID, FAN_REPORT_MNT, FAN_REPORT_NAME, FAN_REPORT_PIDFD,
-    FAN_REPORT_TARGET_FID, FAN_REPORT_TID, FAN_UNLIMITED_MARKS, FANOTIFY_METADATA_VERSION,
+    FAN_EVENT_INFO_TYPE_PIDFD, FAN_EVENT_INFO_TYPE_RANGE, FAN_EVENT_METADATA_LEN, FAN_INFO,
+    FAN_MARK_EVICTABLE, FAN_MARK_IGNORE, FAN_MARK_IGNORED_MASK, FAN_MARK_IGNORED_SURV_MODIFY,
+    FAN_NOFD, FAN_NOPIDFD, FAN_ONDIR, FAN_PRE_ACCESS, FAN_REPORT_DFID_NAME_TARGET,
+    FAN_REPORT_DIR_FID, FAN_REPORT_FD_ERROR, FAN_REPORT_FID, FAN_REPORT_MNT, FAN_REPORT_NAME,
+    FAN_REPORT_PIDFD, FAN_REPORT_TARGET_FID, FAN_REPORT_TID, FAN_UNLIMITED_MARKS,
+    FANOTIFY_METADATA_VERSION,
 };
 use rk_abi::native::open as o;
 use rk_abi::native::types::{FanotifyEventMetadata, FanotifyResponse};
@@ -88,6 +89,9 @@ const PIDFD_INFO_LEN: usize = 8;
 
 /// The size of `struct fanotify_event_info_mnt`, `FANOTIFY_MNT_INFO_LEN` of Linux.
 const MNT_INFO_LEN: usize = 16;
+
+/// The size of `struct fanotify_event_info_range`, `FANOTIFY_RANGE_INFO_LEN` of Linux.
+const RANGE_INFO_LEN: usize = 24;
 
 /// `fs.fanotify.max_queued_events`: the most events in the queue of a new group without
 /// `FAN_UNLIMITED_QUEUE`.
@@ -226,6 +230,8 @@ struct Event {
     info: Info,
     pid: i32,
     perm: Option<Arc<Perm>>,
+    /// The offset and the length of the access of a pre-content event, if they are known.
+    range: Option<(u64, u64)>,
 }
 
 enum Item {
@@ -435,7 +441,11 @@ impl Fanotify {
 
     /// The size of the event in a read, as `fanotify_event_len` of Linux.
     fn event_len(&self, item: &Item) -> usize {
-        let pidfd = if self.flags & FAN_REPORT_PIDFD != 0 { PIDFD_INFO_LEN } else { 0 };
+        // The records of the process file descriptor and of the range.
+        let mut pidfd = if self.flags & FAN_REPORT_PIDFD != 0 { PIDFD_INFO_LEN } else { 0 };
+        if let Item::Event(Event { range: Some(_), .. }) = item {
+            pidfd += RANGE_INFO_LEN;
+        }
         if let Item::Event(Event { info: Info::Mnt(_), .. }) = item {
             return META_LEN + pidfd + MNT_INFO_LEN;
         }
@@ -814,6 +824,18 @@ fn put_fid(out: &mut Vec<u8>, ty: u32, fsid: [i32; 2], fh: &Fh, name: &[u8]) {
     out.resize(start + len, 0);
 }
 
+/// Puts the record of the range of a pre-content event in `out`, as
+/// `struct fanotify_event_info_range` of Linux: the header, 4 bytes of padding, the offset and the
+/// length.
+fn put_range(out: &mut Vec<u8>, (offset, count): (u64, u64)) {
+    out.push(FAN_EVENT_INFO_TYPE_RANGE as u8);
+    out.push(0);
+    out.extend_from_slice(&(RANGE_INFO_LEN as u16).to_ne_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&offset.to_ne_bytes());
+    out.extend_from_slice(&count.to_ne_bytes());
+}
+
 /// Puts the record of a mount event in `out`, as `struct fanotify_event_info_mnt` of Linux: the
 /// header, 4 bytes of padding, and the unique ID of the mount.
 fn put_mnt(out: &mut Vec<u8>, mnt_id: u64) {
@@ -936,7 +958,9 @@ impl Group for Fanotify {
                 self.wake();
                 return Ok(());
             }
-            let event = Event { mask: test, info, pid, perm: perm.clone() };
+            // Only a pre-content event has the range, as `fanotify_event_has_access_range`.
+            let range = ev.range.filter(|_| test & FAN_PRE_ACCESS != 0);
+            let event = Event { mask: test, info, pid, perm: perm.clone(), range };
             st.queue.push_back(Item::Event(event));
         }
         self.wake();
@@ -977,7 +1001,8 @@ impl Group for Fanotify {
                 st.overflow = true;
                 st.queue.push_back(Item::Overflow);
             } else {
-                let event = Event { mask: test, info: Info::Mnt(mnt_id), pid, perm: None };
+                let event =
+                    Event { mask: test, info: Info::Mnt(mnt_id), pid, perm: None, range: None };
                 st.queue.push_back(Item::Event(event));
             }
         }
@@ -1116,21 +1141,25 @@ impl FileOps for FanotifyFile {
             };
             let mut fid = None;
             let mut mnt = None;
+            let range = match &item {
+                Item::Event(e) => e.range,
+                Item::Overflow => None,
+            };
             let (m, fd, mut pid, perm) = match item {
                 // An event without a file has `-EBADF` with `FAN_REPORT_FD_ERROR`, as Linux.
                 Item::Overflow if g.flags & FAN_REPORT_FD_ERROR != 0 => {
                     (mask::Q_OVERFLOW, -i32::from(Errno::EBADF.get()), 0, None)
                 }
                 Item::Overflow => (mask::Q_OVERFLOW, FAN_NOFD as i32, 0, None),
-                Item::Event(Event { info: Info::Fid(f), mask: m, pid, perm }) => {
+                Item::Event(Event { info: Info::Fid(f), mask: m, pid, perm, .. }) => {
                     fid = Some(f);
                     (m, FAN_NOFD as i32, pid, perm)
                 }
-                Item::Event(Event { info: Info::Mnt(id), mask: m, pid, perm }) => {
+                Item::Event(Event { info: Info::Mnt(id), mask: m, pid, perm, .. }) => {
                     mnt = Some(id);
                     (m, FAN_NOFD as i32, pid, perm)
                 }
-                Item::Event(Event { info: Info::Path(at), mask: m, pid, perm }) => {
+                Item::Event(Event { info: Info::Path(at), mask: m, pid, perm, .. }) => {
                     let fd = match g.open_fd(&at) {
                         Ok(fd) => fd,
                         Err(err) if g.flags & FAN_REPORT_FD_ERROR != 0 => -i32::from(err.get()),
@@ -1168,6 +1197,10 @@ impl FileOps for FanotifyFile {
                 records.push(0);
                 records.extend_from_slice(&(PIDFD_INFO_LEN as u16).to_ne_bytes());
                 records.extend_from_slice(&pidfd.to_ne_bytes());
+            }
+            // The record of the range comes after the record of the process file descriptor.
+            if let Some(r) = range {
+                put_range(&mut records, r);
             }
             // The record of the mount is the last, as `copy_mnt_info_to_user` of Linux.
             if let Some(id) = mnt {
@@ -1288,6 +1321,32 @@ mod tests {
         assert_eq!(u16::from_ne_bytes([out[2], out[3]]), 16);
         assert_eq!(&out[4..8], &[0; 4]);
         assert_eq!(u64::from_ne_bytes(out[8..16].try_into().unwrap()), 0x1_0000_0005);
+    }
+
+    #[test]
+    fn a_range_record_has_the_offset_and_the_length_after_the_padding() {
+        let mut out = Vec::new();
+        put_range(&mut out, (0x6_4000, 0x2000));
+        assert_eq!(out.len(), RANGE_INFO_LEN);
+        assert_eq!(out[0], FAN_EVENT_INFO_TYPE_RANGE as u8);
+        assert_eq!(u16::from_ne_bytes([out[2], out[3]]), 24);
+        assert_eq!(&out[4..8], &[0; 4]);
+        assert_eq!(u64::from_ne_bytes(out[8..16].try_into().unwrap()), 0x6_4000);
+        assert_eq!(u64::from_ne_bytes(out[16..24].try_into().unwrap()), 0x2000);
+    }
+
+    #[test]
+    fn a_pre_content_range_covers_whole_pages() {
+        use super::super::page_range;
+        // mmap of 2 pages at page 100, a write of 1 byte at page 1, a read of 256 bytes at
+        // page 2, as LTP fanotify24.
+        assert_eq!(page_range(100 * 4096, 2 * 4096), (100 * 4096, 2 * 4096));
+        assert_eq!(page_range(4096, 1), (4096, 4096));
+        assert_eq!(page_range(2 * 4096, 256), (2 * 4096, 4096));
+        assert_eq!(page_range(5000, 5000), (4096, 8192));
+        // A truncate to a page boundary has no length.
+        assert_eq!(page_range(8192, 0), (8192, 0));
+        assert_eq!(page_range(u64::MAX, 1).0, u64::MAX & !4095);
     }
 
     #[test]

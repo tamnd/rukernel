@@ -455,6 +455,10 @@ pub(crate) fn mmap(
     }
     // As `security_mmap_file` in `vm_mmap_pgoff` of Linux.
     rk_vfs::security::mmap_file(file.as_deref(), reqprot, reqprot, u64::from(flags))?;
+    // As `fsnotify_mmap_perm` in `vm_mmap_pgoff` of Linux. A fault gives no event.
+    if let Some(file) = &file {
+        file.pre_access(Some((offset, len)))?;
+    }
     let mut may_write = file.as_ref().is_none_or(|f| !shared || f.flags().writable());
     let mut may_exec = true;
     let file = match file {

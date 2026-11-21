@@ -456,8 +456,14 @@ fn build(
         path = interp;
     };
     // A file that is open for a write does not run, and a write of the file of the program
-    // fails while it runs, as `exe_file_deny_write_access` in `do_open_execat` of Linux.
-    let deny = rk_vfs::file::DenyWrite::new(at.inode())?;
+    // fails while it runs, as `exe_file_deny_write_access` in `do_open_execat` of Linux. A
+    // program that a group watches for the pre-content events has no denial, so that the group
+    // can fill the file.
+    let deny = if rk_vfs::notify::pre_content_watched(&at) {
+        rk_vfs::file::DenyWrite::none()
+    } else {
+        rk_vfs::file::DenyWrite::new(at.inode())?
+    };
 
     let meta = at.inode().metadata();
     let nosuid = at.mount.flags() & u64::from(MS_NOSUID) != 0;
