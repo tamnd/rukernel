@@ -277,6 +277,16 @@ pub fn populate_wait() -> bool {
     !thread.is_killed()
 }
 
+/// Runs `f` as a memory stall of the current thread in the pressure of its cgroup, as
+/// `psi_memstall_enter` and `psi_memstall_leave` of Linux. A fault reads a page back from swap
+/// with this. Kernel work outside a thread counts nothing.
+pub fn memstall(f: &mut dyn FnMut()) {
+    match crate::current_thread() {
+        Some(thread) => stalled(&thread, f),
+        None => f(),
+    }
+}
+
 /// Charges an I/O of the current thread to its cgroup, for `io.stat`. Kernel work goes to the
 /// root. The delay of `io.max` waits until the thread goes back to user mode, so the thread does
 /// not wait with the locks of a file system. The block layer calls this after each batch, with

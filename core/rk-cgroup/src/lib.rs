@@ -1641,7 +1641,10 @@ impl Hierarchy {
     /// The time in nanoseconds that a thread of `id` must wait because its cgroup or a cgroup
     /// above it uses more than `memory.high`, as `mem_cgroup_handle_over_high` of Linux. The
     /// wait grows with the square of the part of the use over the limit and with the pages that
-    /// the cgroup charged while over it. Sets the count of these pages to 0.
+    /// the cgroup charged while over it. A cgroup gives a wait only when these pages are a full
+    /// batch of `HIGH_BATCH` pages, as Linux charges and handles the pages in batches of
+    /// `MEMCG_CHARGE_BATCH`. Then the count of the pages goes to 0. The count also goes to 0
+    /// when the use is not over the limit.
     pub fn high_delay(&mut self, id: CgId) -> u64 {
         if !self.shared.any_over_high.load(Ordering::SeqCst) {
             return 0;
@@ -1651,12 +1654,16 @@ impl Hierarchy {
             let on = self.on(a, MEMORY);
             let Some(n) = self.nodes.get(&a) else { continue };
             let m = &n.c.mem;
-            let charged = m.over_high.swap(0, Ordering::SeqCst);
             let (current, high) =
                 (m.current.load(Ordering::Relaxed), m.high.load(Ordering::Relaxed));
             if !on || high == MAX || current <= high || high == 0 {
+                m.over_high.store(0, Ordering::SeqCst);
                 continue;
             }
+            if m.over_high.load(Ordering::SeqCst) < HIGH_BATCH * PAGE_SIZE {
+                continue;
+            }
+            let charged = m.over_high.swap(0, Ordering::SeqCst);
             // The part over the limit in units of 2^-20, `calculate_overage` of Linux.
             let over = ((current - high) << 20) / high;
             overage = overage.max(over);
@@ -1668,10 +1675,8 @@ impl Hierarchy {
         if self.nodes.values().any(|n| n.c.mem.over_high.load(Ordering::SeqCst) > 0) {
             self.shared.any_over_high.store(true, Ordering::SeqCst);
         }
-        // `calculate_high_delay` of Linux, in nanoseconds instead of jiffies. Linux handles the
-        // pages in batches of `HIGH_BATCH`, and the limit is for one batch. Here a thread can
-        // come back after each page, so the limit is for a batch and the wait is for the part of
-        // a batch.
+        // `calculate_high_delay` of Linux, in nanoseconds instead of jiffies. The limit is for
+        // one batch of `HIGH_BATCH` pages.
         let delay = (u128::from(overage) * u128::from(overage) * 1_000_000_000) >> 34;
         let delay = delay.min(u128::from(HIGH_DELAY_MAX)) * u128::from(pages);
         let delay = u64::try_from(delay / u128::from(HIGH_BATCH)).unwrap_or(HIGH_DELAY_MAX);
@@ -2612,7 +2617,9 @@ pub fn count_reclaim(id: CgId, who: Reclaimer, anon: bool, scanned: u64, stolen:
 /// Takes back memory from `id` and each cgroup above it whose use is over `memory.high`, as
 /// `reclaim_high` of Linux. Each of these cgroups gives the bytes that the subtree charged over
 /// the limit since the last wait, as Linux takes back the `memcg_nr_pages_over_high` pages of
-/// the task. A cgroup with no such charge gives nothing. The return to user mode calls this
+/// the task. A cgroup gives nothing until these bytes are a batch of `HIGH_BATCH` pages, as Linux
+/// charges in batches of `MEMCG_CHARGE_BATCH` pages. One reclaim of a batch costs much less than
+/// a reclaim for each page. The return to user mode calls this
 /// before [`high_delay`], so the wait is for the use that the reclaim leaves. The reclaim counts
 /// as a memory stall of the cgroup `stall` of the thread in the pressure, as `psi_memstall_enter`
 /// of Linux around the reclaim.
@@ -2627,7 +2634,7 @@ pub fn reclaim_high(id: CgId, stall: CgId) {
                 let high = a.mem.high.load(Ordering::Relaxed);
                 let current = a.mem.current.load(Ordering::Relaxed);
                 let charged = a.mem.over_high.load(Ordering::Relaxed);
-                (a.on(MEMORY) && high != MAX && current > high && charged > 0)
+                (a.on(MEMORY) && high != MAX && current > high && charged >= HIGH_BATCH * PAGE_SIZE)
                     .then_some((a.id, charged))
             })
             .collect();
@@ -2739,6 +2746,20 @@ pub fn charge_cpu(id: CgId, ns: u64) {
 /// `Hierarchy::high_delay`.
 pub fn high_delay(id: CgId) -> u64 {
     if id == 0 || !shared().any_over_high.load(Ordering::Relaxed) {
+        return 0;
+    }
+    // Most returns to user mode come before a full batch. They do not take the lock of the
+    // hierarchy.
+    let due = with_counters(id, |c, _| {
+        let due = c.path().any(|a| {
+            let charged = a.mem.over_high.load(Ordering::Relaxed);
+            let high = a.mem.high.load(Ordering::Relaxed);
+            charged >= HIGH_BATCH * PAGE_SIZE
+                || (charged > 0 && a.mem.current.load(Ordering::Relaxed) <= high)
+        });
+        (due, Changed::default())
+    });
+    if due != Some(true) {
         return 0;
     }
     with(|h| h.high_delay(id))

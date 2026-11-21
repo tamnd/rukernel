@@ -391,7 +391,16 @@ impl Read {
             Self::Swap(slot) => {
                 above_reserve()?;
                 let frame = charged(rk_frame::mm::alloc_frame(), memcg)?;
-                slot.read(&frame).map_err(|()| Errno::EIO)?;
+                // A page that comes back from swap was in use before the reclaim took it, so the
+                // wait for it counts as a memory stall, as `swap_read_folio` of Linux counts the
+                // read of a page of the working set.
+                let mut read = Ok(());
+                let mut run = || read = slot.read(&frame);
+                match MEMSTALL_HOOK.get() {
+                    Some(stall) => stall(&mut run),
+                    None => run(),
+                }
+                read.map_err(|()| Errno::EIO)?;
                 frame.set_anon();
                 Ok(Prepared::Swap { slot, frame })
             }
@@ -485,6 +494,8 @@ pub struct AddressSpace {
     /// the mm of Linux 2.4. Each reclaim goes on from the page after the last page that it took,
     /// so the pages at the start that cannot go are not looked at each time.
     reclaim_at: AtomicUsize,
+    /// The mark of a space in which the last reclaim found no page to take.
+    idle: crate::idle::Idle,
 }
 
 fn map_error(e: MapError) -> Errno {
@@ -616,6 +627,7 @@ impl AddressSpace {
             hiwater: AtomicUsize::new(0),
             mmap_top: AtomicUsize::new(MMAP_TOP),
             reclaim_at: AtomicUsize::new(0),
+            idle: crate::idle::Idle::default(),
         }
     }
 
@@ -1911,9 +1923,15 @@ impl AddressSpace {
     /// Linux. The pages are the pages of [`AddressSpace::page_out`]. Gives the pages that the
     /// reclaim looked at and the pages that went, for `pgscan_anon` and `pgsteal_anon`. The
     /// reclaim starts after the page where the last one stopped, and goes round to the start of
-    /// the space, as an LRU list of Linux puts a page that it looked at to the end.
+    /// the space, as an LRU list of Linux puts a page that it looked at to the end. A space in
+    /// which the whole look found no page is skipped for a time while its pages stay the same,
+    /// so a cgroup with many sleeping processes does not look at their pages for each reclaim.
     pub fn reclaim_anon(&self, want: usize) -> (usize, usize) {
         if want == 0 {
+            return (0, 0);
+        }
+        let now = rk_frame::time::nanos();
+        if self.idle.skip(self.vm.page_count(), now) {
             return (0, 0);
         }
         let at = self.reclaim_at.load(Ordering::Relaxed);
@@ -1923,6 +1941,11 @@ impl AddressSpace {
             (scanned, n, next) = (scanned + s, n + m, after);
         }
         self.reclaim_at.store(next.unwrap_or(0), Ordering::Relaxed);
+        if n == 0 && next.is_none() {
+            self.idle.mark(self.vm.page_count(), now);
+        } else {
+            self.idle.clear();
+        }
         (scanned, n)
     }
 
@@ -2507,6 +2530,16 @@ static POPULATE_HOOK: Once<fn() -> bool> = Once::new();
 /// It gives false if the thread has a kill, and then the populate stops.
 pub fn set_populate_hook(hook: fn() -> bool) {
     POPULATE_HOOK.call_once(|| hook);
+}
+
+/// The hook of [`set_memstall_hook`].
+static MEMSTALL_HOOK: Once<fn(&mut dyn FnMut())> = Once::new();
+
+/// Sets the function that runs the read of a page back from swap for a fault. The function
+/// counts the read as a memory stall of the thread in the pressure, as `psi_memstall_enter` and
+/// `psi_memstall_leave` of Linux around the read.
+pub fn set_memstall_hook(hook: fn(&mut dyn FnMut())) {
+    MEMSTALL_HOOK.call_once(|| hook);
 }
 
 /// Tells if `vma` allows `access`.
