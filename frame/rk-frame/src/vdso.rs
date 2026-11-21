@@ -1,10 +1,13 @@
 //! The vDSO and its data page, per spec/05-processes-signals-exec.md section 5.4.
 //!
 //! The build script links the vDSO from `vdso/x86_64.rs` or `vdso/aarch64.rs`. The kernel maps the
-//! data page and the vDSO in each process, with the data page directly below the vDSO. The timer
-//! interrupt writes the tick count and the counter of the tick to the data page, so the time in
-//! the vDSO is the same as the time of the system calls. The counter is the time stamp counter on
-//! x86-64 and the virtual counter of the generic timer on arm64.
+//! data page and the vDSO in each process, with the data page directly below the vDSO. The data
+//! page has a base time and the counter at the base, and the vDSO adds the time of the counter
+//! since the base, as `clock_ns` does, so the time in the vDSO is the same as the time of the
+//! system calls. The counter is the time stamp counter on x86-64 and the virtual counter of the
+//! generic timer on arm64. On x86-64 the base is the last tick, and the timer interrupt writes it.
+//! On arm64 the base is boot, and the page does not change at a tick, as the vDSO data of Linux
+//! with the arch counter as the clocksource.
 
 use crate::arch::imp::paging;
 use crate::mm::{Frame, alloc_zeroed_frame};
@@ -20,19 +23,21 @@ pub static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vdso.so"));
 #[cfg(target_arch = "aarch64")]
 pub const SIGRETURN: usize = include!(concat!(env!("OUT_DIR"), "/vdso_sigreturn.rs"));
 
-/// The word of the data page with the tick count.
-const TICKS: usize = 0;
-/// The word of the data page with the nanoseconds of one tick.
+/// The word of the data page with the nanoseconds of the clock at the base.
+const BASE_NS: usize = 0;
+/// The word of the data page with the nanoseconds of one tick, the resolution of the clocks.
 const NS_PER_TICK: usize = 1;
 /// The word of the data page with the sequence count. It is odd while the kernel writes the page.
 const SEQ: usize = 2;
-/// The word of the data page with the counter at the last tick.
-const TICK_COUNTER: usize = 3;
+/// The word of the data page with the counter at the base.
+const BASE_COUNTER: usize = 3;
 /// The word of the data page with the nanoseconds of one cycle of the counter, times 2^32.
 const COUNTER_MULT: usize = 4;
 /// The word of the data page with the nanoseconds of `CLOCK_REALTIME` at boot. A clock set changes
 /// it.
 const REALTIME_OFFSET: usize = 5;
+/// The word of the data page with the most nanoseconds that the counter adds to the base.
+const MAX_PART: usize = 6;
 
 static DATA: Once<Option<Arc<Frame>>> = Once::new();
 /// Lets one CPU at a time write the data page. The holder turns interrupts off, so the timer
@@ -54,11 +59,16 @@ pub fn data_page() -> Option<Arc<Frame>> {
     .clone()
 }
 
-/// Writes the tick count and the counter of the tick to the data page. The timer interrupt calls
-/// it after each tick.
+/// Writes the base of the clock to the data page. The timer interrupt of x86-64 calls it after
+/// each tick. On arm64 only `data_page` calls it, because the base is boot.
 pub(crate) fn tick() {
-    let (tick_counter, mult) = crate::arch::imp::timer::counter_state();
-    write(&[(TICKS, crate::time::ticks()), (TICK_COUNTER, tick_counter), (COUNTER_MULT, mult)]);
+    let (base_ns, base_counter, mult, max_part) = crate::arch::imp::timer::counter_state();
+    write(&[
+        (BASE_NS, base_ns),
+        (BASE_COUNTER, base_counter),
+        (COUNTER_MULT, mult),
+        (MAX_PART, max_part),
+    ]);
 }
 
 /// Writes the new offset of `CLOCK_REALTIME` to the data page, after a clock set.

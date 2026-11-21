@@ -3,10 +3,10 @@
 //! process, with the data page directly below it. glibc and musl find the functions by name and by
 //! the version `LINUX_2.6.39`, as on Linux.
 //!
-//! The time functions read the time from the data page. The kernel writes the tick count and the
-//! virtual counter of the generic timer at the tick to the page at each timer tick. The functions
-//! add the time of the counter since the tick, less than one tick, so the time is the same as the
-//! time of the system calls. User code can read the virtual counter, because the kernel sets
+//! The time functions read the time from the data page. The kernel writes the virtual counter of
+//! the generic timer at boot and its multiplier to the page one time. The functions calculate the
+//! time since boot from the counter, as the kernel does, so the time is the same as the time of
+//! the system calls. User code can read the virtual counter, because the kernel sets
 //! `CNTKCTL_EL1.EL0VCTEN`. `common.rs` has the calculation.
 //!
 //! `__kernel_rt_sigreturn` is the return of a signal handler. The kernel puts its address in the

@@ -2630,6 +2630,8 @@ fn base_cmdline(test: &str) -> String {
         "blk" => String::from("console=ttyS0 rk.test=init -- blk"),
         // The `swap` test has only its own checks.
         "swap" => String::from("console=ttyS0 rk.test=init -- only swap"),
+        // The arm64 `clock` test sleeps 10 s and runs a busy loop of 5 s (#813).
+        "clock" => String::from("console=ttyS0 rk.test=init -- only clock 10 5"),
         // AppArmor is active only with `apparmor=1`. The other checks of init run without it.
         "apparmor" => String::from("console=ttyS0 rk.test=init apparmor=1 -- only apparmor"),
         // SELinux is active only with `selinux=1`.
@@ -2675,6 +2677,7 @@ fn pass_line(test: &str) -> String {
             | "smp"
             | "blk"
             | "swap"
+            | "clock"
             | "apparmor"
             | "selinux"
             | "inet"
@@ -3256,7 +3259,7 @@ const AARCH64_TESTS: &[&str] =
 /// `blk` and `inet` tests also run with virtio-pci devices on the PCI bus of the ECAM host, see
 /// `AARCH64_PCI_RUNS`.
 const AARCH64_USER_TESTS: &[&str] =
-    &["init", "smp", "blk", "swap", "apparmor", "selinux", "inet", "busybox"];
+    &["init", "smp", "blk", "swap", "clock", "apparmor", "selinux", "inet", "busybox"];
 
 /// The tests of `SYSTEMD_TESTS` that `boot-test aarch64` runs on the arm64 tree of the `systemd`
 /// test. `RK_SYSTEMD_AARCH64` gives the tarball of the tree, from

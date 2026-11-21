@@ -9,6 +9,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - SELinux checks the operations on other tasks, as the task, `ptrace` and `capget` hooks of hooks.c of Linux. A signal needs `sigkill`, `sigstop`, `sigchld`, `signull` for the signal 0, or `signal` for another signal. `getpgid` and `getsid` of a PID need `getpgid` and `getsession`, `setpgid` needs `setpgid`, a change of the nice value, of the I/O priority or of the scheduler needs `setsched`, and a read of them needs `getsched`. `prlimit` on another process needs `getrlimit` or `setrlimit`, `capget` needs `getcap` and `capset` needs `setcap`. `PTRACE_ATTACH` and `PTRACE_TRACEME` need `ptrace`. `prlimit` on the caller itself does not call the hook `task_prlimit`, as `check_prlimit_permission` of Linux (#540).
 - SELinux checks the maps of files and of anonymous memory, as `selinux_mmap_file` and `file_map_prot_check` of Linux. A map of a file needs `map`, `read`, `write` if the map is shared and can write, and `execute` if it can run code. A map that can run code needs `execmem` of the process if it is anonymous memory, a file without an inode, or a private map that can also write (#540).
 
+### Fixed
+
+- arm64: `CLOCK_MONOTONIC`, `CLOCK_REALTIME` and the tick count come from the virtual counter, as the arch counter clocksource of Linux. The clock is the counter since boot times a multiplier, shifted right, in the kernel and in the vDSO, and the tick count is the clock divided by the time of one tick. Each CPU arms its timer at an absolute counter value, `CNTV_CVAL_EL0`, at the start of the next tick. Before, the clock counted the timer interrupts and moved at most one tick for each interrupt, and each tick re-armed the timer with `CNTV_TVAL_EL0` from the time of the interrupt. So a late interrupt was lost, and on a loaded host under QEMU TCG the clock ran 3 to 8 times slow. The new arm64 boot test `clock` checks that the clock follows the counter in a sleep and in a busy loop (#813).
+
 ## [0.5.38] - 2026-11-21
 
 ### Added

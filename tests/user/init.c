@@ -1119,6 +1119,123 @@ static void test_vdso(void)
 	check("CLOCK_REALTIME is the time of the real time clock", s.tv_sec > 1700000000);
 }
 
+#if defined(__aarch64__)
+/* The nanoseconds of the virtual counter, which user code can read, as CNTVCT/CNTFRQ. */
+static long counter_ns(void)
+{
+	unsigned long cnt, frq;
+	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(cnt));
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+	return (long)((unsigned __int128)cnt * 1000000000u / frq);
+}
+
+/* The times of one point of the clock test: the counter, CLOCK_MONOTONIC of the vDSO and of the
+ * system call, CLOCK_REALTIME and the ticks of times(). */
+struct clock_point {
+	long cnt, vdso, sys, real;
+	clock_t ticks;
+};
+
+static void clock_point(struct clock_point *p, int (*vgettime)(clockid_t, struct timespec *))
+{
+	struct tms tms;
+	struct timespec a, s, r;
+	p->cnt = counter_ns();
+	vgettime(CLOCK_MONOTONIC, &a);
+	syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &s);
+	syscall(SYS_clock_gettime, CLOCK_REALTIME, &r);
+	p->ticks = times(&tms);
+	p->vdso = timespec_ns(&a);
+	p->sys = timespec_ns(&s);
+	p->real = timespec_ns(&r);
+}
+
+/* Tells if `a` is within 1% of `b`. */
+static int within_1pc(long a, long b)
+{
+	long d = a > b ? a - b : b - a;
+	return d * 100 <= b;
+}
+
+/* Checks a phase of the clock test, from the point `a` to the point `b`. The clock must follow
+ * the counter, also when the timer interrupts come late (#813). */
+static void clock_phase(const char *phase, const struct clock_point *a, const struct clock_point *b)
+{
+	long cnt = b->cnt - a->cnt, mono = b->vdso - a->vdso, sys = b->sys - a->sys;
+	long real = b->real - a->real;
+	long ticks = (long)(b->ticks - a->ticks) * (1000000000L / sysconf(_SC_CLK_TCK));
+	printf("clock: %s: CNTVCT/CNTFRQ %ld.%03ld s, CLOCK_MONOTONIC %ld.%03ld s, CLOCK_REALTIME %ld.%03ld s, times %ld.%03ld s, at %ld.%03ld s\n",
+	       phase, cnt / 1000000000, cnt / 1000000 % 1000, mono / 1000000000, mono / 1000000 % 1000,
+	       real / 1000000000, real / 1000000 % 1000, ticks / 1000000000, ticks / 1000000 % 1000,
+	       b->vdso / 1000000000, b->vdso / 1000000 % 1000);
+	char name[128];
+	snprintf(name, sizeof(name), "clock: %s: CLOCK_MONOTONIC is within 1%% of the counter", phase);
+	check(name, within_1pc(mono, cnt) && within_1pc(sys, cnt));
+	snprintf(name, sizeof(name), "clock: %s: CLOCK_REALTIME and times follow the counter", phase);
+	/* times() counts in ticks of 10 ms, so it has two ticks more of room. */
+	long tdiff = ticks > cnt ? ticks - cnt : cnt - ticks;
+	check(name, within_1pc(real, cnt) && tdiff <= cnt / 100 + 20000000);
+}
+
+/*
+ * The clock test of arm64 (#813): a sleep of `sleep_s` seconds and a busy loop of `busy_s`
+ * seconds. CLOCK_MONOTONIC must follow the virtual counter, CNTVCT/CNTFRQ, within 1%, and the
+ * vDSO and the system call must agree. Before, the clock counted the timer interrupts, and on a
+ * loaded host it was 3 to 8 times slow. The host adds its time to the console lines, so the
+ * clock can also be compared to the time of the host.
+ */
+static void test_clock(int sleep_s, int busy_s)
+{
+	int (*vgettime)(clockid_t, struct timespec *) = vdso_sym("__kernel_clock_gettime");
+	check("clock: the vDSO has __kernel_clock_gettime", vgettime != NULL);
+	if (!vgettime)
+		return;
+	struct clock_point p0, p1, p2;
+	clock_point(&p0, vgettime);
+	printf("clock: start at %ld.%03ld s, counter at %ld.%03ld s\n", p0.vdso / 1000000000,
+	       p0.vdso / 1000000 % 1000, p0.cnt / 1000000000, p0.cnt / 1000000 % 1000);
+	check("clock: CLOCK_MONOTONIC is the counter since boot",
+	      p0.vdso <= p0.cnt && p0.cnt - p0.vdso < 60000000000L);
+	check("clock: the vDSO and the system call agree", p0.vdso <= p0.sys && p0.sys - p0.vdso < 1000000000L);
+	struct timespec d = { sleep_s, 0 };
+	nanosleep(&d, NULL);
+	clock_point(&p1, vgettime);
+	check("clock: the sleep does not end early", p1.vdso - p0.vdso >= sleep_s * 1000000000L);
+	clock_phase("sleep", &p0, &p1);
+	long opens = 0, end = p1.vdso + busy_s * 1000000000L;
+	struct timespec now;
+	do {
+		int fd = open("/", O_RDONLY | O_DIRECTORY);
+		if (fd >= 0)
+			close(fd);
+		opens++;
+		vgettime(CLOCK_MONOTONIC, &now);
+	} while (timespec_ns(&now) < end);
+	clock_point(&p2, vgettime);
+	printf("clock: busy loop: %ld open and close\n", opens);
+	clock_phase("busy loop", &p1, &p2);
+	/* The vDSO and the system call give the same time: a system call between two vDSO calls is
+	 * between their times. */
+	int agree = 1;
+	for (int i = 0; i < 1000; i++) {
+		struct timespec a, s, b;
+		vgettime(CLOCK_MONOTONIC, &a);
+		syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &s);
+		vgettime(CLOCK_MONOTONIC, &b);
+		if (timespec_ns(&a) > timespec_ns(&s) || timespec_ns(&s) > timespec_ns(&b))
+			agree = 0;
+	}
+	check("clock: the vDSO and the system call give the same time", agree);
+}
+#else
+static void test_clock(int sleep_s, int busy_s)
+{
+	(void)sleep_s;
+	(void)busy_s;
+	printf("clock: the test is for arm64 only\n");
+}
+#endif
+
 static volatile sig_atomic_t got_sig, got_code, got_pid, chld_count, on_altstack;
 static volatile void *got_addr;
 static char altstack[16384];
@@ -17581,6 +17698,8 @@ int main(int argc, char **argv)
 		test_swap();
 	if (argc > 1 && strcmp(argv[1], "inet") == 0)
 		test_inet(argc > 2 ? atoi(argv[2]) : 0);
+	if (argc > 1 && strcmp(argv[1], "clock") == 0)
+		test_clock(argc > 2 ? atoi(argv[2]) : 10, argc > 3 ? atoi(argv[3]) : 5);
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");
 	return failed;
 }

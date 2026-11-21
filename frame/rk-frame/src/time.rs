@@ -1,7 +1,7 @@
 //! The timer tick.
 //!
-//! The timer interrupts `HZ` times each second on the boot CPU. The tick count is the `jiffies`
-//! value of Linux, but it starts at 0.
+//! The timer interrupts `HZ` times each second. The tick count is the `jiffies` value of Linux,
+//! but it starts at 0.
 
 use crate::arch::imp;
 use crate::sync::Once;
@@ -10,9 +10,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// The timer interrupts each second.
 pub const HZ: u64 = imp::timer::HZ;
 
-/// The timer interrupts since boot.
+/// The timer ticks since boot. On arm64 the counter gives them, so a late interrupt does not lose
+/// a tick. On x86-64 the timer interrupt adds the ticks that passed.
 pub fn ticks() -> u64 {
-    imp::timer::TICKS.load(Ordering::Relaxed)
+    imp::timer::ticks()
 }
 
 /// The nanoseconds since boot. On x86-64 the time stamp counter gives them, so they change
@@ -23,7 +24,8 @@ pub fn nanos() -> u64 {
 
 /// The nanoseconds of the clock since boot. The value changes between two ticks, but it is in the
 /// same tick as `ticks`, so a deadline in ticks is not before the time on the clock. The clocks of
-/// the system calls and of the vDSO use it.
+/// the system calls and of the vDSO use it. On arm64 it is the time of the counter, as the
+/// clocksource of Linux.
 pub fn clock_ns() -> u64 {
     imp::timer::clock_ns()
 }

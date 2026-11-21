@@ -200,7 +200,7 @@ pub(crate) mod console {
 /// The timer values that the architecture independent code reads.
 pub(crate) mod timer {
     pub(crate) use super::apic::{
-        HZ, TICKS, TIMER_HZ, clock_ns, nanos, tsc_state as counter_state,
+        HZ, TIMER_HZ, clock_ns, nanos, ticks, tsc_state as counter_state,
     };
 }
 

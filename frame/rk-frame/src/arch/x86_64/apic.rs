@@ -192,9 +192,23 @@ fn tick() {
     TICK_BUSY.store(false, Ordering::Release);
 }
 
-/// The time stamp counter at the last tick and `TSC_MULT`, for the data page of the vDSO.
-pub(crate) fn tsc_state() -> (u64, u64) {
-    (TICK_TSC.load(Ordering::Relaxed), TSC_MULT.load(Ordering::Relaxed))
+/// The timer ticks since boot.
+pub(crate) fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+/// The clock state for the data page of the vDSO: the nanoseconds of the last tick, the time
+/// stamp counter at the last tick, `TSC_MULT` and the most nanoseconds that the counter adds,
+/// which is less than one tick, as in `clock`.
+pub(crate) fn tsc_state() -> (u64, u64, u64, u64) {
+    loop {
+        let ticks = TICKS.load(Ordering::Acquire);
+        let base = TICK_TSC.load(Ordering::Acquire);
+        if TICKS.load(Ordering::Acquire) == ticks {
+            let tick_ns = 1_000_000_000 / HZ;
+            return (ticks * tick_ns, base, TSC_MULT.load(Ordering::Relaxed), tick_ns - 1);
+        }
+    }
 }
 
 fn read_msr(msr: u32) -> u64 {

@@ -4,6 +4,7 @@
 //! the clock, and the timer interrupts `HZ` times each second. User code can read the virtual
 //! counter, so the vDSO calculates the clock from it.
 
+use crate::clocksource;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// The timer interrupts each second.
@@ -24,15 +25,12 @@ pub(crate) fn intid() -> u32 {
     INTID.load(Ordering::Relaxed)
 }
 
-/// The timer interrupts since boot.
-pub(crate) static TICKS: AtomicU64 = AtomicU64::new(0);
 /// The frequency of the counter in Hz.
 pub(crate) static TIMER_HZ: AtomicU64 = AtomicU64::new(0);
-/// The counter at the last tick.
-static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
-/// The counter at boot.
+/// The counter at boot, the time 0 of the clock.
 static BOOT_COUNT: AtomicU64 = AtomicU64::new(0);
-/// The nanoseconds of one cycle of the counter, times 2^32. The clock and the vDSO use it.
+/// The multiplier of the counter, see `clocksource::mult`. The clock and the vDSO use it. It is 0
+/// before `init`.
 static COUNTER_MULT: AtomicU64 = AtomicU64::new(0);
 
 fn counter() -> u64 {
@@ -52,16 +50,21 @@ fn frequency() -> u64 {
     value
 }
 
-/// Sets the timer to interrupt after one tick.
-fn arm(freq: u64) {
+/// Sets the timer of this CPU to interrupt at the start of the next tick, at an absolute value of
+/// the counter, as Linux arms a clockevent device in oneshot mode. A late interrupt thus does not
+/// make the next tick late.
+fn arm() {
+    let mult = COUNTER_MULT.load(Ordering::Relaxed);
+    let boot = BOOT_COUNT.load(Ordering::Relaxed);
+    let next = clocksource::next_tick(counter().wrapping_sub(boot), mult, NS_PER_TICK);
     // SAFETY: the timer registers of EL1 change only the timer. The control value 1 turns the
     // timer on with its interrupt not masked.
     unsafe {
         core::arch::asm!(
-            "msr cntv_tval_el0, {tval}",
+            "msr cntv_cval_el0, {cval}",
             "msr cntv_ctl_el0, {ctl}",
             "isb",
-            tval = in(reg) freq / HZ,
+            cval = in(reg) boot.wrapping_add(next),
             ctl = in(reg) 1u64,
             options(nomem, nostack),
         );
@@ -72,13 +75,8 @@ fn arm(freq: u64) {
 pub(crate) fn init() {
     let freq = frequency();
     TIMER_HZ.store(freq, Ordering::Relaxed);
-    if freq != 0 {
-        COUNTER_MULT
-            .store(((1_000_000_000u128 << 32) / u128::from(freq)) as u64, Ordering::Relaxed);
-    }
-    let now = counter();
-    BOOT_COUNT.store(now, Ordering::Relaxed);
-    TICK_COUNT.store(now, Ordering::Relaxed);
+    BOOT_COUNT.store(counter(), Ordering::Relaxed);
+    COUNTER_MULT.store(clocksource::mult(freq), Ordering::Release);
     init_cpu();
 }
 
@@ -98,52 +96,38 @@ pub(crate) fn init_cpu() {
         return;
     }
     super::gic::enable(intid());
-    arm(freq);
+    arm();
 }
 
-/// Handles the timer interrupt. Each CPU gets one, and the boot CPU counts the ticks.
+/// Handles the timer interrupt. Each CPU gets one and arms its timer for the next tick. The clock
+/// and the tick count come from the counter, so the interrupt does not change them.
 pub(crate) fn tick() {
-    if super::cpu::id() == 0 {
-        // `clock_ns` reads the tick count before and after the counter of the tick, so the counter
-        // must change first.
-        TICK_COUNT.store(counter(), Ordering::Release);
-        TICKS.fetch_add(1, Ordering::Release);
-        crate::vdso::tick();
-    }
-    arm(TIMER_HZ.load(Ordering::Relaxed));
+    arm();
 }
 
-fn to_ns(count: u64, freq: u64) -> u64 {
-    (u128::from(count) * 1_000_000_000 / u128::from(freq)) as u64
-}
-
-/// The nanoseconds since boot, from the counter.
-pub(crate) fn nanos() -> u64 {
-    let freq = TIMER_HZ.load(Ordering::Relaxed);
-    if freq == 0 {
-        return TICKS.load(Ordering::Relaxed) * NS_PER_TICK;
-    }
-    to_ns(counter().saturating_sub(BOOT_COUNT.load(Ordering::Relaxed)), freq)
-}
-
-/// The nanoseconds of the clock since boot. The value is in the same tick as the tick count, so a
-/// deadline in ticks is not before the time on the clock. The vDSO calculates the same value from
-/// its data page.
+/// The nanoseconds since boot, from the counter. This is the clocksource of Linux: the counter
+/// since boot times `COUNTER_MULT`, shifted right. The value does not depend on the timer
+/// interrupts, so a late tick does not make the clock slow. The vDSO calculates the same value
+/// from its data page. It is 0 before `init`.
 pub(crate) fn clock_ns() -> u64 {
-    let mult = COUNTER_MULT.load(Ordering::Relaxed);
-    loop {
-        let ticks = TICKS.load(Ordering::Acquire);
-        let base = TICK_COUNT.load(Ordering::Acquire);
-        let now = counter();
-        if TICKS.load(Ordering::Acquire) == ticks {
-            let cycles = u128::from(now.saturating_sub(base));
-            let part = ((cycles * u128::from(mult)) >> 32).min(u128::from(NS_PER_TICK - 1));
-            return ticks * NS_PER_TICK + part as u64;
-        }
-    }
+    let mult = COUNTER_MULT.load(Ordering::Acquire);
+    clocksource::cycles_to_ns(counter().saturating_sub(BOOT_COUNT.load(Ordering::Relaxed)), mult)
 }
 
-/// The counter at the last tick and `COUNTER_MULT`, for the data page of the vDSO.
-pub(crate) fn counter_state() -> (u64, u64) {
-    (TICK_COUNT.load(Ordering::Relaxed), COUNTER_MULT.load(Ordering::Relaxed))
+/// The nanoseconds since boot, for the scheduler. It is the same as `clock_ns`.
+pub(crate) fn nanos() -> u64 {
+    clock_ns()
+}
+
+/// The timer ticks since boot, the `jiffies` value of Linux, from the clock. A tick that comes
+/// late is not lost, and a deadline in ticks is not before the time on the clock.
+pub(crate) fn ticks() -> u64 {
+    clock_ns() / NS_PER_TICK
+}
+
+/// The clock state for the data page of the vDSO: the nanoseconds at the base, the counter at the
+/// base, `COUNTER_MULT` and the most nanoseconds that the counter adds to the base. The base is
+/// boot, and the counter part has no limit.
+pub(crate) fn counter_state() -> (u64, u64, u64, u64) {
+    (0, BOOT_COUNT.load(Ordering::Relaxed), COUNTER_MULT.load(Ordering::Relaxed), u64::MAX)
 }
