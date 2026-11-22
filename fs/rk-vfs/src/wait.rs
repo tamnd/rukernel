@@ -87,6 +87,12 @@ impl WaitQueue {
         #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
         self.inner.wake_all();
     }
+
+    /// Wakes the first task that waits.
+    pub fn wake_one(&self) {
+        #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        self.inner.wake_one();
+    }
 }
 
 impl Default for WaitQueue {

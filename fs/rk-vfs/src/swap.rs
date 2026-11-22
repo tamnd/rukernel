@@ -17,7 +17,7 @@ use crate::inode::{FiemapExtent, Inode, InodeRef, Result};
 use crate::wait::WaitQueue;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_block::Queue;
 use rk_block::cache::PAGE_SIZE;
@@ -581,7 +581,7 @@ fn locate(e: u64) -> Result<(Arc<Queue>, u64)> {
 /// Gives `EINVAL` for an entry of no active area, and the error of the disk.
 pub fn write_page(e: u64, data: &[u8]) -> Result<()> {
     let (queue, sector) = locate(e)?;
-    queue.write(sector, &data[..PAGE_SIZE])
+    IO.run(|| queue.write(sector, &data[..PAGE_SIZE]))
 }
 
 /// Reads the page of the swap entry `e` into `buf`, with direct I/O from the disk.
@@ -591,8 +591,42 @@ pub fn write_page(e: u64, data: &[u8]) -> Result<()> {
 /// Gives `EINVAL` for an entry of no active area, and the error of the disk.
 pub fn read_page(e: u64, buf: &mut [u8]) -> Result<()> {
     let (queue, sector) = locate(e)?;
-    queue.read(sector, &mut buf[..PAGE_SIZE])
+    IO.run(|| queue.read(sector, &mut buf[..PAGE_SIZE]))
 }
+
+/// The turn of the reads and writes of the swap areas. The driver of the disk does one request
+/// at a time, and its lock spins, so a task that waits for the lock holds its CPU. When many
+/// tasks thrash, each CPU then spins for the disk, and no other task runs. With the turn, one
+/// task waits for the disk and the others sleep, as a task of Linux sleeps in `submit_bio_wait`
+/// and in `folio_wait_locked` while the disk does the I/O of another task. The CPU then runs the
+/// other tasks of the system.
+struct IoTurn {
+    busy: AtomicBool,
+    queue: WaitQueue,
+}
+
+impl IoTurn {
+    const fn new() -> Self {
+        Self { busy: AtomicBool::new(false), queue: WaitQueue::new() }
+    }
+
+    /// Runs `f` when no other task has the turn, and gives the turn to the next task after it.
+    fn run<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.queue.wait_until(|| {
+            self.busy
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+                .then_some(())
+        });
+        let r = f();
+        self.busy.store(false, Ordering::Release);
+        self.queue.wake_one();
+        r
+    }
+}
+
+/// The turn of all the swap I/O.
+static IO: IoTurn = IoTurn::new();
 
 #[cfg(test)]
 mod tests {
@@ -628,6 +662,34 @@ mod tests {
         assert!(!s.free(70));
         assert_eq!(s.alloc(), Some(30));
         assert_eq!(s.alloc(), None);
+    }
+
+    /// Several threads do swap I/O at the same time. One at a time has the turn, and each gets it.
+    #[test]
+    fn one_swap_io_at_a_time_has_the_turn() {
+        extern crate std;
+        let turn = IoTurn::new();
+        let (inside, most, done) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..200 {
+                        let n = turn.run(|| {
+                            let n = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                            most.fetch_max(n, Ordering::SeqCst);
+                            core::hint::spin_loop();
+                            inside.fetch_sub(1, Ordering::SeqCst);
+                            n
+                        });
+                        assert_eq!(n, 1);
+                        done.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(most.load(Ordering::SeqCst), 1);
+        assert_eq!(done.load(Ordering::SeqCst), 800);
+        assert!(!turn.busy.load(Ordering::SeqCst));
     }
 
     #[test]
