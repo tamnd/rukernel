@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.39] - 2026-11-22
+
 ### Added
 
 - SELinux checks the mounts, as `selinux_mount`, `selinux_move_mount` and `selinux_umount` of Linux. A new mount and a move of a mount need `mounton` on the place of the mount, a remount needs `remount` of the file system, and an unmount needs `unmount` of the file system (#540).
@@ -1828,6 +1830,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.39]: https://github.com/tamnd/rukernel/compare/v0.5.38...v0.5.39
 [0.5.38]: https://github.com/tamnd/rukernel/compare/v0.5.37...v0.5.38
 [0.5.37]: https://github.com/tamnd/rukernel/compare/v0.5.36...v0.5.37
 [0.5.36]: https://github.com/tamnd/rukernel/compare/v0.5.35...v0.5.36
