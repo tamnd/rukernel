@@ -10,7 +10,7 @@
 
 use crate::ip::{self, Ip};
 use crate::ipv6;
-use crate::route::{INFINITY, Metrics, RTAX_MAX};
+use crate::route::{INFINITY, Metrics, RTAX_MAX, flow_hash, pick};
 use crate::rules::{Flow, Rules, Step};
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -21,7 +21,7 @@ use rk_abi::native::if_addr::{
 use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE};
 use rk_abi::native::rtnetlink::{
     RT_TABLE_LOCAL, RT_TABLE_MAIN, RTN_BLACKHOLE, RTN_LOCAL, RTN_MULTICAST, RTN_PROHIBIT,
-    RTN_UNICAST, RTN_UNREACHABLE, RTPROT_KERNEL,
+    RTN_UNICAST, RTN_UNREACHABLE, RTNH_F_DEAD, RTNH_F_LINKDOWN, RTPROT_KERNEL,
 };
 use rk_net::sysctl::{Family, Scope};
 use rk_vfs::inode::Result;
@@ -108,6 +108,11 @@ pub struct Route6 {
     pub nhid: u32,
     /// Tells if the nexthop object of the route is a blackhole.
     pub blackhole: bool,
+    /// The weight of the route among its siblings, from 1, as `fib_nh_weight` of Linux.
+    pub weight: u32,
+    /// The flags `RTNH_F_DEAD` and `RTNH_F_LINKDOWN` of a path of a multipath route whose
+    /// device went down, as `fib_nh_flags` of Linux.
+    pub nh_flags: u8,
 }
 
 impl Route6 {
@@ -128,6 +133,8 @@ impl Route6 {
             metrics: [0; RTAX_MAX as usize],
             nhid: 0,
             blackhole: false,
+            weight: 1,
+            nh_flags: 0,
         }
     }
 
@@ -144,7 +151,7 @@ impl Route6 {
 
     /// Tells if `r` is the same route: the same table, destination, metric, gateway and
     /// interface.
-    fn same(&self, r: &Route6) -> bool {
+    pub(crate) fn same(&self, r: &Route6) -> bool {
         self.table == r.table
             && self.dst == r.dst
             && self.prefix == r.prefix
@@ -152,6 +159,33 @@ impl Route6 {
             && self.gateway == r.gateway
             && self.ifindex == r.ifindex
             && self.nhid == r.nhid
+    }
+
+    /// Tells if the path is dead: its device went down while the other paths stayed.
+    pub fn dead(&self) -> bool {
+        u32::from(self.nh_flags) & RTNH_F_DEAD != 0
+    }
+
+    /// Tells if the route can be a path of a multipath route: a unicast route through a
+    /// gateway, not of a router advertisement and not through a nexthop object, as
+    /// `rt6_qualify_for_ecmp` of Linux.
+    pub fn ecmp(&self) -> bool {
+        self.gateway.is_some()
+            && !self.addrconf
+            && self.nhid == 0
+            && u32::from(self.kind) == RTN_UNICAST
+    }
+
+    /// Tells if `o` is a sibling of the route: another path of the same multipath route, with
+    /// the same table, destination and metric, as the list `fib6_siblings` of Linux.
+    pub fn sibling_of(&self, o: &Route6) -> bool {
+        self.ecmp()
+            && o.ecmp()
+            && self.table == o.table
+            && self.dst == o.dst
+            && self.prefix == o.prefix
+            && self.priority == o.priority
+            && !self.same(o)
     }
 }
 
@@ -411,6 +445,10 @@ impl Table6 {
     /// table `local`, as `addrconf_add_mroute` of Linux.
     pub fn link_up(&mut self, ifindex: u32, loopback: bool) -> Changes6 {
         let mut c = Changes6::default();
+        // The paths through the device are alive again, as `rt6_sync_up` of Linux.
+        for r in self.routes.iter_mut().filter(|r| r.ifindex == ifindex) {
+            r.nh_flags = 0;
+        }
         if !loopback {
             let mut m = [0; 16];
             m[0] = 0xff;
@@ -430,11 +468,34 @@ impl Table6 {
             core::mem::take(&mut self.addrs).into_iter().partition(|a| a.ifindex == ifindex);
         self.addrs = kept;
         let mut c = Changes6::default();
-        self.routes.retain(|r| {
-            // The routes through nexthop objects go away with their nexthops.
-            if r.ifindex == ifindex && r.nhid == 0 {
+        // A path of a multipath route stays, dead, while another path is alive. The route goes
+        // when its last path goes, as `fib6_ifdown` of Linux. The routes through nexthop objects
+        // go away with their nexthops.
+        let flush: Vec<bool> = self
+            .routes
+            .iter()
+            .map(|r| {
+                let on_dev = |o: &Route6| o.ifindex == ifindex && o.nhid == 0;
+                let gone = |o: &Route6| on_dev(o) || o.dead();
+                match self.siblings(r).next() {
+                    None => on_dev(r),
+                    Some(_) => {
+                        (on_dev(r) || self.siblings(r).any(on_dev))
+                            && gone(r)
+                            && self.siblings(r).all(gone)
+                    }
+                }
+            })
+            .collect();
+        let mut i = 0;
+        self.routes.retain_mut(|r| {
+            i += 1;
+            if flush[i - 1] {
                 c.removed.push(r.clone());
                 return false;
+            }
+            if r.ifindex == ifindex && r.nhid == 0 {
+                r.nh_flags |= (RTNH_F_DEAD | RTNH_F_LINKDOWN) as u8;
             }
             true
         });
@@ -461,6 +522,39 @@ impl Table6 {
         }
         self.routes.push(r);
         Ok(())
+    }
+
+    /// Adds the paths of a multipath route, as `ip6_route_multipath_add` of Linux. The first
+    /// path takes the flags `flags`. The next paths take `NLM_F_CREATE` without `NLM_F_EXCL`
+    /// and `NLM_F_REPLACE`, so they become siblings of the first. If a path fails, the paths
+    /// that were added go away again.
+    ///
+    /// # Errors
+    ///
+    /// Gives the error of `insert_route` for the path that failed.
+    pub fn insert_routes(&mut self, rs: &[Route6], flags: u32) -> Result<()> {
+        for (i, r) in rs.iter().enumerate() {
+            let f =
+                if i == 0 { flags } else { (flags & !(NLM_F_EXCL | NLM_F_REPLACE)) | NLM_F_CREATE };
+            if let Err(e) = self.insert_route(r.clone(), f) {
+                // A path that replaced a route cannot come back: Linux does not undo that too.
+                let added = &rs[..i];
+                self.routes.retain(|o| !added.iter().any(|a| a.same(o)));
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// The siblings of the route `r`, in the order of the table.
+    pub fn siblings<'a>(&'a self, r: &'a Route6) -> impl Iterator<Item = &'a Route6> {
+        self.routes.iter().filter(move |o| r.sibling_of(o))
+    }
+
+    /// Tells if a sibling of the route at `i` is before it in the table. A dump shows a
+    /// multipath route once, at its first path.
+    pub fn has_earlier_sibling(&self, i: usize) -> bool {
+        self.routes[..i].iter().any(|o| self.routes[i].sibling_of(o))
     }
 
     /// Adds or changes a route of a router advertisement, and gives it if it is new.
@@ -507,6 +601,29 @@ impl Table6 {
     /// Tells if a route goes through one of the nexthop objects `ids`.
     pub fn uses_nh(&self, ids: &[u32]) -> bool {
         self.routes.iter().any(|r| r.nhid != 0 && ids.contains(&r.nhid))
+    }
+
+    /// Removes the first route that `m` takes as `delete_route`. Without a gateway in `m`, the
+    /// siblings of the route go away too, as `__ip6_del_rt_siblings` of Linux. Gives the
+    /// route, then its siblings.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ESRCH` if no route matches.
+    pub fn delete_routes(&mut self, m: &Match6) -> Result<Vec<Route6>> {
+        let r = self.delete_route(m)?;
+        let mut gone = Vec::new();
+        if m.gateway.is_none() {
+            self.routes.retain(|o| {
+                let sibling = r.sibling_of(o);
+                if sibling {
+                    gone.push(o.clone());
+                }
+                !sibling
+            });
+        }
+        gone.insert(0, r);
+        Ok(gone)
     }
 
     /// Removes the first route that `m` takes, as `ip6_route_del` of Linux.
@@ -709,6 +826,7 @@ impl Table6 {
                                 | RTN_BLACKHOLE
                         )
                         && (oif == 0 || r.ifindex == oif)
+                        && !r.dead()
                         && ipv6::same_net(&r.dst, dst, r.prefix)
                 })
                 .max_by_key(|r| (r.prefix, u32::MAX - r.priority))
@@ -723,6 +841,24 @@ impl Table6 {
             Ok(r) => Some(r),
             Err(Errno::ESRCH) => None,
             Err(e) => return Err(e),
+        };
+        // A multipath route: the hash of the flow picks a path by the weights, as
+        // `fib6_select_path` of Linux. The siblings are in the order of the table.
+        let route = match route {
+            Some(r) if r.ecmp() => {
+                let paths: Vec<&Route6> = self
+                    .routes
+                    .iter()
+                    .filter(|o| {
+                        (core::ptr::eq(*o, r) || r.sibling_of(o))
+                            && (oif == 0 || o.ifindex == oif)
+                            && !o.dead()
+                    })
+                    .collect();
+                let weights: Vec<u32> = paths.iter().map(|o| o.weight).collect();
+                paths.get(pick(flow_hash(fl), &weights)).copied().or(Some(r))
+            }
+            r => r,
         };
         // A route that rejects gives the error of `ip6_rt_type_to_error` of Linux.
         match route.map(|r| u32::from(r.kind)) {

@@ -124,6 +124,7 @@ These pull requests of #538 fixed the kernel for these tests:
 - #808: IFLA_INET6_ADDR_GEN_MODE in RTM_SETLINK and the AF_INET6 attributes in IFLA_AF_SPEC of each link. A device with addr_gen_mode 1 (none) gets no link local address. With this, test_link_local_addressing_ipv6ll passes.
 - #809: the IPv6 gateway of a new nexthop or route is on the link while each address of the interface is tentative. Before, networkd got "No route to host" for the nexthop `id 2 via 2001:1234:5:8f63::2 dev veth99` in test_nexthop.
 - RTA_VIA: an IPv4 route or nexthop through an IPv6 gateway, as Linux 5.2 and later. With this, test_route_via_ipv6 and test_nexthop pass on rukernel (the run of NetworkdNetworkTests on 2026-11-21 gave 31 passes of 42, and 29 before).
+- RTA_MULTIPATH: multipath routes for IPv4 and IPv6, with a weight for each path and the IPv6 siblings. With this, test_route_static passes on rukernel, and `ip route show` gives the same paths in the same order as Linux 6.8 (the run of NetworkdNetworkTests on 2026-11-21 gave 32 passes of 42, and 31 before). Before, networkd failed dummy98 with "Could not set static route: No such device".
 
 ## Exceptions
 
@@ -142,7 +143,6 @@ These tests pass on Linux and do not pass on rukernel. Most of them need a devic
   - The files retrans_time_ms and base_reachable_time_ms in /proc/sys/net/ipv6/neigh/DEV: test_ipv6_neigh_retrans_time and test_ipv6_prefix_delegation.
   - addr_gen_mode none: networkd sets IFLA_INET6_ADDR_GEN_MODE with RTM_SETLINK, and reads it from IFLA_AF_SPEC. rukernel did not take it, so with LinkLocalAddressing=no the device still had an fe80 address, and test_link_local_addressing_ipv6ll did not get a new fe80 address after the change of its .network file. #808 came after this run, and with it test_link_local_addressing_ipv6ll passes. test_link_local_addressing also needs stable_secret and the mode stable privacy (IPv6StableSecretAddress), which rukernel does not have.
   - Temporary IPv6 addresses: test_dhcp6pd.
-  - Multipath routes: test_route_static. It also uses gre devices.
   - DAD: in test_ipv6_token_prefixstable the address from the router advertisement gets the flag dadfailed.
   - TCP_CONGESTION of a route: test_route_congctl is xfail.
   - L3 master devices (VRF): test_routing_policy_rule_l3mdev is xfail.

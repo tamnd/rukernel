@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- Multipath routes, as Linux. An IPv4 `RTM_NEWROUTE` with `RTA_MULTIPATH` makes a route with a path for each `rtnexthop`, with the checks of `fib_count_nexthops`, `fib_get_nhs` and `fib_check_nh`, and a weight of `rtnh_hops` and one. A request with one path makes a route with one path. The dump shows `RTA_MULTIPATH`, and `RTM_DELROUTE` with paths matches them in order, as `fib_nh_match`. A device that goes down marks its paths `dead linkdown`, and the route goes away when all of its paths are dead. An IPv6 route with `RTA_MULTIPATH` makes a route for each path, and these routes are siblings, as `ip6_route_multipath_add`. The dump and the notifications show the siblings in one `RTA_MULTIPATH` with their weights, and a delete without a gateway removes the siblings too. An IPv6 path whose device goes down also stays, marked `dead linkdown`, while another path is alive, as `fib6_ifdown`. A flow takes a path from a hash of its addresses and the weights, so its packets stay in order. Before, the kernel did not use `RTA_MULTIPATH` in a route (#538).
+
 ## [0.5.39] - 2026-11-22
 
 ### Added

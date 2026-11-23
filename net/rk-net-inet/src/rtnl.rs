@@ -8,8 +8,8 @@ use crate::ipv4::Addr;
 use crate::neigh::{Change, Info, Nud, ProxyInfo};
 use crate::nexthop;
 use crate::route::{
-    INFINITY, IfAddr, Match, Metrics, RTAX_ADVMSS, RTAX_CC_ALGO, RTAX_FEATURE_MASK, RTAX_FEATURES,
-    RTAX_HOPLIMIT, RTAX_MAX, RTAX_MTU, Route,
+    Gateway, INFINITY, IfAddr, Match, Metrics, Path, RTAX_ADVMSS, RTAX_CC_ALGO, RTAX_FEATURE_MASK,
+    RTAX_FEATURES, RTAX_HOPLIMIT, RTAX_MAX, RTAX_MTU, Route,
 };
 use crate::rules::Flow;
 use crate::stack::{self, ROUTES};
@@ -29,13 +29,13 @@ use rk_abi::native::neighbour::{
 };
 use rk_abi::native::netlink::{NLM_F_DUMP_FILTERED, NLM_F_EXCL, NLM_F_MULTI, NLM_F_REPLACE};
 use rk_abi::native::rtnetlink::{
-    RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_COMPAT, RT_TABLE_MAIN, RTA_CACHEINFO,
-    RTA_DEL_REASON, RTA_DPORT, RTA_DST, RTA_ENCAP, RTA_GATEWAY, RTA_IIF, RTA_IP_PROTO, RTA_MARK,
-    RTA_METRICS, RTA_MULTIPATH, RTA_NH_ID, RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_SPORT, RTA_SRC,
-    RTA_TABLE, RTA_UID, RTA_VIA, RTM_DELADDR, RTM_DELNEIGH, RTM_DELROUTE, RTM_F_CLONED,
-    RTM_F_FIB_MATCH, RTM_F_LOOKUP_TABLE, RTM_F_NOTIFY, RTM_F_PREFIX, RTM_GETADDR, RTM_GETNEIGH,
-    RTM_GETROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST,
-    RTNLGRP_NEIGH,
+    RT_SCOPE_HOST, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_COMPAT, RT_TABLE_MAIN,
+    RTA_CACHEINFO, RTA_DEL_REASON, RTA_DPORT, RTA_DST, RTA_ENCAP, RTA_GATEWAY, RTA_IIF,
+    RTA_IP_PROTO, RTA_MARK, RTA_METRICS, RTA_MULTIPATH, RTA_NH_ID, RTA_OIF, RTA_PREFSRC,
+    RTA_PRIORITY, RTA_SPORT, RTA_SRC, RTA_TABLE, RTA_UID, RTA_VIA, RTM_DELADDR, RTM_DELNEIGH,
+    RTM_DELROUTE, RTM_F_CLONED, RTM_F_FIB_MATCH, RTM_F_LOOKUP_TABLE, RTM_F_NOTIFY, RTM_F_PREFIX,
+    RTM_GETADDR, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE,
+    RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST, RTNH_F_DEAD, RTNH_F_LINKDOWN, RTNLGRP_NEIGH,
 };
 use rk_net::consts::{AF_INET, AF_INET6, IFNAMSIZ};
 use rk_net::dev::{self, NetDevice};
@@ -270,6 +270,62 @@ fn via(v: &[u8]) -> core::result::Result<nexthop::Gateway, &'static str> {
     }
 }
 
+/// The paths of the `RTA_MULTIPATH` attribute `m` of an IPv4 route, as `fib_count_nexthops`
+/// and `fib_get_nhs` of Linux. Gives the message of Linux for paths that are not valid.
+fn to_paths(m: &[u8]) -> core::result::Result<Vec<Path>, &'static str> {
+    let (hops, whole) = nexthop::hops(m);
+    if hops.is_empty() || !whole {
+        return Err("Invalid nexthop configuration - extra data after nexthops");
+    }
+    let path = |h: &nexthop::Hop<'_>| {
+        let gateway = match (h.get(RTA_GATEWAY), h.get(RTA_VIA)) {
+            (Some(_), Some(_)) => {
+                return Err("Nexthop configuration can not contain both GATEWAY and VIA");
+            }
+            (Some(g), None) => {
+                let g: Addr = g
+                    .get(..4)
+                    .and_then(|g| g.try_into().ok())
+                    .ok_or("Invalid IPv4 address in RTA_GATEWAY")?;
+                Gateway::of(Some(g).filter(|g| *g != ipv4::ANY), None)
+            }
+            (None, Some(v)) => match via(v)? {
+                Gateway::V4(g) => Gateway::of(Some(g).filter(|g| *g != ipv4::ANY), None),
+                g => g,
+            },
+            (None, None) => Gateway::None,
+        };
+        Ok(Path { gateway, ifindex: h.ifindex, flags: h.flags, weight: u32::from(h.hops) + 1 })
+    };
+    hops.iter().map(path).collect()
+}
+
+/// Checks the paths of a new multipath route with the rest of the request, as `fib_get_nhs`
+/// and `fib_create_info` of Linux.
+fn check_paths(req: &Request<'_>, r: &Route) -> Result<()> {
+    let dead = (RTNH_F_DEAD | RTNH_F_LINKDOWN) as u8;
+    if r.paths.iter().any(|p| p.flags & dead != 0) {
+        return Err(req
+            .error("Invalid flags for nexthop - can not contain DEAD or LINKDOWN", Errno::EINVAL));
+    }
+    let first = &r.paths[0];
+    if r.ifindex != 0 && first.ifindex != r.ifindex {
+        return Err(req.error("Nexthop device index does not match RTA_OIF", Errno::EINVAL));
+    }
+    let gw = Gateway::of(r.gateway, r.via6);
+    if gw != Gateway::None && gw != first.gateway {
+        return Err(
+            req.error("Nexthop gateway does not match RTA_GATEWAY or RTA_VIA", Errno::EINVAL)
+        );
+    }
+    if r.scope == RT_SCOPE_HOST as u8 && r.paths.len() != 1 {
+        return Err(
+            req.error("Route with host scope can not have multiple nexthops", Errno::EINVAL)
+        );
+    }
+    Ok(())
+}
+
 /// A route of a request, as `rtm_to_fib_config` of Linux. Gives the route with its table.
 fn to_route(req: &Request<'_>) -> Result<Route> {
     let (h, a) = req.parse(RTMSG_LEN, RTA_MAX)?;
@@ -313,6 +369,12 @@ fn to_route(req: &Request<'_>) -> Result<Route> {
             nexthop::Gateway::None => {}
         }
     }
+    // The policy of Linux wants a `struct rtnexthop` at least.
+    let paths = match a.get(RTA_MULTIPATH) {
+        None => Vec::new(),
+        Some(m) if m.len() < 8 => return Err(Errno::EINVAL),
+        Some(m) => to_paths(m).map_err(|e| req.error(e, Errno::EINVAL))?,
+    };
     Ok(Route {
         table,
         dst,
@@ -330,6 +392,7 @@ fn to_route(req: &Request<'_>) -> Result<Route> {
         metrics: a.get(RTA_METRICS).map_or(Ok([0; RTAX_MAX as usize]), to_metrics)?,
         nhid,
         blackhole: false,
+        paths,
     })
 }
 
@@ -338,6 +401,9 @@ fn newroute(req: &Request<'_>) -> Result<()> {
     let mut r = to_route(req)?;
     if r.nhid != 0 {
         nexthop::exists(req, r.nhid)?;
+    }
+    if !r.paths.is_empty() {
+        check_paths(req, &r)?;
     }
     fib::check_route(&mut r)?;
     if r.nhid != 0 {
@@ -367,6 +433,7 @@ fn delroute(req: &Request<'_>) -> Result<()> {
         ifindex: (r.ifindex != 0).then_some(r.ifindex),
         priority: (r.priority != 0).then_some(r.priority),
         nhid: (r.nhid != 0).then_some(r.nhid),
+        paths: r.paths,
     };
     fib::del_route(&m, req.origin())
 }
@@ -555,7 +622,7 @@ fn dump_routes(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
         .filter(|r| table == 0 || r.table == table)
         .filter(|r| protocol == 0 || r.protocol == protocol)
         .filter(|r| kind == 0 || r.kind == kind)
-        .filter(|r| oif == 0 || r.ifindex == oif)
+        .filter(|r| oif == 0 || r.uses_dev(oif))
         .map(|r| fib::fill_route(r, RTM_NEWROUTE, req.portid, req.hdr.seq, flags))
         .collect())
 }
@@ -787,6 +854,7 @@ pub(crate) fn notify_neigh(af: u32, change: Change<Ip>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     fn attr(ty: u16, v: &[u8]) -> Vec<u8> {
         let mut b = Vec::from(((4 + v.len()) as u16).to_ne_bytes());
@@ -851,5 +919,49 @@ mod tests {
         assert!(got.contains(&(RTA_VIA as u16, via)));
         assert!(got.contains(&(RTA_OIF as u16, 2u32.to_ne_bytes().to_vec())));
         assert!(!got.iter().any(|(t, _)| *t == RTA_GATEWAY as u16));
+    }
+
+    /// The paths of `RTA_MULTIPATH` have the checks of `fib_count_nexthops` and `fib_get_nhs`
+    /// of Linux. The weight is `rtnh_hops` and one.
+    #[test]
+    fn multipath_has_the_checks_of_linux() {
+        let hop = |hops: u8, ifindex: u32, a: &[Vec<u8>]| {
+            let mut b = vec![0, 0, 0, hops];
+            b.extend_from_slice(&ifindex.to_ne_bytes());
+            for x in a {
+                b.extend_from_slice(x);
+                b.resize(b.len().next_multiple_of(4), 0);
+            }
+            let len = b.len() as u16;
+            b[..2].copy_from_slice(&len.to_ne_bytes());
+            b
+        };
+        let gw = |a: &[u8]| attr(RTA_GATEWAY as u16, a);
+        let mut m = hop(0, 2, &[gw(&[10, 0, 2, 2])]);
+        m.extend(hop(2, 3, &[gw(&[10, 0, 3, 2])]));
+        let p = |gateway, ifindex, weight| Path { gateway, ifindex, flags: 0, weight };
+        assert_eq!(
+            to_paths(&m),
+            Ok(vec![p(Gateway::V4([10, 0, 2, 2]), 2, 1), p(Gateway::V4([10, 0, 3, 2]), 3, 3)])
+        );
+        let mut v = Vec::from((AF_INET6 as u16).to_ne_bytes());
+        v.extend_from_slice(&GW6);
+        let via6 = attr(RTA_VIA as u16, &v);
+        assert_eq!(to_paths(&hop(0, 2, &[via6.clone()])), Ok(vec![p(Gateway::V6(GW6), 2, 1)]));
+        assert_eq!(to_paths(&hop(0, 2, &[])), Ok(vec![p(Gateway::None, 2, 1)]));
+        assert_eq!(
+            to_paths(&hop(0, 2, &[gw(&[10, 0, 2, 2]), via6])),
+            Err("Nexthop configuration can not contain both GATEWAY and VIA")
+        );
+        assert_eq!(
+            to_paths(&hop(0, 2, &[gw(&[10, 0])])),
+            Err("Invalid IPv4 address in RTA_GATEWAY")
+        );
+        let mut extra = hop(0, 2, &[]);
+        extra.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(
+            to_paths(&extra),
+            Err("Invalid nexthop configuration - extra data after nexthops")
+        );
     }
 }

@@ -462,6 +462,66 @@ fn a_route_through_an_ipv6_gateway() {
     assert_eq!(t.delete_route(&m).unwrap(), r);
 }
 
+/// A multipath route spreads the flows on its paths by their weights, as
+/// `fib_select_multipath` of Linux. A device that goes down kills its paths, and the route
+/// stays while a path is alive. A delete with paths takes the route if its paths match in order,
+/// as `fib_nh_match` of Linux.
+#[test]
+fn a_multipath_route() {
+    use crate::route::{Gateway, Path};
+    let mut t = qemu_table();
+    let mut eth1 = IfAddr::new(3, [10, 0, 3, 15], 24, "eth1");
+    eth1.broadcast = eth1.default_broadcast();
+    t.insert_addr(eth1).unwrap();
+    t.sync_link(Link { ifindex: 3, up: true, loopback: false });
+    let paths = vec![
+        Path { gateway: Gateway::V4([10, 0, 2, 2]), ifindex: 2, flags: 0, weight: 1 },
+        Path { gateway: Gateway::V4([10, 0, 3, 2]), ifindex: 3, flags: 0, weight: 3 },
+    ];
+    let r =
+        Route { paths: paths.clone(), ..Route::new([192, 168, 0, 0], 16, Some([10, 0, 2, 2]), 2) };
+    t.insert_route(r.clone(), NLM_F_CREATE | NLM_F_EXCL).unwrap();
+    let mut n = [0; 2];
+    for i in 0..4096u16 {
+        let [a, b] = i.to_be_bytes();
+        let x = t.lookup([192, 168, a, b]).unwrap();
+        let want = if x.ifindex == 2 {
+            ([10, 0, 2, 2], [10, 0, 2, 15])
+        } else {
+            ([10, 0, 3, 2], [10, 0, 3, 15])
+        };
+        assert_eq!((x.hop, x.src), want);
+        n[(x.ifindex - 2) as usize] += 1;
+        // A flow keeps its path.
+        assert_eq!(t.lookup([192, 168, a, b]).unwrap().ifindex, x.ifindex);
+    }
+    // Each path takes a part of the flows as large as its weight: about 1024 and 3072.
+    assert!(n[0] > 700 && n[0] < 1400, "{n:?}");
+    // A flow out of an interface takes the path of the interface.
+    for oif in [2, 3] {
+        assert_eq!(t.lookup_route([192, 168, 0, 1], oif).unwrap().0.ifindex, oif);
+    }
+    // The paths of the device 3 die. The route stays, and the flows take the device 2.
+    t.link_down(3);
+    for b in 0..64 {
+        assert_eq!(t.lookup([192, 168, 0, b]).unwrap().hop, [10, 0, 2, 2]);
+    }
+    let mut m = Match {
+        table: RT_TABLE_MAIN,
+        dst: [192, 168, 0, 0],
+        prefix: 16,
+        paths: vec![paths[1], paths[0]],
+        ..Match::default()
+    };
+    assert_eq!(t.delete_route(&m), Err(Errno::ESRCH));
+    m.paths = vec![paths[0]];
+    assert_eq!(t.delete_route(&m), Err(Errno::ESRCH));
+    // A path without a gateway and an interface matches each path.
+    m.paths = vec![Path { gateway: Gateway::None, ifindex: 0, flags: 0, weight: 1 }, paths[1]];
+    assert_eq!(t.delete_route(&m).unwrap().dst, [192, 168, 0, 0]);
+    assert_eq!(t.lookup([192, 168, 0, 1]).unwrap().hop, [10, 0, 2, 2]);
+}
+
 #[test]
 fn insert_and_delete_routes() {
     let mut t = qemu_table();
@@ -1250,6 +1310,65 @@ fn an_ipv6_reject_route_is_on_the_loopback_device() {
     for kind in [RTN_BLACKHOLE, RTN_UNREACHABLE, RTN_PROHIBIT] {
         assert!(kinds.contains(&(kind as u8)));
     }
+}
+
+/// The paths of an IPv6 multipath route are routes that are siblings, as on Linux. A flow takes
+/// a sibling by the weights. A delete with a gateway takes one path, and a delete without a
+/// gateway takes the route with its siblings.
+#[test]
+fn ipv6_multipath_routes_are_siblings() {
+    use crate::route6::{Addr6, Match6, Route6, Table6};
+    use rk_abi::native::rtnetlink::{RTNH_F_DEAD, RTNH_F_LINKDOWN};
+    let mut t = Table6::new();
+    t.set_loopback(1);
+    t.insert_addr(Addr6::new(1, ip::LOOPBACK, 128)).unwrap();
+    t.insert_addr(Addr6::new(2, v6([0xfd00, 0, 0, 0, 0, 0, 0, 1]), 64)).unwrap();
+    t.insert_addr(Addr6::new(3, v6([0xfd01, 0, 0, 0, 0, 0, 0, 1]), 64)).unwrap();
+    let dst = v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0]);
+    let a = Route6::new(dst, 64, Some(v6([0xfd00, 0, 0, 0, 0, 0, 0, 2])), 2);
+    let b =
+        Route6 { weight: 3, ..Route6::new(dst, 64, Some(v6([0xfd01, 0, 0, 0, 0, 0, 0, 2])), 3) };
+    t.insert_routes(&[a.clone(), b.clone()], NLM_F_CREATE | NLM_F_EXCL).unwrap();
+    assert_eq!(t.siblings(&a).collect::<Vec<_>>(), vec![&b]);
+    let at = |t: &Table6, r: &Route6| t.routes().iter().position(|o| o == r).unwrap();
+    assert!(!t.has_earlier_sibling(at(&t, &a)));
+    assert!(t.has_earlier_sibling(at(&t, &b)));
+    let mut n = [0; 2];
+    for i in 0..4096u16 {
+        let x = t.lookup(&v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, i]), 0).unwrap();
+        n[(x.ifindex - 2) as usize] += 1;
+    }
+    assert!(n[0] > 700 && n[0] < 1400, "{n:?}");
+    assert_eq!(t.lookup(&v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]), 3).unwrap().ifindex, 3);
+    // A path that is there: the request fails, and the paths that it added go away.
+    let c = Route6::new(dst, 64, Some(v6([0xfd00, 0, 0, 0, 0, 0, 0, 3])), 2);
+    assert_eq!(t.insert_routes(&[c.clone(), a.clone()], NLM_F_CREATE), Err(Errno::EEXIST));
+    assert!(!t.routes().contains(&c));
+    let m =
+        Match6 { table: RT_TABLE_MAIN, dst, prefix: 64, gateway: b.gateway, ..Match6::default() };
+    assert_eq!(t.delete_routes(&m), Ok(vec![b.clone()]));
+    t.insert_route(b.clone(), NLM_F_CREATE).unwrap();
+    // A path whose device goes down stays, dead, as `fib6_ifdown` of Linux. The flows take the
+    // other path until the device is up again.
+    let dead = (RTNH_F_DEAD | RTNH_F_LINKDOWN) as u8;
+    let flags = |t: &Table6| {
+        t.routes().iter().filter(|o| o.dst == dst).map(|o| o.nh_flags).collect::<Vec<u8>>()
+    };
+    t.link_down(3);
+    assert_eq!(flags(&t), vec![0, dead]);
+    for i in 0..64u16 {
+        assert_eq!(t.lookup(&v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, i]), 0).unwrap().ifindex, 2);
+    }
+    t.link_up(3, false);
+    assert_eq!(flags(&t), vec![0, 0]);
+    let m = Match6 { gateway: None, ..m };
+    assert_eq!(t.delete_routes(&m), Ok(vec![a.clone(), b.clone()]));
+    assert_eq!(t.lookup(&dst, 0).err(), Some(Errno::ENETUNREACH));
+    // The route goes when its last path goes down.
+    t.insert_routes(&[a, b], NLM_F_CREATE).unwrap();
+    t.link_down(3);
+    t.link_down(2);
+    assert_eq!(flags(&t), Vec::<u8>::new());
 }
 
 /// systemd-networkd-tests.py puts dnsmasq and networkd on the two ends of a veth pair in one

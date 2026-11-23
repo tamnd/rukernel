@@ -149,6 +149,7 @@ pub fn fill_route(r: &Route, ty: u32, portid: u32, seq: u32, flags: u32) -> Vec<
     match &nh {
         Some(c) if c.paths.len() == 1 => nexthop::put_path(&mut b, &c.paths[0], AF_INET),
         Some(c) => nexthop::put_multipath(&mut b, &c.paths, AF_INET),
+        None if !r.paths.is_empty() => nexthop::put_multipath(&mut b, &r.paths, AF_INET),
         None => {
             if let Some(gw) = r.gateway {
                 b.put(RTA_GATEWAY as u16, &gw);
@@ -350,8 +351,8 @@ pub fn check_route(r: &mut Route) -> Result<()> {
         return Err(Errno::EINVAL);
     }
     if matches!(kind, RTN_UNREACHABLE | RTN_PROHIBIT | RTN_BLACKHOLE | RTN_THROW) {
-        // A route without a next hop takes no gateway and no device.
-        if r.gateway.is_some() || r.via6.is_some() || r.ifindex != 0 {
+        // A route without a next hop takes no gateway, no device and no paths.
+        if r.gateway.is_some() || r.via6.is_some() || r.ifindex != 0 || !r.paths.is_empty() {
             return Err(Errno::EINVAL);
         }
     } else {
@@ -360,15 +361,29 @@ pub fn check_route(r: &mut Route) -> Result<()> {
         {
             return Err(Errno::EINVAL);
         }
-        // `nexthop::check_route4` checks a nexthop object. An IPv6 gateway is a neighbour of
-        // IPv6, as `fib_check_nh_v6_gw`: the table of the IPv6 routes checks it, without the
-        // lock of the IPv4 routes.
-        if r.nhid == 0 {
-            r.ifindex = match r.via6 {
-                Some(_) if r.scope == RT_SCOPE_HOST as u8 => return Err(Errno::EINVAL),
-                Some(gw) => addrconf::check_gateway(&gw, r.ifindex, r.flags)?,
-                None => ROUTES.lock().check_nexthop(r, |i| dev::by_index(i).map(|d| d.is_up()))?,
-            };
+        // `nexthop::check_route4` checks a nexthop object. Each path of a multipath route
+        // is checked as a route with one path, as `fib_check_nh` for each `fib_nh` of Linux.
+        if r.nhid == 0 && r.paths.is_empty() {
+            r.ifindex = check_path(r)?;
+        } else if r.nhid == 0 {
+            let mut paths = core::mem::take(&mut r.paths);
+            for p in &mut paths {
+                let mut one = r.clone();
+                (one.gateway, one.via6) = p.gateway.split();
+                one.ifindex = p.ifindex;
+                one.flags = (r.flags & !0xff) | u32::from(p.flags);
+                p.ifindex = check_path(&one)?;
+            }
+            // The route keeps a copy of the first path. A request with one path makes a
+            // route with one path.
+            let first = paths[0];
+            (r.gateway, r.via6) = first.gateway.split();
+            r.ifindex = first.ifindex;
+            if paths.len() == 1 {
+                r.flags = (r.flags & !0xff) | u32::from(first.flags);
+            } else {
+                r.paths = paths;
+            }
         }
     }
     let t = ROUTES.lock();
@@ -380,6 +395,17 @@ pub fn check_route(r: &mut Route) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Checks the next hop of a route with one path and gives its interface, as `fib_check_nh` of
+/// Linux. An IPv6 gateway is a neighbour of IPv6, as `fib_check_nh_v6_gw`: the table of the
+/// IPv6 routes checks it, without the lock of the IPv4 routes.
+fn check_path(r: &Route) -> Result<u32> {
+    match r.via6 {
+        Some(_) if r.scope == RT_SCOPE_HOST as u8 => Err(Errno::EINVAL),
+        Some(gw) => addrconf::check_gateway(&gw, r.ifindex, r.flags),
+        None => ROUTES.lock().check_nexthop(r, |i| dev::by_index(i).map(|d| d.is_up())),
+    }
 }
 
 /// The new label of an address after a change of the name of its device, as
