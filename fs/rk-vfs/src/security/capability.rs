@@ -8,13 +8,14 @@ use super::hooks::SecurityHooks;
 use super::{BlobSizes, LsmId, LsmInfo, Order, id};
 use crate::cred::{Cred, cap};
 use crate::inode::Result;
+use crate::user_ns::UserNs;
 use rk_abi::Errno;
 
 /// The hooks of the capability module.
 pub struct Capability;
 
 impl SecurityHooks for Capability {
-    fn capable(&self, cred: &Cred, c: u32, _opts: u32) -> Result<()> {
+    fn capable(&self, cred: &Cred, _ns: &UserNs, c: u32, _opts: u32) -> Result<()> {
         if cred.cap_effective & cap::bit(c) != 0 { Ok(()) } else { Err(Errno::EPERM) }
     }
 }

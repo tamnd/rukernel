@@ -33,7 +33,7 @@ use core::sync::atomic::{AtomicI32, Ordering};
 use rk_abi::Errno;
 use rk_vfs::cred::{self, Cred, cap};
 use rk_vfs::inode::Result;
-use rk_vfs::security::Sysctl;
+use rk_vfs::security::{self, Sysctl};
 
 /// `AA_USERNS_CREATE`.
 const USERNS_CREATE: u32 = 8;
@@ -160,7 +160,7 @@ fn profile_ns_perm(p: Option<&Arc<Profile>>, cred: &Cred) -> Result<Label> {
     match (p, state) {
         (None, _) => {
             let admin = cred.cap_effective & cap::bit(cap::SYS_ADMIN) != 0
-                && rk_vfs::security::capable_lsm(cred, cap::SYS_ADMIN, CAP_OPT_NOAUDIT);
+                && security::capable_lsm(cred, &cred.user_ns, cap::SYS_ADMIN, CAP_OPT_NOAUDIT);
             if RESTRICTED.load(Ordering::Relaxed) == 0 || admin {
                 return Ok(new);
             }

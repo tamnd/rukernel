@@ -53,12 +53,13 @@ use rk_vfs::security::{
     self, BlobSizes, Bprm, ExecFiles, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order,
     SecurityHooks, Sock, Task, id,
 };
+use rk_vfs::user_ns::UserNs;
 
 /// The hooks of AppArmor. A hook gives the error of a denial of a profile in enforce mode.
 struct AppArmor;
 
 impl SecurityHooks for AppArmor {
-    fn capable(&self, cred: &Cred, cap: u32, opts: u32) -> Result<()> {
+    fn capable(&self, cred: &Cred, _ns: &UserNs, cap: u32, opts: u32) -> Result<()> {
         capability::capable(cred, cap, opts)
     }
 

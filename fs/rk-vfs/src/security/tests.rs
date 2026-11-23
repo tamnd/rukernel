@@ -118,7 +118,7 @@ fn the_first_error_stops_the_call() {
 #[test]
 fn the_capability_module_checks_the_effective_set() {
     let mut c = Cred::root();
-    assert!(capable(&c, cap::SYS_ADMIN, 0));
+    assert!(capable(&c, crate::user_ns::init(), cap::SYS_ADMIN, 0));
     c.cap_effective = cap::bit(cap::NET_BIND_SERVICE);
     assert!(!c.capable(cap::SYS_ADMIN));
     assert!(c.capable(cap::NET_BIND_SERVICE));

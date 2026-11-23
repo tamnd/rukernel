@@ -17082,6 +17082,9 @@ static void test_selinux(void)
 	struct rlimit rl;
 	unsigned int caphdr[2] = { 0x20080522, 0 }, capdata[6];
 	unsigned long ino_tmp = 0;
+	struct timespec now;
+	struct utsname uts;
+	pid_t upid = -1;
 
 	n = klogctl(3, buf, sizeof(buf) - 1);
 	buf[n > 0 ? n : 0] = 0;
@@ -17320,6 +17323,17 @@ static void test_selinux(void)
 	check("selinux: a mount on /tmp gives EACCES in enforcing mode", mount("tmpfs", "/tmp", "tmpfs", 0, NULL) < 0 && errno == EACCES);
 	check("selinux: a remount of /tmp gives EACCES in enforcing mode", mount(NULL, "/tmp", NULL, MS_REMOUNT, NULL) < 0 && errno == EACCES);
 	check("selinux: an unmount of /tmp gives EACCES in enforcing mode", umount("/tmp") < 0 && errno == EACCES);
+	/*
+	 * The checks of the capabilities, as selinux_capable of Linux. The policy gives each domain its capabilities in the first user
+	 * namespace without sys_time, so a set of the clock gives EPERM and a sethostname works. In a new user namespace, the class is
+	 * cap_userns, and the policy gives no capability in it, so a new UTS namespace gives EPERM.
+	 */
+	check("selinux: a set of the clock gives EPERM in enforcing mode", clock_gettime(CLOCK_REALTIME, &now) == 0 && clock_settime(CLOCK_REALTIME, &now) < 0 && errno == EPERM);
+	check("selinux: a sethostname works in enforcing mode", uname(&uts) == 0 && sethostname(uts.nodename, strlen(uts.nodename)) == 0);
+	upid = fork();
+	if (upid == 0)
+		_exit(unshare(CLONE_NEWUSER) == 0 && unshare(CLONE_NEWUTS) < 0 && errno == EPERM ? 0 : 1);
+	check("selinux: a new UTS namespace in a new user namespace gives EPERM in enforcing mode", upid > 0 && waitpid(upid, &status, 0) == upid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	close(rfd);
 	close(wfd);
 	close(afd);
@@ -17398,6 +17412,10 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the denial of remount", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "avc:  denied  { unmount } for  pid=1 comm=\"init\" scontext=%s tcontext=system_u:object_r:tmpfs_t:s0 tclass=filesystem permissive=0", kernel);
 	check("selinux: the kernel log has the denial of unmount", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { sys_time } for  pid=1 comm=\"init\" capability=25  scontext=%s tcontext=%s tclass=capability permissive=0", kernel, kernel);
+	check("selinux: the kernel log has the denial of sys_time with the capability", strstr(buf, want) != NULL);
+	snprintf(want, sizeof(want), "avc:  denied  { sys_admin } for  pid=%d comm=\"init\" capability=21  scontext=%s tcontext=%s tclass=cap_userns permissive=0", (int)upid, kernel, kernel);
+	check("selinux: the kernel log has the denial of sys_admin in the new user namespace", strstr(buf, want) != NULL);
 	snprintf(want, sizeof(want), "tcontext=%s tclass=fd permissive=1", kernel);
 	check("selinux: the kernel log has the denial of the use of the pipe of init by init_t", strstr(buf, "avc:  denied  { use } for  pid=") != NULL && strstr(buf, "scontext=system_u:system_r:init_t:s0 ") != NULL && strstr(buf, want) != NULL);
 	unlink("/tmp/rk-aa-w");

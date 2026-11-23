@@ -15,7 +15,6 @@ use crate::sidtab::sid;
 use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_vfs::cred::cap;
 use rk_vfs::dentry::Location;
 use rk_vfs::inode::{Inode, Result};
 use rk_vfs::security::blob::Blob;
@@ -242,7 +241,7 @@ pub fn getsecurity(
         return None;
     }
     let sid = inode_sid(inode, at);
-    let text = if rk_vfs::cred::current().capable(cap::MAC_ADMIN) {
+    let text = if crate::task::has_cap_mac_admin(false) {
         server::sid_to_context_force(sid)
     } else {
         server::sid_to_context(sid)

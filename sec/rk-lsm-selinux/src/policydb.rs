@@ -1585,7 +1585,7 @@ mod tests {
             let p = Policydb::read(data).unwrap();
             assert_eq!(p.version, v);
             assert!(p.mls && !p.reject_unknown && !p.allow_unknown);
-            assert_eq!(p.classes.len(), 13);
+            assert_eq!(p.classes.len(), 16);
             assert_eq!(p.class(p.process_class).unwrap().name, "process");
             assert_eq!(p.process_trans_perms, (1 << 1) | (1 << 23));
             assert_eq!(p.name(sym::CLASSES, 1), Some("security"));

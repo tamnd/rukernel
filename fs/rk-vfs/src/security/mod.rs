@@ -23,6 +23,7 @@ use crate::cred::{Cred, IpcOwner};
 use crate::dentry::Location;
 use crate::file::File;
 use crate::inode::{Inode, InodeRef, Result, SetAttr};
+use crate::user_ns::UserNs;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -408,18 +409,18 @@ pub trait SockNames {
 
 /// `security_capable`: the task with `cred` has the capability `cap`. `opts` has the
 /// `CAP_OPT_*` bits.
-pub fn capable(cred: &Cred, cap: u32, opts: u32) -> bool {
-    call_int_hook!(capable, cred, cap, opts).is_ok()
+pub fn capable(cred: &Cred, ns: &UserNs, cap: u32, opts: u32) -> bool {
+    call_int_hook!(capable, cred, ns, cap, opts).is_ok()
 }
 
 /// `security_capable` after the capability module: the other active modules check the
-/// capability `cap` of the task with `cred`. The caller has done the check of the capability
-/// module, `cap_capable` of Linux, in the user namespace of the request.
-pub fn capable_lsm(cred: &Cred, cap: u32, opts: u32) -> bool {
+/// capability `cap` of the task with `cred` in the user namespace `ns`. The caller has done the
+/// check of the capability module, `cap_capable` of Linux, in `ns`.
+pub fn capable_lsm(cred: &Cred, ns: &UserNs, cap: u32, opts: u32) -> bool {
     modules()
         .iter()
         .filter(|m| m.info.id.id != id::CAPABILITY)
-        .all(|m| m.info.hooks.capable(cred, cap, opts).is_ok())
+        .all(|m| m.info.hooks.capable(cred, ns, cap, opts).is_ok())
 }
 
 /// `security_capget`.
