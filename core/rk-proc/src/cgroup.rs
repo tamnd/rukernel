@@ -253,6 +253,12 @@ pub fn wait_throttled(thread: &Thread) -> bool {
 /// its cgroup charged pages over `memory.high`, as `mem_cgroup_handle_over_high` of Linux. The
 /// reclaim and the wait count as a memory stall in the pressure. A kill or a change of the limit ends the wait.
 fn wait_over_high(thread: &Thread, cg: CgId) {
+    // A thread with a kill goes to its exit, and its memory goes back with its address space.
+    // Linux delivers the fatal signal before `resume_user_mode_work`, so such a task does not
+    // reclaim or wait in `mem_cgroup_handle_over_high`.
+    if thread.is_killed() {
+        return;
+    }
     let memcg = thread.process().memcg();
     rk_cgroup::reclaim_high(memcg, cg);
     let delay = rk_cgroup::high_delay(memcg);
@@ -401,6 +407,11 @@ fn reap(victim: &Arc<Process>) {
 /// It does not kill init or a process with `oom_score_adj` -1000. The thread then waits for
 /// the end of the victim, so that the fault can try again. Gives `false` if no process can go.
 pub fn system_oom(thread: &Thread) -> bool {
+    // A thread with a kill frees its memory at its exit, so it does not reclaim or kill, as
+    // `out_of_memory` of Linux gives true at once for a task in `task_will_free_mem`.
+    if thread.is_killed() {
+        return true;
+    }
     // A fault that a memory cgroup refused, with free memory in the system, is not for this
     // killer.
     if rk_frame::mm::frame_stats().free > system_reserve() {
@@ -468,6 +479,12 @@ pub fn memcg_oom(thread: &Thread) -> bool {
     let memcg = process.memcg();
     if memcg == 0 {
         return false;
+    }
+    // A thread with a kill ends at its return to user mode, and its memory goes back then. It
+    // does not reclaim or kill, as `mem_cgroup_out_of_memory` of Linux skips the kill for a task
+    // in `task_will_free_mem`.
+    if thread.is_killed() {
+        return true;
     }
     // A test charge finds the cgroup whose limit blocks the page.
     let blocking = match rk_cgroup::charge_page(memcg) {
