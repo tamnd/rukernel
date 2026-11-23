@@ -8,6 +8,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - Multipath routes, as Linux. An IPv4 `RTM_NEWROUTE` with `RTA_MULTIPATH` makes a route with a path for each `rtnexthop`, with the checks of `fib_count_nexthops`, `fib_get_nhs` and `fib_check_nh`, and a weight of `rtnh_hops` and one. A request with one path makes a route with one path. The dump shows `RTA_MULTIPATH`, and `RTM_DELROUTE` with paths matches them in order, as `fib_nh_match`. A device that goes down marks its paths `dead linkdown`, and the route goes away when all of its paths are dead. An IPv6 route with `RTA_MULTIPATH` makes a route for each path, and these routes are siblings, as `ip6_route_multipath_add`. The dump and the notifications show the siblings in one `RTA_MULTIPATH` with their weights, and a delete without a gateway removes the siblings too. An IPv6 path whose device goes down also stays, marked `dead linkdown`, while another path is alive, as `fib6_ifdown`. A flow takes a path from a hash of its addresses and the weights, so its packets stay in order. Before, the kernel did not use `RTA_MULTIPATH` in a route (#538).
 
+### Fixed
+
+- nf_tables: the batch and the programs of the base chains share the elements of the sets. A batch copies a set only at its first change, and a commit makes the program data of a set again only when the set changed. Before, each batch begin copied each element of each table, and each commit copied each set that a base chain used into each program (#542).
+
 ## [0.5.39] - 2026-11-22
 
 ### Added
