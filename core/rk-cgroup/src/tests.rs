@@ -477,12 +477,52 @@ fn memory_high_makes_a_delay_that_grows_with_the_use() {
     // Twice the limit gives the longest wait.
     h.charge_memory(a, (1 << 20) - PAGE_SIZE).unwrap();
     assert_eq!(h.high_delay(a), HIGH_DELAY_MAX);
-    // The wait is for the pages that the cgroup charged since the last wait.
+    // The wait is for the pages that the cgroup charged since the last wait, in batches of
+    // `HIGH_BATCH` pages.
     assert_eq!(h.high_delay(a), 0);
     h.charge_memory(a, PAGE_SIZE).unwrap();
-    assert_eq!(h.high_delay(a), HIGH_DELAY_MAX / HIGH_BATCH);
+    assert_eq!(h.high_delay(a), 0);
+    h.charge_memory(a, (HIGH_BATCH - 1) * PAGE_SIZE).unwrap();
+    assert_eq!(h.high_delay(a), HIGH_DELAY_MAX);
+    assert_eq!(h.high_delay(a), 0);
     let events = h.read(a, "memory.events", 0).unwrap();
     assert!(events.starts_with("low 0\nhigh "), "{events}");
+}
+
+#[test]
+fn memory_high_counts_the_pages_over_the_limit_only_while_the_use_is_over_it() {
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "memory.high", b"1M", 0).unwrap();
+    h.charge_memory(a, 1 << 20).unwrap();
+    h.charge_memory(a, (HIGH_BATCH - 1) * PAGE_SIZE).unwrap();
+    assert_eq!(h.high_delay(a), 0);
+    // The use goes under the limit, and the pages over it do not count after that.
+    h.uncharge_memory(a, HIGH_BATCH * PAGE_SIZE);
+    assert_eq!(h.high_delay(a), 0);
+    h.charge_memory(a, 2 * PAGE_SIZE).unwrap();
+    h.write(a, "memory.high", b"512K", 0).unwrap();
+    assert_eq!(h.high_delay(a), 0);
+    // A full batch at twice the limit gives the longest wait.
+    h.charge_memory(a, (HIGH_BATCH - 2) * PAGE_SIZE).unwrap();
+    assert_eq!(h.high_delay(a), HIGH_DELAY_MAX);
+}
+
+#[test]
+fn memory_high_wait_of_a_batch_grows_with_the_square_of_the_use_over_the_limit() {
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "memory.high", b"64M", 0).unwrap();
+    h.charge_memory(a, 64 << 20).unwrap();
+    // A batch at 1/256 over the limit gives 1/1024 s, less than the shortest wait.
+    h.charge_memory(a, HIGH_BATCH * PAGE_SIZE).unwrap();
+    assert_eq!(h.high_delay(a), 0);
+    // At 1/64 over the limit a batch gives 1/64 s, as `calculate_high_delay` of Linux gives
+    // HZ / 64. The wait is for the 3 batches since the last wait.
+    h.charge_memory(a, 3 * HIGH_BATCH * PAGE_SIZE).unwrap();
+    assert_eq!(h.high_delay(a), 3 * 1_000_000_000 / 64);
 }
 
 #[test]

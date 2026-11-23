@@ -251,10 +251,16 @@ pub fn wait_throttled(thread: &Thread) -> bool {
 
 /// Takes memory back from the cgroups over `memory.high`, and then keeps `thread` waiting when
 /// its cgroup charged pages over `memory.high`, as `mem_cgroup_handle_over_high` of Linux. The
-/// wait counts as a memory stall in the pressure. A kill or a change of the limit ends the wait.
+/// reclaim and the wait count as a memory stall in the pressure. A kill or a change of the limit ends the wait.
 fn wait_over_high(thread: &Thread, cg: CgId) {
+    // A thread with a kill goes to its exit, and its memory goes back with its address space.
+    // Linux delivers the fatal signal before `resume_user_mode_work`, so such a task does not
+    // reclaim or wait in `mem_cgroup_handle_over_high`.
+    if thread.is_killed() {
+        return;
+    }
     let memcg = thread.process().memcg();
-    rk_cgroup::reclaim_high(memcg);
+    rk_cgroup::reclaim_high(memcg, cg);
     let delay = rk_cgroup::high_delay(memcg);
     if delay == 0 {
         return;
@@ -275,6 +281,16 @@ pub fn populate_wait() -> bool {
         wait_over_high(&thread, thread.cgroup());
     }
     !thread.is_killed()
+}
+
+/// Runs `f` as a memory stall of the current thread in the pressure of its cgroup, as
+/// `psi_memstall_enter` and `psi_memstall_leave` of Linux. A fault reads a page back from swap
+/// with this. Kernel work outside a thread counts nothing.
+pub fn memstall(f: &mut dyn FnMut()) {
+    match crate::current_thread() {
+        Some(thread) => stalled(&thread, f),
+        None => f(),
+    }
 }
 
 /// Charges an I/O of the current thread to its cgroup, for `io.stat`. Kernel work goes to the
@@ -391,19 +407,25 @@ fn reap(victim: &Arc<Process>) {
 /// It does not kill init or a process with `oom_score_adj` -1000. The thread then waits for
 /// the end of the victim, so that the fault can try again. Gives `false` if no process can go.
 pub fn system_oom(thread: &Thread) -> bool {
+    // A thread with a kill frees its memory at its exit, so it does not reclaim or kill, as
+    // `out_of_memory` of Linux gives true at once for a task in `task_will_free_mem`.
+    if thread.is_killed() {
+        return true;
+    }
     // A fault that a memory cgroup refused, with free memory in the system, is not for this
     // killer.
     if rk_frame::mm::frame_stats().free > system_reserve() {
         return false;
     }
-    // The clean page cache goes first, as the reclaim of Linux before `out_of_memory`.
-    rk_vfs::blockdev::reclaim_all();
-    if rk_frame::mm::frame_stats().free > system_reserve() {
-        return true;
-    }
-    // Then anonymous memory goes to swap, and the fault tries again while the reclaim frees
-    // pages.
-    if reclaim_anon(rk_cgroup::ROOT, RECLAIM_BATCH) > 0 {
+    // The clean page cache goes first, as the reclaim of Linux before `out_of_memory`. Then
+    // anonymous memory goes to swap, and the fault tries again while the reclaim frees pages. The
+    // reclaim counts as a memory stall, as `__perform_reclaim` of Linux.
+    let freed = stalled(thread, || {
+        rk_vfs::blockdev::reclaim_all();
+        rk_frame::mm::frame_stats().free > system_reserve()
+            || reclaim_anon(rk_cgroup::ROOT, RECLAIM_BATCH) > 0
+    });
+    if freed {
         return true;
     }
     // A victim that is still on its way out frees its memory soon: wait for it, as Linux does
@@ -458,6 +480,12 @@ pub fn memcg_oom(thread: &Thread) -> bool {
     if memcg == 0 {
         return false;
     }
+    // A thread with a kill ends at its return to user mode, and its memory goes back then. It
+    // does not reclaim or kill, as `mem_cgroup_out_of_memory` of Linux skips the kill for a task
+    // in `task_will_free_mem`.
+    if thread.is_killed() {
+        return true;
+    }
     // A test charge finds the cgroup whose limit blocks the page.
     let blocking = match rk_cgroup::charge_page(memcg) {
         Ok(()) => {
@@ -470,7 +498,7 @@ pub fn memcg_oom(thread: &Thread) -> bool {
     };
     // Anonymous memory goes to swap before a kill, as `try_charge_memcg` of Linux does a
     // reclaim before `mem_cgroup_oom`. The fault holds no lock of the space now.
-    if reclaim_anon(blocking, RECLAIM_BATCH) > 0 {
+    if stalled(thread, || reclaim_anon(blocking, RECLAIM_BATCH) > 0) {
         return true;
     }
     let cg = thread.cgroup();
@@ -490,6 +518,16 @@ pub fn memcg_oom(thread: &Thread) -> bool {
     }
     rk_cgroup::psi_change(cg, |c| c.memstall = c.memstall.saturating_sub(1));
     victim.is_some()
+}
+
+/// Runs the reclaim `f` of a fault of `thread`. The reclaim counts as a memory stall of the cgroup
+/// of the thread, as `psi_memstall_enter` of Linux around a direct reclaim.
+fn stalled<R>(thread: &Thread, f: impl FnOnce() -> R) -> R {
+    let cg = thread.cgroup();
+    rk_cgroup::psi_change(cg, |c| c.memstall += 1);
+    let r = f();
+    rk_cgroup::psi_change(cg, |c| c.memstall = c.memstall.saturating_sub(1));
+    r
 }
 
 /// The bytes of the anonymous reclaim for a fault that a memory cgroup or the system refused, as

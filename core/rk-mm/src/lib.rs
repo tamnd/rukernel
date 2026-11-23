@@ -14,6 +14,7 @@
 extern crate alloc;
 
 pub mod hugetlb;
+pub mod idle;
 pub mod ksm;
 pub mod pttree;
 pub mod rangelog;
@@ -27,7 +28,7 @@ mod space;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use space::{
     Access, AddressSpace, FileRef, MMAP_MIN_ADDR, MMAP_TOP, MmFile, MmapRequest, Remap, STACK_SIZE,
-    STACK_TOP, WriteMap, set_populate_hook,
+    STACK_TOP, WriteMap, set_memstall_hook, set_populate_hook,
 };
 pub use vma::{Backing, HugeAdvice, PAGE_SIZE, Prot, STACK_GUARD_GAP, Vma, VmaKind, VmaSet};
 

@@ -380,6 +380,8 @@ pub fn init() {
     rk_cgroup::set_reclaim(rk_vfs::blockdev::reclaim_memcg);
     // A long populate waits for `memory.high` after each batch of pages.
     rk_mm::set_populate_hook(rk_proc::cgroup::populate_wait);
+    // The read of a page back from swap counts as a memory stall in the pressure.
+    rk_mm::set_memstall_hook(rk_proc::cgroup::memstall);
     rk_vfs::blockdev::set_memcg_ops(rk_vfs::blockdev::MemcgOps {
         current: || rk_proc::current_thread().map_or(0, |t| t.process().memcg()),
         charge: rk_cgroup::charge_file,

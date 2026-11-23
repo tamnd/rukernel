@@ -391,7 +391,16 @@ impl Read {
             Self::Swap(slot) => {
                 above_reserve()?;
                 let frame = charged(rk_frame::mm::alloc_frame(), memcg)?;
-                slot.read(&frame).map_err(|()| Errno::EIO)?;
+                // A page that comes back from swap was in use before the reclaim took it, so the
+                // wait for it counts as a memory stall, as `swap_read_folio` of Linux counts the
+                // read of a page of the working set.
+                let mut read = Ok(());
+                let mut run = || read = slot.read(&frame);
+                match MEMSTALL_HOOK.get() {
+                    Some(stall) => stall(&mut run),
+                    None => run(),
+                }
+                read.map_err(|()| Errno::EIO)?;
                 frame.set_anon();
                 Ok(Prepared::Swap { slot, frame })
             }
@@ -481,6 +490,12 @@ pub struct AddressSpace {
     /// The top of the `mmap` area, as `mmap_base` of Linux. It is [`MMAP_TOP`] less a random
     /// offset that `execve` sets.
     mmap_top: AtomicUsize,
+    /// The address where the next reclaim of anonymous memory looks first, as `swap_address` of
+    /// the mm of Linux 2.4. Each reclaim goes on from the page after the last page that it took,
+    /// so the pages at the start that cannot go are not looked at each time.
+    reclaim_at: AtomicUsize,
+    /// The mark of a space in which the last reclaim found no page to take.
+    idle: crate::idle::Idle,
 }
 
 fn map_error(e: MapError) -> Errno {
@@ -611,6 +626,8 @@ impl AddressSpace {
             huge_resv: SpinLock::new(BTreeMap::new()),
             hiwater: AtomicUsize::new(0),
             mmap_top: AtomicUsize::new(MMAP_TOP),
+            reclaim_at: AtomicUsize::new(0),
+            idle: crate::idle::Idle::default(),
         }
     }
 
@@ -1904,12 +1921,32 @@ impl AddressSpace {
     /// Writes up to `want` private anonymous pages of the space to a swap area and frees their
     /// frames, for the reclaim of a memory cgroup or of the system, as `shrink_folio_list` of
     /// Linux. The pages are the pages of [`AddressSpace::page_out`]. Gives the pages that the
-    /// reclaim looked at and the pages that went, for `pgscan_anon` and `pgsteal_anon`.
+    /// reclaim looked at and the pages that went, for `pgscan_anon` and `pgsteal_anon`. The
+    /// reclaim starts after the page where the last one stopped, and goes round to the start of
+    /// the space, as an LRU list of Linux puts a page that it looked at to the end. A space in
+    /// which the whole look found no page is skipped for a time while its pages stay the same,
+    /// so a cgroup with many sleeping processes does not look at their pages for each reclaim.
     pub fn reclaim_anon(&self, want: usize) -> (usize, usize) {
         if want == 0 {
             return (0, 0);
         }
-        self.page_out_range(0, usize::MAX, want)
+        let now = rk_frame::time::nanos();
+        if self.idle.skip(self.vm.page_count(), now) {
+            return (0, 0);
+        }
+        let at = self.reclaim_at.load(Ordering::Relaxed);
+        let (mut scanned, mut n, mut next) = self.page_out_range(at, usize::MAX, want);
+        if next.is_none() && at > 0 {
+            let (s, m, after) = self.page_out_range(0, at, want - n);
+            (scanned, n, next) = (scanned + s, n + m, after);
+        }
+        self.reclaim_at.store(next.unwrap_or(0), Ordering::Relaxed);
+        if n == 0 && next.is_none() {
+            self.idle.mark(self.vm.page_count(), now);
+        } else {
+            self.idle.clear();
+        }
+        (scanned, n)
     }
 
     /// Reads back each page of the space that has a swap entry for which `of` gives `true`, and
@@ -1938,31 +1975,51 @@ impl AddressSpace {
     }
 
     /// Writes up to `want` pages of `start..end` to swap. See [`AddressSpace::page_out`]. Gives
-    /// the pages that it looked at and the pages that went.
-    fn page_out_range(&self, start: usize, end: usize, want: usize) -> (usize, usize) {
-        let st = self.state.lock();
-        let mut pages = Vec::new();
-        for vma in st.vmas.iter().filter(|v| v.start < end && start < v.end) {
-            if !vma.shared && !vma.hugetlb && !vma.locked {
-                let (from, to) = (start.max(vma.start), end.min(vma.end));
-                pages.extend(self.vm.mapped_pages(VirtAddr::new(from), VirtAddr::new(to)));
-            }
+    /// the pages that it looked at, the pages that went, and the page where it stopped before
+    /// the end of the range.
+    fn page_out_range(
+        &self,
+        start: usize,
+        end: usize,
+        want: usize,
+    ) -> (usize, usize, Option<usize>) {
+        if want == 0 {
+            return (0, 0, Some(start));
         }
-        // The writes wait for the disk, so they run with no lock of the areas, as the write back
-        // of `munmap`.
-        drop(st);
-        let (mut scanned, mut n) = (0, 0);
-        for page in pages {
-            if n >= want {
+        let (mut scanned, mut n, mut at) = (0, 0, start);
+        while at < end {
+            // The pages go in batches of `RECLAIM_BATCH` bytes, so a reclaim that wants a few
+            // pages does not first collect each mapped page of a large space, as `walk_page_range`
+            // of Linux stops when the reclaim has enough.
+            let st = self.state.lock();
+            let Some(vma) = st
+                .vmas
+                .iter()
+                .find(|v| at < v.end && v.start < end && !v.shared && !v.hugetlb && !v.locked)
+            else {
                 break;
+            };
+            let from = at.max(vma.start);
+            let to = end.min(vma.end).min(from.saturating_add(RECLAIM_BATCH));
+            let pages = self.vm.mapped_pages(VirtAddr::new(from), VirtAddr::new(to));
+            // The writes wait for the disk, so they run with no lock of the areas, as the write
+            // back of `munmap`.
+            drop(st);
+            at = to;
+            for page in pages {
+                scanned += 1;
+                // A page that cannot go takes no swap entry.
+                let Some(frame) = self.vm.swap_out_start(page) else { continue };
+                let Some(slot) = SwapSlot::alloc(self.memcg()) else {
+                    return (scanned, n, Some(page.get()));
+                };
+                n += usize::from(self.swap_out(page, &frame, slot));
+                if n >= want {
+                    return (scanned, n, Some(page.get() + PAGE_SIZE));
+                }
             }
-            scanned += 1;
-            // A page that cannot go takes no swap entry.
-            let Some(frame) = self.vm.swap_out_start(page) else { continue };
-            let Some(slot) = SwapSlot::alloc(self.memcg()) else { break };
-            n += usize::from(self.swap_out(page, &frame, slot));
         }
-        (scanned, n)
+        (scanned, n, None)
     }
 
     /// Writes the page `frame` at `page`, which `swap_out_start` gave, to the swap entry `slot`,
@@ -2455,6 +2512,10 @@ fn only_enomem(r: Result<(), Errno>) -> Result<(), Errno> {
     }
 }
 
+/// The bytes of the address space that the reclaim of anonymous memory looks at in one step, the
+/// size of one page table. See [`AddressSpace::page_out_range`].
+const RECLAIM_BATCH: usize = 2 << 20;
+
 /// The pages of a populate between two calls of the hook of [`set_populate_hook`], as
 /// `MEMCG_CHARGE_BATCH` of Linux.
 const POPULATE_BATCH: usize = 64;
@@ -2469,6 +2530,16 @@ static POPULATE_HOOK: Once<fn() -> bool> = Once::new();
 /// It gives false if the thread has a kill, and then the populate stops.
 pub fn set_populate_hook(hook: fn() -> bool) {
     POPULATE_HOOK.call_once(|| hook);
+}
+
+/// The hook of [`set_memstall_hook`].
+static MEMSTALL_HOOK: Once<fn(&mut dyn FnMut())> = Once::new();
+
+/// Sets the function that runs the read of a page back from swap for a fault. The function
+/// counts the read as a memory stall of the thread in the pressure, as `psi_memstall_enter` and
+/// `psi_memstall_leave` of Linux around the read.
+pub fn set_memstall_hook(hook: fn(&mut dyn FnMut())) {
+    MEMSTALL_HOOK.call_once(|| hook);
 }
 
 /// Tells if `vma` allows `access`.
