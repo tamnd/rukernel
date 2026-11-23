@@ -8,10 +8,10 @@
 //! with its table of SIDs ([`sidtab`]), the text of the contexts ([`context`]), the classes of
 //! the kernel ([`classmap`]), the access vector cache ([`avc`]), the SIDs of the tasks with
 //! their change at an exec, their attributes in `/proc/PID/attr` and the checks of the
-//! operations on other tasks ([`task`]), the labels of the files ([`inode`]), the checks of
-//! the access to the files and to the open files ([`file`]), of the mounts ([`mount`]) and of
-//! the operations on the names of the directories ([`namei`]), and the labels of the new files
-//! and the changes of the labels ([`xattr`]).
+//! operations on other tasks and of the capabilities ([`task`]), the labels of the files
+//! ([`inode`]), the checks of the access to the files and to the open files ([`file`]), of the
+//! mounts ([`mount`]) and of the operations on the names of the directories ([`namei`]), and
+//! the labels of the new files and the changes of the labels ([`xattr`]).
 //!
 //! The module is active when the command line has `selinux=1`, when `lsm=` names it, or with
 //! `security=selinux`. With `selinux=0` it is not active. The module starts in permissive
@@ -59,11 +59,16 @@ use rk_vfs::security::{
     BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, MountReq, Order,
     SecurityHooks, Task, id,
 };
+use rk_vfs::user_ns::UserNs;
 
 /// The hooks of SELinux.
 struct SeLinux;
 
 impl SecurityHooks for SeLinux {
+    fn capable(&self, cred: &Cred, ns: &UserNs, cap: u32, opts: u32) -> Result<()> {
+        task::capable(cred, ns, cap, opts)
+    }
+
     fn capget(&self, target: &Task<'_>) -> Result<()> {
         task::current_has_perm(target, process::GETCAP)
     }

@@ -447,7 +447,7 @@ pub fn file_ioctl(f: &File, cmd: u32) -> Result<()> {
         FS_IOC_SETFLAGS | FS_IOC_SETVERSION => file_has_perm(f, file::SETATTR),
         FIONBIO | FIOASYNC => file_has_perm(f, 0),
         KDSKBENT | KDSKBSENT => {
-            task::cred_has_capability(&rk_vfs::cred::current(), CAP_SYS_TTY_CONFIG, true)
+            task::cred_has_capability(&rk_vfs::cred::current(), CAP_SYS_TTY_CONFIG, 0, true)
         }
         FIOCLEX | FIONCLEX
             if crate::policy().is_some_and(|p| p.db.policycap(POLICYCAP_IOCTL_SKIP_CLOEXEC)) =>

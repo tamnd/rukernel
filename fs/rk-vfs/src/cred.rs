@@ -303,7 +303,8 @@ impl Cred {
     /// effective set, and no security module denies it, as `ns_capable(current_user_ns(), cap)`
     /// of Linux.
     pub fn has_cap(&self, cap: u32) -> bool {
-        self.cap_effective & cap::bit(cap) != 0 && crate::security::capable_lsm(self, cap, 0)
+        self.cap_effective & cap::bit(cap) != 0
+            && crate::security::capable_lsm(self, &self.user_ns, cap, 0)
     }
 
     /// The process has the capability in the user namespace `ns`, as `ns_capable` and
@@ -311,18 +312,19 @@ impl Cred {
     /// namespaces below it. The owner of a namespace has all the capabilities in it, if the
     /// process is in the parent of the namespace. After this check of the capability module, the
     /// other security modules check the capability, as `security_capable` of Linux.
-    pub fn ns_capable(&self, ns: &UserNs, cap: u32) -> bool {
-        let mut ns = ns;
+    pub fn ns_capable(&self, target: &UserNs, cap: u32) -> bool {
+        let mut ns = target;
         loop {
             if *ns == *self.user_ns {
-                return self.has_cap(cap);
+                return self.cap_effective & cap::bit(cap) != 0
+                    && crate::security::capable_lsm(self, target, cap, 0);
             }
             if ns.level() <= self.user_ns.level() {
                 return false;
             }
             let Some(parent) = ns.parent() else { return false };
             if **parent == *self.user_ns && ns.owner() == self.euid {
-                return crate::security::capable_lsm(self, cap, 0);
+                return crate::security::capable_lsm(self, target, cap, 0);
             }
             ns = parent;
         }

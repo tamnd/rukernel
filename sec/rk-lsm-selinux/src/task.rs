@@ -17,6 +17,7 @@ use rk_vfs::cred::{Cred, cap};
 use rk_vfs::dentry::Location;
 use rk_vfs::inode::Result;
 use rk_vfs::security::{Bprm, Task, attr, id};
+use rk_vfs::user_ns::UserNs;
 
 /// The size of the part of SELinux in the credentials blob: the six SIDs of [`slot`], one in
 /// each word.
@@ -69,16 +70,21 @@ pub fn cred_sid(cred: &Cred) -> u32 {
     load(cred, slot::SID)
 }
 
+/// The bit of the `opts` of [`cred_has_capability`] for a check without an audit record,
+/// `CAP_OPT_NOAUDIT` of Linux.
+pub const CAP_OPT_NOAUDIT: u32 = 1 << 1;
+
 /// Checks the capability `cap` of the task with `cred`, as `cred_has_capability` of Linux:
 /// the permission of the capability in the class `capability` or `capability2` on the task
 /// itself, or in `cap_userns` or `cap2_userns` if the capability is not for the first user
-/// namespace (`initns` false). The record has ` capability=N `.
+/// namespace (`initns` false). The record has ` capability=N `. There is no record if `opts` has
+/// [`CAP_OPT_NOAUDIT`].
 ///
 /// # Errors
 ///
 /// `EACCES` if the policy denies the permission in enforcing mode, and `EINVAL` for a
 /// capability after the last one.
-pub fn cred_has_capability(cred: &Cred, cap: u32, initns: bool) -> Result<()> {
+pub fn cred_has_capability(cred: &Cred, cap: u32, opts: u32, initns: bool) -> Result<()> {
     let sclass = match (cap / 32, initns) {
         (0, true) => class::CAPABILITY,
         (0, false) => class::CAP_USERNS,
@@ -90,9 +96,36 @@ pub fn cred_has_capability(cred: &Cred, cap: u32, initns: bool) -> Result<()> {
         }
     };
     let sid = cred_sid(cred);
-    avc::has_perm(sid, sid, sclass, 1 << (cap % 32), |s| {
-        let _ = write!(s, " capability={cap} ");
-    })
+    let av = 1 << (cap % 32);
+    let (avd, rc) = avc::has_perm_noaudit(sid, sid, sclass, av);
+    if opts & CAP_OPT_NOAUDIT == 0 {
+        avc::audit(sid, sid, sclass, av, &avd, rc, 0, |s| {
+            let _ = write!(s, " capability={cap} ");
+        });
+    }
+    rc
+}
+
+/// The `capable` hook, `selinux_capable` of Linux: checks the capability `cap` of the task with
+/// `cred` in the user namespace `ns`, with the classes of the first user namespace if `ns` is the
+/// first one.
+///
+/// # Errors
+///
+/// As [`cred_has_capability`].
+pub fn capable(cred: &Cred, ns: &UserNs, cap: u32, opts: u32) -> Result<()> {
+    cred_has_capability(cred, cap, opts, ns.is_init())
+}
+
+/// The current task has `CAP_MAC_ADMIN` in the first user namespace, as `has_cap_mac_admin` of
+/// Linux: the check of the capability module, then the check of SELinux, with a record if
+/// `audit` is true.
+pub fn has_cap_mac_admin(audit: bool) -> bool {
+    let cred = rk_vfs::cred::current();
+    let opts = if audit { 0 } else { CAP_OPT_NOAUDIT };
+    cred.user_ns.is_init()
+        && cred.cap_effective & cap::bit(cap::MAC_ADMIN) != 0
+        && cred_has_capability(&cred, cap::MAC_ADMIN, opts, true).is_ok()
 }
 
 /// The SID of the file `at`, from [`crate::inode::inode_sid`].
@@ -316,7 +349,7 @@ pub fn setattr(attr: u64, value: &[u8]) -> Result<usize> {
         let text = &value[..size];
         sid = match server::context_to_sid(text, 0, false) {
             Err(Errno::EINVAL) if attr == attr::FSCREATE => {
-                if !cred.capable(cap::MAC_ADMIN) {
+                if !has_cap_mac_admin(true) {
                     let mut s = String::from("op=fscreate invalid_context=");
                     avc::untrusted(&mut s, text.strip_suffix(&[0]).unwrap_or(text));
                     services::log_err(&s);
@@ -670,6 +703,53 @@ mod tests {
         assert_eq!(ptrace_access_check(&me, &o, 0x02), Ok(()));
         assert_eq!(ptrace_traceme(&o), Ok(()));
         assert_eq!(capset(&init, &me), Ok(()));
+    }
+
+    #[test]
+    fn a_capability_needs_its_permission_in_the_policy() {
+        let _guard = setup();
+        let me = Cred::root();
+        let host = rk_vfs::user_ns::init();
+        let child = rk_vfs::user_ns::create(&me).unwrap();
+        let free = Cred::root();
+        store(&free, slot::SID, sid_of("system_u:system_r:unconfined_t:s0"));
+        // CAP_SYS_TTY_CONFIG, and CAP_WAKE_ALARM, the fourth capability of the class
+        // capability2.
+        let (tty_config, wake_alarm) = (26, 35);
+        crate::set_enforcing(true);
+        // The rules give each domain the capabilities on itself in the first user namespace,
+        // without sys_time, sys_tty_config and wake_alarm.
+        for c in [cap::CHOWN, cap::SYS_ADMIN, cap::SETFCAP, cap::MAC_ADMIN, cap::LAST] {
+            assert_eq!(capable(&me, host, c, 0), Ok(()), "{c}");
+        }
+        for c in [cap::SYS_TIME, tty_config, wake_alarm] {
+            assert_eq!(capable(&me, host, c, 0), Err(Errno::EACCES), "{c}");
+            assert_eq!(capable(&me, host, c, CAP_OPT_NOAUDIT), Err(Errno::EACCES), "{c}");
+        }
+        // In another user namespace, the classes are cap_userns and cap2_userns, and the
+        // policy has no rules for them.
+        for c in [cap::CHOWN, cap::SYS_ADMIN, cap::MAC_ADMIN, cap::LAST] {
+            assert_eq!(capable(&child, &child.user_ns, c, 0), Err(Errno::EACCES), "{c}");
+        }
+        assert_eq!(capable(&free, host, cap::SYS_TIME, 0), Ok(()));
+        // As on Linux, a capability after the last one of capability2 is a bit of the class
+        // that the policy does not know, and a capability after the class capability2 is not
+        // valid.
+        assert_eq!(capable(&me, host, cap::LAST + 1, 0), Err(Errno::EACCES));
+        assert_eq!(capable(&me, host, 64, 0), Err(Errno::EINVAL));
+        // After the check of the effective set, the capability functions of the credentials
+        // ask SELinux, with the user namespace of the request.
+        assert!(me.capable(cap::SYS_ADMIN));
+        assert!(!me.capable(cap::SYS_TIME));
+        assert!(!child.capable(cap::SYS_ADMIN));
+        assert!(!child.ns_capable(&child.user_ns, cap::SYS_ADMIN));
+        assert!(has_cap_mac_admin(false));
+        crate::set_enforcing(false);
+        // Permissive mode only makes the records.
+        assert_eq!(capable(&me, host, cap::SYS_TIME, 0), Ok(()));
+        assert_eq!(capable(&child, &child.user_ns, cap::SYS_ADMIN, 0), Ok(()));
+        assert!(child.ns_capable(&child.user_ns, cap::SYS_ADMIN));
+        assert_eq!(capable(&me, host, 64, 0), Err(Errno::EINVAL));
     }
 
     #[test]

@@ -11,7 +11,6 @@ use crate::{avc, server, services, task};
 use alloc::string::String;
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_vfs::cred::cap;
 use rk_vfs::dentry::Location;
 use rk_vfs::inode::{Inode, Result};
 
@@ -52,7 +51,7 @@ pub fn init_security(
 fn new_sid(value: &[u8]) -> Result<u32> {
     match server::context_to_sid(value, 0, false) {
         Err(Errno::EINVAL) => {
-            if !rk_vfs::cred::current().capable(cap::MAC_ADMIN) {
+            if !crate::task::has_cap_mac_admin(true) {
                 let mut s = String::from("op=setxattr invalid_context=");
                 avc::untrusted(&mut s, value.strip_suffix(&[0]).unwrap_or(value));
                 services::log_err(&s);

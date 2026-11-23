@@ -12,6 +12,7 @@ use crate::cred::{Cred, IpcOwner};
 use crate::dentry::Location;
 use crate::file::File;
 use crate::inode::{Inode, Result, SetAttr};
+use crate::user_ns::UserNs;
 use alloc::vec::Vec;
 
 /// The names of the LSM hooks of Linux, in the order of include/linux/lsm_hook_defs.h.
@@ -311,9 +312,9 @@ pub fn hook_index(name: &str) -> Option<usize> {
 /// Linux. The methods without a result are the hooks of `call_void_hook`.
 #[allow(unused_variables)]
 pub trait SecurityHooks: Sync {
-    /// `capable`: the task with `cred` uses the capability `cap`. `opts` has the `CAP_OPT_*`
-    /// bits.
-    fn capable(&self, cred: &Cred, cap: u32, opts: u32) -> Result<()> {
+    /// `capable`: the task with `cred` uses the capability `cap` in the user namespace `ns`.
+    /// `opts` has the `CAP_OPT_*` bits.
+    fn capable(&self, cred: &Cred, ns: &UserNs, cap: u32, opts: u32) -> Result<()> {
         Ok(())
     }
 
